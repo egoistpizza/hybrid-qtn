@@ -2,62 +2,97 @@ import torch
 import torch.nn as nn
 
 class DoubleConv(nn.Module):
-    """Her seviyede peş peşe 2 kez yapılan Conv işlemleri"""
+    """(Conv2d -> BatchNorm -> ReLU) x 2"""
     def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
+
     def forward(self, x):
+        return self.double_conv(x)
+
+class UpBlock(nn.Module):
+    """Upscaling (Bilinear) then double conv"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        #: Bilinear Upsample + 1x1 Conv2d instead of ConvTranspose2d
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+        )
+        self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # Skip connection Concat
+        x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
-class UNetBaseline(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1):
-        super(UNetBaseline, self).__init__()
+class UNet(nn.Module):
+    # in_channels=3 for RGB 
+    def __init__(self, in_channels=3, out_channels=1):
+        super().__init__()
         
-        # ENCODER 
-        self.down1 = DoubleConv(in_channels, 32)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2) # 28x28 -> 14x14
+        # 4 block for encoder
+        self.inc = DoubleConv(in_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
         
-        self.down2 = DoubleConv(32, 64)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2) # 14x14 -> 7x7
+        # Bottleneck filter aranged as 1024
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(512, 1024))
         
-        # BOTTLENECK 
-        self.bottleneck = DoubleConv(64, 128)
+        # Decoder
+        self.up1 = UpBlock(1024, 512)
+        self.up2 = UpBlock(512, 256)
+        self.up3 = UpBlock(256, 128)
+        self.up4 = UpBlock(128, 64)
         
-        # DECODER
-        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2) # 7x7 -> 14x14
-        self.conv_up2 = DoubleConv(128, 64) # Skip connection ile birleşince 64+64=128 girdi
-        
-        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2) # 14x14 -> 28x28
-        self.conv_up1 = DoubleConv(64, 32) # Skip connection ile birleşince 32+32=64 girdi
-        
-        # Segmentaton Mask
-        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
-        
+        self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
+
     def forward(self, x):
-        # Encoder and skip connections 
-        x1 = self.down1(x)
-        p1 = self.pool1(x1)
+        # Encoder Path
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
         
-        x2 = self.down2(p1)
-        p2 = self.pool2(x2)
+        # Bottleneck
+        x5 = self.down4(x4)
         
-        # bottleneck
-        b = self.bottleneck(p2)
+        # Decoder Path
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
         
-        # Decoder 
-        u2 = self.up2(b)
-        merge2 = torch.cat([u2, x2], dim=1) # Kanalları yan yana ekle
-        d2 = self.conv_up2(merge2)
+        logits = self.outc(x)
+        return logits
+
+#  Dummy Tensor Test
+if __name__ == "__main__":
+    print("🚀 Dummy Tensor Test starting..")
+    
+    # 1. Create model
+    model = UNet(in_channels=3, out_channels=1)
+    
+    # 2. Sahte (Dummy) input tensor (Batch=1, Channels=3, H=512, W=512)
+    dummy_input = torch.randn(1, 3, 512, 512)
+    print(f"📥 Input size:  {dummy_input.shape}")
+    
+    # 3. Tensor to model
+    with torch.no_grad():
+        output = model(dummy_input)
         
-        u1 = self.up1(d2)
-        merge1 = torch.cat([u1, x1], dim=1)
-        d1 = self.conv_up1(merge1)
-        
-        return self.final_conv(d1)
+    print(f"📤 Output size: {output.shape}")
+    
+    # 4. Doğrulama
+    assert output.shape == (1, 1, 512, 512), "Error: Shape mismatch!"
+    print("✅ SUCCESS: 512x512 RGB images can be processed...")
