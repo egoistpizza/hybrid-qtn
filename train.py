@@ -1,16 +1,19 @@
+import logging
 import os
 import random
-import logging
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import wandb
+
+from dataset import load_kvasir_seg
+# from models.unet_classic import UNet
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,9 +89,9 @@ class SegmentationTrainer:
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [Train]")
         
-        for batch_idx, (images, masks) in enumerate(pbar):
-            images = images.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            masks = masks.to(self.device, non_blocking=True)
+        for batch_idx, batch in enumerate(pbar):
+            images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            masks = batch["mask"].to(self.device, non_blocking=True)
 
             with autocast():
                 outputs = self.model(images)
@@ -119,9 +122,9 @@ class SegmentationTrainer:
         
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [Val]")
         
-        for images, masks in pbar:
-            images = images.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            masks = masks.to(self.device, non_blocking=True)
+        for batch in pbar:
+            images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            masks = batch["mask"].to(self.device, non_blocking=True)
 
             with autocast():
                 outputs = self.model(images)
@@ -197,24 +200,31 @@ if __name__ == "__main__":
         "checkpoint_dir": "./checkpoints"
     }
 
-    # Placeholders for integration
-    model = nn.Identity() 
-    train_loader = []     
-    val_loader = []       
+    full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    
+    train_ds, val_ds = random_split(
+        full_dataset, 
+        [train_size, val_size], 
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
+    # model = UNet(in_channels=3, out_channels=1) 
+    model = nn.Identity()
+    
     if int(torch.__version__.split('.')[0]) >= 2:
-        logger.info("PyTorch >= 2.0 detected. Compiling model...")
-        model = torch.compile(model)
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass
     
     criterion = BCEDiceLoss()
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=config["learning_rate"], 
-        weight_decay=config["weight_decay"]
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config["epochs"]
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
 
     trainer = SegmentationTrainer(
         model=model,
