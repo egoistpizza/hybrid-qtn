@@ -13,7 +13,7 @@ from tqdm import tqdm
 import wandb
 
 from dataset import load_kvasir_seg
-# from models.unet_classic import UNet
+from models.unet_classic import UNet
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,6 +157,7 @@ class SegmentationTrainer:
 
     def fit(self) -> None:
         """Execute full training and validation loop."""
+        # W&B entegrasyonu tamamen duruyor
         wandb.init(project="hybrid-qtn", config=self.config)
         
         logger.info("Starting training...")
@@ -213,8 +214,8 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
-    # model = UNet(in_channels=3, out_channels=1) 
-    model = nn.Identity()
+    # Model
+    model = UNet(in_channels=3, out_channels=1) 
     
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
@@ -237,4 +238,4 @@ if __name__ == "__main__":
         scheduler=scheduler
     )
     
-    # trainer.fit()
+    trainer.fit()
