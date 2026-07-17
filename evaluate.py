@@ -68,7 +68,12 @@ def main():
     
     checkpoint_path = "checkpoints/best_model.pth"
     if os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        state_dict = torch.load(checkpoint_path, map_location=device)
+
+        clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            
+        model.load_state_dict(clean_state_dict)
+        print("Weights successfully loaded and adapted!")
     
     model.eval()
     total_dice, total_iou = 0.0, 0.0
