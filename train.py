@@ -7,13 +7,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import wandb
 
 from dataset import load_kvasir_seg
 from models.unet_classic import UNet
+from utils import get_device
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +79,8 @@ class SegmentationTrainer:
         self.device = device
         self.config = config
         
-        self.scaler = GradScaler()
+        self.use_amp = device.type == "cuda"
+        self.scaler = GradScaler(enabled=self.use_amp)
         self.best_val_dice = 0.0 
         self.checkpoint_dir = config.get("checkpoint_dir", "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -93,7 +96,7 @@ class SegmentationTrainer:
             images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
             masks = batch["mask"].to(self.device, non_blocking=True)
 
-            with autocast():
+            with torch.autocast(self.device.type, enabled=self.use_amp):
                 outputs = self.model(images)
                 loss = self.criterion(outputs, masks)
                 loss = loss / acc_steps
@@ -126,7 +129,7 @@ class SegmentationTrainer:
             images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
             masks = batch["mask"].to(self.device, non_blocking=True)
 
-            with autocast():
+            with torch.autocast(self.device.type, enabled=self.use_amp):
                 outputs = self.model(images)
                 loss = self.criterion(outputs, masks)
 
@@ -189,10 +192,10 @@ class SegmentationTrainer:
 
 if __name__ == "__main__":
     seed_everything(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     
     config = {
-        "epochs": 100,
+        "epochs": 1,
         "batch_size": 4,           
         "accumulation_steps": 8,   
         "learning_rate": 2e-4,
@@ -217,6 +220,7 @@ if __name__ == "__main__":
     # Model
     model = UNet(in_channels=3, out_channels=1) 
     
+
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
             model = torch.compile(model)
