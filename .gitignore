@@ -217,6 +217,14 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Model Weights
+checkpoints/
+*.pth
 
+# Evaluation Outputs
+outputs/
+
+# Weights & Biases Logs
+wandb/
 
 **/data/*
