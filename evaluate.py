@@ -1,12 +1,14 @@
+import argparse
 import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from tqdm import tqdm
 
 from dataset import load_kvasir_seg
 from models.unet_classic import UNet
+from utils import get_device
 
 def calculate_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> tuple[float, float]:
     probs = torch.sigmoid(logits)
@@ -27,7 +29,8 @@ def denormalize(tensor: torch.Tensor) -> np.ndarray:
     return torch.clamp(tensor, 0, 1).cpu().permute(1, 2, 0).numpy()
 
 def save_visualizations(images: torch.Tensor, masks: torch.Tensor, logits: torch.Tensor, 
-                        sample_ids: list[str], output_dir: str = "outputs"):
+                        sample_ids: list[str], output_dir: str = "outputs/visualizations",
+                        start_index: int = 0):
     os.makedirs(output_dir, exist_ok=True)
     preds = (torch.sigmoid(logits) > 0.5).float()
     
@@ -35,6 +38,8 @@ def save_visualizations(images: torch.Tensor, masks: torch.Tensor, logits: torch
         img_np = denormalize(images[i])
         gt_np = masks[i].cpu().squeeze().numpy()
         pred_np = preds[i].cpu().squeeze().numpy()
+
+        dice, iou = calculate_metrics(logits[i:i+1], masks[i:i+1])
         
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         axes[0].imshow(img_np)
@@ -46,23 +51,30 @@ def save_visualizations(images: torch.Tensor, masks: torch.Tensor, logits: torch
         axes[1].axis('off')
         
         axes[2].imshow(pred_np, cmap='gray')
-        axes[2].set_title("Model Prediction")
+        axes[2].set_title(f"Prediction\nDice: {dice:.4f} | IoU: {iou:.4f}")
         axes[2].axis('off')
         
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f"pred_{sample_ids[i]}.png"), bbox_inches='tight', dpi=150)
+        filename = f"viz_{start_index + i + 1:03d}_{sample_ids[i]}.png"
+        plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight', dpi=300)
         plt.close(fig)
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = parse_args()
+
+    device = get_device()
     print(f"Evaluating on device: {device}")
-    
+
     full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     
     _, val_ds = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
     val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=4)
+
+    viz_indices = torch.randperm(len(val_ds), generator=torch.Generator().manual_seed(123))[:args.num_samples]
+    viz_subset = Subset(val_ds, viz_indices.tolist())
+    viz_loader = DataLoader(viz_subset, batch_size=1, shuffle=False, num_workers=4)
     
     model = UNet(in_channels=3, out_channels=1).to(device)
     
@@ -77,7 +89,6 @@ def main():
     
     model.eval()
     total_dice, total_iou = 0.0, 0.0
-    viz_saved = 0
     
     with torch.inference_mode():
         for batch in tqdm(val_loader, desc="Evaluating"):
@@ -88,11 +99,27 @@ def main():
             total_dice += dice
             total_iou += iou
             
-            if viz_saved < 2:
-                save_visualizations(images, masks, outputs, batch["metadata"]["sample_id"])
-                viz_saved += 1
                 
     print(f"Avg Dice: {total_dice / len(val_loader):.4f} | Avg IoU: {total_iou / len(val_loader):.4f}")
+
+    print(f"\nGenerating {args.num_samples} visualizations...")
+    viz_count = 0
+    with torch.inference_mode():
+        for batch in tqdm(viz_loader, desc="Saving visualizations"):
+            images, masks = batch["image"].to(device), batch["mask"].to(device)
+            outputs = model(images)
+            save_visualizations(images, masks, outputs, batch["metadata"]["sample_id"], args.output_dir, viz_count)
+            viz_count += images.size(0)
+    print(f"Visualizations saved to: {os.path.abspath(args.output_dir)}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate UNet on Kvasir-SEG validation set")
+    parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11),
+                        metavar="[5-10]", help="Number of samples to visualize (default: 10)")
+    parser.add_argument("--output_dir", type=str, default="outputs/visualizations",
+                        help="Directory to save visualization PNGs (default: outputs/visualizations)")
+    return parser.parse_args()
 
 if __name__ == "__main__":
     main()

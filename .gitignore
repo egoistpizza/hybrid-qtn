@@ -226,5 +226,6 @@ outputs/
 
 # Weights & Biases Logs
 wandb/
+**/wandb/**
 
 **/data/*
