@@ -12,6 +12,8 @@ Usage:
     python scripts/download_kvasir_seg.py [--dest data/kvasir-seg] [--force]
 """
 
+# TODO: Maybe get the vars like KVASIR_SEG_URL from a YAML file in /configs
+
 from __future__ import annotations
 
 import argparse
@@ -62,14 +64,23 @@ EXTRACTED_MARKER = "Kvasir-SEG"
 
 def _download(url: str, dest: Path, chunk: int = 1 << 20) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # TODO: Use logging library
+    print(f"\x1b[38;5;240m[debug] download_kvasir_seg.py::_download({url}, {dest}, {chunk})\x1b[0m")
+    
+    
 
     if _download_with_curl(url, dest):
         return
-
+    
+    # Disable HTTPS context verifying to avoid "urllib.error.URLError: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1032)>"
+    ssl._create_default_https_context = ssl._create_unverified_context
+    
     tmp = dest.with_suffix(dest.suffix + ".part")
     print(f"Downloading via urllib {url}\n           -> {dest}")
-
-    with urllib.request.urlopen(url, context=_ssl_context()) as resp:
+    
+    # Disable HTTPS context verifying to avoid "urllib.error.URLError: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1032)>"
+    # Remove context=_ssl_context as well (to avoid the same error) in urllib.request.urlopen(url, context=_ssl_context())
+    with urllib.request.urlopen(url) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
         digest = hashlib.sha256()
         read = 0
