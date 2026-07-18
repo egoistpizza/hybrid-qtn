@@ -153,7 +153,7 @@ class SegmentationTrainer:
         # TODO: Logger pollutes the STDOUT (with an unicode encode error and its stack trace) due to wandb probably
         #       trying to print a unicode character to its own logger instance (when seleted [3: don't visualize])
         #       so suppress that message for now.
-        #       That happens when the directory contains 
+        #       That happens when the directory path contains non-ASCII characters including the uppercase "İ" (as in "İnzva")
         wandb.init(project="hybrid-qtn", config=self.config)
         
         logger.info("Starting training...")
