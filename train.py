@@ -12,29 +12,21 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import wandb
 
+from utils.seed import seed_everything
+from utils.init_first import init
+
 from dataset import load_kvasir_seg
 from models.unet_classic import UNet
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+# Outside of the main function (where init_first is called which calls init_logger_basicconfig) --- calling
+# init_logger_basicconfig explicitly
+from utils.init_first import init_logger_basicconfig
+init_logger_basicconfig()
 logger = logging.getLogger(__name__)
 
 
-def seed_everything(seed: int = 42) -> None:
-    """Fix random seeds for reproducibility."""
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
-    logger.info(f"Seed set to {seed}")
 
+# BCE (Binary Cross Entropy) Loss for pixelwise comparison + Dice Loss for imbalanced classes
 class BCEDiceLoss(nn.Module):
     """BCE + Dice Loss for highly imbalanced segmentation tasks."""
     def __init__(self, smooth: float = 1e-5):
@@ -158,6 +150,10 @@ class SegmentationTrainer:
     def fit(self) -> None:
         """Execute full training and validation loop."""
         # W&B entegrasyonu tamamen duruyor
+        # TODO: Logger pollutes the STDOUT (with an unicode encode error and its stack trace) due to wandb probably
+        #       trying to print a unicode character to its own logger instance (when seleted [3: don't visualize])
+        #       so suppress that message for now.
+        #       That happens when the directory contains 
         wandb.init(project="hybrid-qtn", config=self.config)
         
         logger.info("Starting training...")
@@ -187,9 +183,13 @@ class SegmentationTrainer:
             wandb.finish()
             logger.info("Training finished.")
 
+
 if __name__ == "__main__":
+    init()
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # TODO: Maybe get this from a YAML file in /configs
     
     config = {
         "epochs": 100,
@@ -219,9 +219,17 @@ if __name__ == "__main__":
     
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
-            model = torch.compile(model)
-        except Exception:
-            pass
+            c_model = torch.compile(model)
+            # torch.compile is lazy, it will wrap and successfully get out of the try-catch, and will try to compile only
+            # when run something forward/backward.
+            # Try actually attempting to run anything through it just to see if it compiles successfully.
+            dummy_input = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
+            _ = c_model(dummy_input)
+            # Replace it with the compiled only after passing the test
+            model = c_model
+        except Exception as e:
+            logger.warn("[!] torch.compile(model)(input) failed")
+            # logger.warn(e)
     
     criterion = BCEDiceLoss()
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
