@@ -54,3 +54,12 @@ To ensure the stability of the codebase:
 
 ## License
 This project is licensed under the MIT License - see the `LICENSE` file for details.
+
+
+
+## Estimated Number of Parameters with and without mid-core matrix
+| Layer                    | Formula                   |  r=32 |  r=64 | r=128 |
+| ------------------------ | ------------------------- | ----: | ----: | ----: |
+| ChannelOnlyMPS           | 2 × C × r²                |  2.1M |  8.4M | 33.6M |
+| Full MPS (with core_mid) | C × r² + r² × L² + r² × C | 1.07B | 4.30B | 17.2B |
+| Vanilla bottleneck       | 2 × Conv3×3 + 2 × BN      | 14.2M |     — |     — |

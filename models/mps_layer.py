@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 class SpatialFlattening(nn.Module):
     def __init__(self):
@@ -51,10 +53,48 @@ class CustomMPSLayer(nn.Module):
         out = torch.einsum('bmjk, jkd -> bmd', mid_contract, self.core_right)
         
         return out
+    
+class ChannelOnlyMPSLayer(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, bond_dim: int = 16):
+        super().__init__()
+        
+        self.core_left = nn.Parameter(torch.empty(in_channels, bond_dim, bond_dim))
+        self.core_right = nn.Parameter(torch.empty(bond_dim, bond_dim, out_channels))
+        
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        nn.init.xavier_normal_(self.core_left)
+        nn.init.xavier_normal_(self.core_right)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Channel to Bond Projection
+        left_contract = torch.einsum('blc, cij -> blij', x, self.core_left)
+        
+        # Global mixing removed for middle(due to number of parameters concern)
+        # Instead, adding simple gelu for non-linearity after left contraction
+        # which is expected to help with the expressiveness of the model(do not limit with a huge tensor to be represented).
+        left_contract = F.gelu(left_contract)
+        
+        # 3. Bond to Channel Projection
+        out = torch.einsum('blij, ijd -> bld', left_contract, self.core_right)
+        
+        return out
+    
+class MPSBottleneck(nn.Module):
+    def __init__(self, channels, bond_dim):
+        super().__init__()
+        self.flatten = SpatialFlattening()
+        self.mps = ChannelOnlyMPSLayer(channels, channels, bond_dim)
+
+    def forward(self, x):
+        x_seq, spatial_shape = self.flatten(x)
+        x_seq = self.mps(x_seq)
+        return self.flatten.reverse(x_seq, spatial_shape)
 
 
 if __name__ == "__main__":
-    print("[debug] Starting MPS Layer Dummy Run...")
+    print("[debug] Starting Triangular MPS Layer Dummy Run...")
     
     BATCH_SIZE = 4
     IN_CHANNELS = 1024

@@ -13,9 +13,9 @@ from tqdm import tqdm
 import wandb
 
 from dataset import load_kvasir_seg
-from models.unet_classic import UNet
+from models.unet_hybrid import UNetHybrid
 from utils import get_device
-
+from models.mps_layer import MPSBottleneck
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,9 +162,11 @@ class SegmentationTrainer:
         """Execute full training and validation loop."""
         # W&B entegrasyonu tamamen duruyor
         total_params = sum(p.numel() for p in self.model.parameters())
-        wandb.init(project="hybrid-qtn",
-                   config={**self.config, "total_params": total_params},
-                   name="vanilla_unet_training")
+        wandb.init(
+            entity="hybrid-qtn-team",
+            project="hybrid-qtn",
+            config={**self.config, "total_params": total_params},
+            name="r=32_channel_only_mps_run")
         
         logger.info("Starting training...")
         try:
@@ -198,36 +200,106 @@ class SegmentationTrainer:
             wandb.finish()
             logger.info("Training finished.")
 
+def debug_model_info(model: nn.Module, device: torch.device, config: dict) -> None:
+    logger.info("=" * 60)
+    logger.info("MODEL DEBUG INFO")
+    logger.info("=" * 60)
+
+    logger.info(f"Device:               {device}")
+    if device.type == "cuda":
+        logger.info(f"GPU:                  {torch.cuda.get_device_name(device)}")
+        vram = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        logger.info(f"VRAM:                 {vram:.1f} GB")
+        logger.info(f"CUDA version:         {torch.version.cuda}")
+    logger.info(f"PyTorch version:      {torch.__version__}")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters:     {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+
+    logger.info("-" * 60)
+    logger.info("Per-component parameter counts:")
+    for name, module in model.named_children():
+        count = sum(p.numel() for p in module.parameters())
+        logger.info(f"  {name:25s} → {count:>12,}")
+
+    if model.bottleneck_transform is not None:
+        logger.info("-" * 60)
+        logger.info("MPS Bottleneck breakdown:")
+        bt = model.bottleneck_transform
+        for name, param in bt.named_parameters():
+            logger.info(f"  {name:25s} → shape {str(list(param.shape)):20s} = {param.numel():>10,}")
+
+    logger.info("-" * 60)
+    logger.info("Forward pass shape trace (dummy input):")
+    model.to(device)
+    dummy = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
+
+    with torch.no_grad():
+        x1 = model.inc(dummy)
+        logger.info(f"  inc  (encoder 0):  {list(dummy.shape)} → {list(x1.shape)}")
+        x2 = model.down1(x1)
+        logger.info(f"  down1 (encoder 1): {list(x1.shape)} → {list(x2.shape)}")
+        x3 = model.down2(x2)
+        logger.info(f"  down2 (encoder 2): {list(x2.shape)} → {list(x3.shape)}")
+        x4 = model.down3(x3)
+        logger.info(f"  down3 (encoder 3): {list(x3.shape)} → {list(x4.shape)}")
+        x5 = model.down4(x4)
+        logger.info(f"  down4 (bottleneck conv): {list(x4.shape)} → {list(x5.shape)}")
+
+        if model.bottleneck_transform is not None:
+            x5_mps = model.bottleneck_transform(x5)
+            logger.info(f"  MPS transform:     {list(x5.shape)} → {list(x5_mps.shape)}")
+            x5 = x5_mps
+
+        x = model.up1(x5, x4)
+        logger.info(f"  up1 (decoder 1):   {list(x5.shape)} → {list(x.shape)}")
+        x = model.up2(x, x3)
+        logger.info(f"  up2 (decoder 2):   → {list(x.shape)}")
+        x = model.up3(x, x2)
+        logger.info(f"  up3 (decoder 3):   → {list(x.shape)}")
+        x = model.up4(x, x1)
+        logger.info(f"  up4 (decoder 4):   → {list(x.shape)}")
+        out = model.outc(x)
+        logger.info(f"  outc (final):      → {list(out.shape)}")
+
+    logger.info("=" * 60)
+
+
 if __name__ == "__main__":
     seed_everything(42)
     device = get_device()
-    
+
     config = {
         "epochs": 1,
-        "batch_size": 4,           
-        "accumulation_steps": 8,   
+        "batch_size": 4,
+        "accumulation_steps": 8,
         "learning_rate": 2e-4,
         "weight_decay": 1e-4,
         "image_size": 512,
+        "bond_dim": 32,
         "checkpoint_dir": "./checkpoints"
     }
 
     full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
-    
+
     train_ds, val_ds = random_split(
-        full_dataset, 
-        [train_size, val_size], 
+        full_dataset,
+        [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
-    
+
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
     # Model
-    model = UNet(in_channels=3, out_channels=1) 
-    
+    bottleneck = MPSBottleneck(channels=1024, bond_dim=config["bond_dim"])
+    model = UNetHybrid(in_channels=3, out_channels=1, bottleneck_transform=bottleneck)
+
+    debug_model_info(model, device, config)
 
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
