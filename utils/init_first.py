@@ -4,9 +4,9 @@
 
 def init():
     
+    init_logger_basicconfig()
     disable_albumentations_update_checks()
     init_torch_cache()
-    init_logger_basicconfig()
     
 # }}}
 
@@ -19,10 +19,14 @@ def disable_albumentations_update_checks(): # {{{
 # Let the compiler cache be saved for faster loads in subsequent runs
 # FIXME: Not yet verified to be working
 def init_torch_cache(): # {{{
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    
     import os
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
-    os.environ["TORCHINDUCTOR_CACHE_DIR"]      = "./cache/torch cache"
-    print(f"\x1b[38;5;240m[debug] Torch cache will be saved to: {os.environ["TORCHINDUCTOR_CACHE_DIR"]}\x1b[0m")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"]      = "./cache/torch_cache"
+    logger.debug(f"\x1b[38;5;240mTorch cache will be saved to: {os.environ["TORCHINDUCTOR_CACHE_DIR"]}\x1b[0m")
 # }}}
 
 def init_logger_basicconfig(): # {{{
@@ -30,7 +34,7 @@ def init_logger_basicconfig(): # {{{
     
     logging.basicConfig(
         # filename=...,
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         
@@ -38,6 +42,7 @@ def init_logger_basicconfig(): # {{{
         # position ...: character maps to <undefined>"
         encoding='utf-8'
     )
+    
     
 # }}}
 

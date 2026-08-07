@@ -18,11 +18,9 @@ from utils.init_first import init
 from dataset import load_kvasir_seg
 from models.unet_classic import UNet
 
-# Outside of the main function (where init_first is called which calls init_logger_basicconfig) --- calling
-# init_logger_basicconfig explicitly
-from utils.init_first import init_logger_basicconfig
-init_logger_basicconfig()
-logger = logging.getLogger(__name__)
+
+logger = None # Will be initialized in main
+device = None # Will be initialized in main
 
 
 
@@ -155,7 +153,6 @@ class SegmentationTrainer:
         #       so suppress that message for now.
         #       That happens when the directory path contains non-ASCII characters including the uppercase "İ" (as in "İnzva")
         wandb.init(project="hybrid-qtn", config=self.config)
-        
         logger.info("Starting training...")
         try:
             for epoch in range(1, self.config['epochs'] + 1):
@@ -184,8 +181,13 @@ class SegmentationTrainer:
             logger.info("Training finished.")
 
 
-if __name__ == "__main__":
+def main(): # {{{
     init()
+    
+    global logger
+    global device
+    logger = logging.getLogger(__name__) # Getting it only after we call the init() the first time (which calls init_logger_basicconfig())
+    
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -228,8 +230,8 @@ if __name__ == "__main__":
             # Replace it with the compiled only after passing the test
             model = c_model
         except Exception as e:
-            logger.warn("[!] torch.compile(model)(input) failed")
-            # logger.warn(e)
+            logger.warning("[!] torch.compile(model)(input) failed")
+            # logger.warning(e)
     
     criterion = BCEDiceLoss()
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
@@ -247,3 +249,9 @@ if __name__ == "__main__":
     )
     
     trainer.fit()
+    
+# }}}
+
+if __name__ == "__main__":
+    main()
+
