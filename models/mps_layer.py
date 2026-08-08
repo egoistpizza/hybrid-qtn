@@ -44,3 +44,36 @@ class AxialMPSLayer(nn.Module):
         restored_output = self.out_proj(horizontal_contraction)
         
         return restored_output
+
+class MPSBottleneck(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        bond_dim: int,
+        height: int,
+        width: int
+    ):
+        super().__init__()
+        self.norm_pre = nn.BatchNorm2d(in_channels)
+        
+        self.axial_mps = AxialMPSLayer(
+            in_channels=in_channels,
+            bond_dim=bond_dim,
+            height=height,
+            width=width
+        )
+        
+        self.norm_post = nn.BatchNorm2d(in_channels)
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        
+        out = self.norm_pre(x)
+        out = self.axial_mps(out)
+        out = self.norm_post(out)
+        out = self.activation(out)
+        
+        out = out + identity
+        
+        return out
