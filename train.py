@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler
+from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import wandb
@@ -34,23 +35,25 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = True
     logger.info(f"Seed set to {seed}")
 
-class BCEDiceLoss(nn.Module):
-    def __init__(self, smooth: float = 1e-5):
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1e-5):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
         self.smooth = smooth
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        bce_loss = self.bce(logits, targets)
-        
         probs = torch.sigmoid(logits)
-        intersection = (probs * targets).sum(dim=(2, 3))
-        union = probs.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
         
-        dice_score = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1.0 - dice_score.mean()
+        tp = (probs * targets).sum(dim=(2, 3))
+        fp = (probs * (1.0 - targets)).sum(dim=(2, 3))
+        fn = ((1.0 - probs) * targets).sum(dim=(2, 3))
         
-        return bce_loss + dice_loss
+        tversky_index = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        focal_tversky = (1.0 - tversky_index) ** self.gamma
+        
+        return focal_tversky.mean()
 
 def get_vram_metrics() -> Dict[str, float]:
     if not torch.cuda.is_available():
@@ -144,6 +147,10 @@ class SegmentationTrainer:
         self.checkpoint_dir = config.get("checkpoint_dir", "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
+        self.swa_start_epoch = int(self.config["epochs"] * self.config.get("swa_start_pct", 0.75))
+        self.swa_model = AveragedModel(self.model)
+        self.swa_scheduler = SWALR(self.optimizer, swa_lr=self.config.get("swa_lr", 5e-5))
+
     def train_epoch(self, epoch: int) -> float:
         self.model.train()
         epoch_loss = 0.0
@@ -177,19 +184,22 @@ class SegmentationTrainer:
         return epoch_loss / len(self.train_loader)
 
     @torch.inference_mode()
-    def validate_epoch(self, epoch: int) -> Tuple[float, float]:
-        self.model.eval()
+    def validate_epoch(self, epoch: int, use_swa: bool = False) -> Tuple[float, float]:
+        eval_model = self.swa_model if use_swa else self.model
+        eval_model.eval()
+        
         epoch_loss = 0.0
         epoch_dice = 0.0
         
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [Val]")
+        mode_str = "Val-SWA" if use_swa else "Val"
+        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [{mode_str}]")
         
         for batch in pbar:
             images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
             masks = batch["mask"].to(self.device, non_blocking=True)
 
             with torch.autocast(self.device.type, enabled=self.use_amp):
-                outputs = self.model(images)
+                outputs = eval_model(images)
                 loss = self.criterion(outputs, masks)
 
             epoch_loss += loss.item()
@@ -208,6 +218,19 @@ class SegmentationTrainer:
             })
 
         return epoch_loss / len(self.val_loader), epoch_dice / len(self.val_loader)
+
+    @torch.no_grad()
+    def _update_swa_bn(self) -> None:
+        self.swa_model.train()
+        for module in self.swa_model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.reset_running_stats()
+                module.momentum = None
+        
+        for batch in self.train_loader:
+            images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            with torch.autocast(self.device.type, enabled=self.use_amp):
+                self.swa_model(images)
 
     def save_checkpoint(self, val_dice: float, filename: str = "best_model.pth") -> None:
         if val_dice > self.best_val_dice:
@@ -228,22 +251,44 @@ class SegmentationTrainer:
         try:
             for epoch in range(1, self.config['epochs'] + 1):
                 train_loss = self.train_epoch(epoch)
-                val_loss, val_dice = self.validate_epoch(epoch)
                 
-                if self.scheduler:
+                use_swa = epoch >= self.swa_start_epoch
+                if use_swa:
+                    self.swa_model.update_parameters(self.model)
+                    self.swa_scheduler.step()
+                elif self.scheduler:
                     self.scheduler.step()
+                
+                val_loss, val_dice = self.validate_epoch(epoch, use_swa=use_swa)
                 
                 log_data = {
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "val_dice": val_dice,
-                    "learning_rate": self.optimizer.param_groups[0]['lr'],
+                    "learning_rate": self.optimizer.param_groups[0]['lr'] if not use_swa else self.swa_scheduler.get_last_lr()[0],
+                    "is_swa_active": float(use_swa),
                     **get_vram_metrics()
                 }
                 
                 wandb.log(log_data)
-                self.save_checkpoint(val_dice)
+                
+                if not use_swa:
+                    self.save_checkpoint(val_dice)
+                else:
+                    filepath = os.path.join(self.checkpoint_dir, "swa_latest.pth")
+                    torch.save(self.swa_model.state_dict(), filepath)
+
+            if self.config['epochs'] >= self.swa_start_epoch:
+                logger.info("Training complete. Updating SWA BatchNorm statistics...")
+                self._update_swa_bn()
+                final_val_loss, final_val_dice = self.validate_epoch(self.config['epochs'], use_swa=True)
+                
+                logger.info(f"Final SWA Model - Val Loss: {final_val_loss:.4f} | Val Dice: {final_val_dice:.4f}")
+                wandb.log({"final_swa_val_loss": final_val_loss, "final_swa_val_dice": final_val_dice})
+                
+                filepath = os.path.join(self.checkpoint_dir, "best_swa_model.pth")
+                torch.save(self.swa_model.state_dict(), filepath)
                 
         except KeyboardInterrupt:
             logger.warning("Training interrupted. Saving current state...")
@@ -262,13 +307,15 @@ if __name__ == "__main__":
     device = get_device()
 
     config = {
-        "epochs": 1,
+        "epochs": 40,
         "batch_size": 4,
         "accumulation_steps": 8,
         "learning_rate": 2e-4,
         "weight_decay": 1e-4,
         "image_size": 512,
         "bond_dim": 32,
+        "swa_start_pct": 0.75,
+        "swa_lr": 5e-5,
         "checkpoint_dir": "./checkpoints"
     }
 
@@ -311,7 +358,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"torch.compile failed: {e}")
     
-    criterion = BCEDiceLoss()
+    criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
 
