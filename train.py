@@ -301,13 +301,14 @@ class SegmentationTrainer:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
     parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid"])
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
     args = parser.parse_args()
 
     seed_everything(42)
     device = get_device()
 
     config = {
-        "epochs": 40,
+        "epochs": args.epochs,
         "batch_size": 4,
         "accumulation_steps": 8,
         "learning_rate": 2e-4,
