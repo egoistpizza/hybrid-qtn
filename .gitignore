@@ -228,4 +228,8 @@ outputs/
 wandb/
 **/wandb/**
 
-**/data/*
+# Datasets and Raw Data
+data/
+
+# Test Artifacts
+augmentation_preview.png
