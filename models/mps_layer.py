@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,18 +12,20 @@ class AxialMPSLayer(nn.Module):
         width: int
     ):
         super().__init__()
-        self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=1)
+        self.bond_dim = bond_dim
+        self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=3, padding=1)
         
         self.T_mid_H = nn.Parameter(torch.empty(bond_dim, height, height, bond_dim))
         self.T_mid_W = nn.Parameter(torch.empty(bond_dim, width, width, bond_dim))
         
-        self.out_proj = nn.Conv2d(bond_dim, in_channels, kernel_size=1)
+        self.out_proj = nn.Conv2d(bond_dim, in_channels, kernel_size=3, padding=1)
         
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.trunc_normal_(self.T_mid_H, std=0.02)
-        nn.init.trunc_normal_(self.T_mid_W, std=0.02)
+        stdv = 1.0 / math.sqrt(self.bond_dim)
+        nn.init.trunc_normal_(self.T_mid_H, std=stdv)
+        nn.init.trunc_normal_(self.T_mid_W, std=stdv)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         projected_input = self.in_proj(x)
@@ -63,6 +66,8 @@ class MPSBottleneck(nn.Module):
             width=width
         )
         
+        self.local_bypass = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        
         self.norm_post = nn.BatchNorm2d(in_channels)
         self.activation = nn.GELU()
 
@@ -70,10 +75,16 @@ class MPSBottleneck(nn.Module):
         identity = x
         
         out = self.norm_pre(x)
-        out = self.axial_mps(out)
+        
+        mps_out = self.axial_mps(out)
+        local_out = self.local_bypass(out)
+        
+        out = mps_out + local_out
+        
         out = self.norm_post(out)
         out = self.activation(out)
         
         out = out + identity
         
         return out
+    
