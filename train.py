@@ -92,10 +92,14 @@ def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, A
         count = sum(p.numel() for p in module.parameters())
         logger.info(f"  {name:25s} -> {count:>12,}")
 
-    if hasattr(model, 'bottleneck_transform') and model.bottleneck_transform is not None:
+    if hasattr(model, 'transform_512') and model.transform_512 is not None:
         logger.info("-" * 60)
-        bt = model.bottleneck_transform
-        for name, param in bt.named_parameters():
+        for name, param in model.transform_512.named_parameters():
+            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
+
+    if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
+        logger.info("-" * 60)
+        for name, param in model.transform_1024.named_parameters():
             logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
 
     logger.info("-" * 60)
@@ -106,11 +110,14 @@ def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, A
         x1 = model.inc(dummy)
         x2 = model.down1(x1)
         x3 = model.down2(x2)
+        
         x4 = model.down3(x3)
+        if hasattr(model, 'transform_512') and model.transform_512 is not None:
+            x4 = model.transform_512(x4)
+            
         x5 = model.down4(x4)
-
-        if hasattr(model, 'bottleneck_transform') and model.bottleneck_transform is not None:
-            x5 = model.bottleneck_transform(x5)
+        if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
+            x5 = model.transform_1024(x5)
 
         x = model.up1(x5, x4)
         x = model.up2(x, x3)
@@ -300,8 +307,10 @@ class SegmentationTrainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
-    parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid"])
+    parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
+    parser.add_argument("--bond_dim", type=int, default=32, help="Bond dimension for MPS layer")
     args = parser.parse_args()
 
     seed_everything(42)
@@ -309,12 +318,12 @@ if __name__ == "__main__":
 
     config = {
         "epochs": args.epochs,
-        "batch_size": 4,
+        "batch_size": args.batch_size,
         "accumulation_steps": 8,
         "learning_rate": 2e-4,
         "weight_decay": 1e-4,
         "image_size": 512,
-        "bond_dim": 32,
+        "bond_dim": args.bond_dim,
         "swa_start_pct": 0.75,
         "swa_lr": 5e-5,
         "checkpoint_dir": "./checkpoints"
@@ -333,16 +342,38 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
-    if args.model == "hybrid":
-        logger.info("Initializing Hybrid UNet with MPS Bottleneck...")
-        from models.unet_hybrid import UNetHybrid
+    if args.model == "deep_hybrid":
+        logger.info("Initializing DEEP Hybrid UNet with Dual MPS Bottlenecks...")
+        from models.unet_hybrid import UNetDeepHybrid
         from models.mps_layer import MPSBottleneck
         
-        bottleneck = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
-        model = UNetHybrid(in_channels=3, out_channels=1, bottleneck_transform=bottleneck)
-        run_name = f"hybrid_unet_b{config['bond_dim']}"
+        mps_512 = MPSBottleneck(in_channels=512, bond_dim=config["bond_dim"], height=64, width=64)
+        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
         
+        model = UNetDeepHybrid(
+            in_channels=3, 
+            out_channels=1, 
+            transform_512=mps_512, 
+            transform_1024=mps_1024
+        )
+        run_name = f"deep_hybrid_unet_b{config['bond_dim']}_ckpt"
+        debug_model_info(model, device, config)
+
+    elif args.model == "hybrid":
+        logger.info("Initializing Standard Hybrid UNet...")
+        from models.unet_hybrid import UNetDeepHybrid
+        from models.mps_layer import MPSBottleneck
+        
+        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
+        model = UNetDeepHybrid(
+            in_channels=3, 
+            out_channels=1, 
+            transform_512=None, 
+            transform_1024=mps_1024
+        )
+        run_name = f"hybrid_unet_b{config['bond_dim']}_ckpt"
         debug_model_info(model, device, config) 
+        
     else:
         logger.info("Initializing Vanilla UNet...")
         from models.unet_classic import UNet
