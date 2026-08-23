@@ -10,9 +10,10 @@ Semantic categories (one test class per concern):
     TestPairing            — pairing.pair_by_stem behavior
     TestTransforms         — transforms.build_transforms_from_config
     TestOutputContract     — GenericSegmentationDataset output shape/dtype/keys
-    TestConfigLoader       — kvasir_seg.load_kvasir_seg (YAML -> dataset)
+    TestConfigLoader       — loader.load_dataset (YAML -> dataset)
     TestDataLoaderBatching — torch DataLoader collation into batches
     TestKvasirIntegration  — real Kvasir-SEG on disk (auto-skips if missing)
+    TestClinicDBIntegration— real CVC-ClinicDB on disk (auto-skips if missing)
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from torch.utils.data import DataLoader
 from dataset import (
     GenericSegmentationDataset,
     build_transforms_from_config,
-    load_kvasir_seg,
+    load_dataset,
     pair_by_stem,
 )
 
@@ -265,13 +266,13 @@ class TestOutputContract:
 # ---------------------------------------------------------------------------
 
 class TestConfigLoader:
-    def test_load_kvasir_seg_reads_yaml_and_instantiates(
+    def test_load_dataset_reads_yaml_and_instantiates(
         self, tmp_path, base_config, standard_transforms,
     ):
         base_config["transforms"] = standard_transforms
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text(yaml.safe_dump(base_config))
-        ds = load_kvasir_seg(yaml_path)
+        ds = load_dataset(yaml_path)
         assert len(ds) == 4
         assert ds[0]["image"].shape == (3, 32, 32)
         assert ds[0]["mask"].shape == (1, 32, 32)
@@ -307,7 +308,7 @@ def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
     for step in cfg.get("transforms", []):
         if step["name"] == "Resize":
             return step["height"], step["width"]
-    raise AssertionError("no Resize step in kvasir_seg.yaml")
+    raise AssertionError(f"no Resize step in {cfg_path.name}")
 
 
 @pytest.mark.skipif(
@@ -316,12 +317,12 @@ def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
 )
 class TestKvasirIntegration:
     def test_len_matches_official_1000(self):
-        ds = load_kvasir_seg(KVASIR_YAML)
+        ds = load_dataset(KVASIR_YAML)
         assert len(ds) == 1000
 
     def test_single_sample_shapes_match_yaml_resize(self):
         h, w = _resize_from_yaml(KVASIR_YAML)
-        ds = load_kvasir_seg(KVASIR_YAML)
+        ds = load_dataset(KVASIR_YAML)
         sample = ds[0]
         assert sample["image"].shape == (3, h, w)
         assert sample["mask"].shape == (1, h, w)
@@ -330,7 +331,58 @@ class TestKvasirIntegration:
 
     def test_dataloader_one_batch(self):
         h, w = _resize_from_yaml(KVASIR_YAML)
-        ds = load_kvasir_seg(KVASIR_YAML)
+        ds = load_dataset(KVASIR_YAML)
+        loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
+        batch = next(iter(loader))
+        assert batch["image"].shape == (4, 3, h, w)
+        assert batch["mask"].shape == (4, 1, h, w)
+
+
+# ---------------------------------------------------------------------------
+# 7) Integration — real CVC-ClinicDB on disk (auto-skips if not downloaded)
+# ---------------------------------------------------------------------------
+
+CLINICDB_YAML = _ROOT / "configs" / "cvc_clinicdb.yaml"
+CLINICDB_IMAGES = _ROOT / "data" / "cvc-clinicdb" / "CVC-ClinicDB" / "Original"
+
+
+@pytest.mark.skipif(
+    not CLINICDB_IMAGES.is_dir(),
+    reason="CVC-ClinicDB not on disk — run scripts/download_cvc_clinicdb.py first",
+)
+class TestClinicDBIntegration:
+    def test_len_matches_official_612(self):
+        # Also catches a cvc_clinicdb.yaml still pointing at Kvasir (would be 1000).
+        ds = load_dataset(CLINICDB_YAML)
+        assert len(ds) == 612
+
+    def test_config_points_at_clinicdb_not_kvasir(self):
+        cfg = yaml.safe_load(CLINICDB_YAML.read_text())
+        assert "cvc-clinicdb" in cfg["images_dir"]
+        assert "cvc-clinicdb" in cfg["masks_dir"]
+
+    def test_single_sample_shapes_match_yaml_resize(self):
+        h, w = _resize_from_yaml(CLINICDB_YAML)
+        ds = load_dataset(CLINICDB_YAML)
+        sample = ds[0]
+        assert sample["image"].shape == (3, h, w)
+        assert sample["mask"].shape == (1, h, w)
+        assert sample["image"].dtype == torch.float32
+        assert sample["mask"].dtype == torch.float32
+
+    def test_masks_are_binary(self):
+        ds = load_dataset(CLINICDB_YAML)
+        mask = ds[0]["mask"]
+        assert torch.all((mask == 0.0) | (mask == 1.0))
+
+    def test_transforms_match_kvasir_for_controlled_ablation(self):
+        kvasir = yaml.safe_load(KVASIR_YAML.read_text())["transforms"]
+        clinic = yaml.safe_load(CLINICDB_YAML.read_text())["transforms"]
+        assert kvasir == clinic
+
+    def test_dataloader_one_batch(self):
+        h, w = _resize_from_yaml(CLINICDB_YAML)
+        ds = load_dataset(CLINICDB_YAML)
         loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
         batch = next(iter(loader))
         assert batch["image"].shape == (4, 3, h, w)

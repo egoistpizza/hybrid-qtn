@@ -6,7 +6,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dataset import load_kvasir_seg
+from dataset import load_dataset
 
 
 def test_augmentations_and_visualization():
@@ -18,7 +18,7 @@ def test_augmentations_and_visualization():
     output_path = project_root / "augmentation_preview.png"
 
     # FIXED: The architecture is fully config-driven, removed invalid kwargs.
-    dataset = load_kvasir_seg(str(config_path))
+    dataset = load_dataset(str(config_path))
     
     assert len(dataset) > 0, "Dataset must not be empty."
     

@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Subset, random_split
 from tqdm import tqdm
 
-from dataset import load_kvasir_seg
+from dataset import load_dataset
 from models.unet_classic import UNet
 from utils import get_device
 
@@ -65,7 +65,7 @@ def main():
     device = get_device()
     print(f"Evaluating on device: {device}")
 
-    full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
+    full_dataset = load_dataset("configs/kvasir_seg.yaml")
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     
