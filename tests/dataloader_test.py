@@ -12,8 +12,8 @@ Semantic categories (one test class per concern):
     TestOutputContract     — GenericSegmentationDataset output shape/dtype/keys
     TestConfigLoader       — loader.load_dataset (YAML -> dataset)
     TestDataLoaderBatching — torch DataLoader collation into batches
-    TestKvasirIntegration  — real Kvasir-SEG on disk (auto-skips if missing)
-    TestClinicDBIntegration— real CVC-ClinicDB on disk (auto-skips if missing)
+    TestRealDatasetIntegration — every dataset on disk (each auto-skips if missing)
+    TestDatasetConsistency — invariants that must hold across all datasets
 """
 
 from __future__ import annotations
@@ -37,8 +37,11 @@ from torch.utils.data import DataLoader
 from dataset import (
     GenericSegmentationDataset,
     build_transforms_from_config,
+    discover_dataset_configs,
     load_dataset,
+    make_splits,
     pair_by_stem,
+    resolve_config,
 )
 
 
@@ -296,11 +299,14 @@ class TestDataLoaderBatching:
 
 
 # ---------------------------------------------------------------------------
-# 6) Integration — real Kvasir-SEG on disk (auto-skips if not downloaded)
+# 6) Integration — every real dataset on disk (each auto-skips if missing)
 # ---------------------------------------------------------------------------
 
-KVASIR_YAML = _ROOT / "configs" / "kvasir_seg.yaml"
-KVASIR_IMAGES = _ROOT / "data" / "kvasir-seg" / "Kvasir-SEG" / "images"
+# name -> (images_dir relative to repo root, official sample count)
+REAL_DATASETS = {
+    "kvasir_seg": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
+    "cvc_clinicdb": ("data/cvc-clinicdb/CVC-ClinicDB/Original", 612),
+}
 
 
 def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
@@ -311,79 +317,81 @@ def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
     raise AssertionError(f"no Resize step in {cfg_path.name}")
 
 
-@pytest.mark.skipif(
-    not KVASIR_IMAGES.is_dir(),
-    reason="Kvasir-SEG not on disk — run scripts/download_kvasir_seg.py first",
-)
-class TestKvasirIntegration:
-    def test_len_matches_official_1000(self):
-        ds = load_dataset(KVASIR_YAML)
-        assert len(ds) == 1000
+def _require_on_disk(name: str) -> Path:
+    """Return the config path, or skip if the dataset is not downloaded."""
+    images_dir, _ = REAL_DATASETS[name]
+    if not (_ROOT / images_dir).is_dir():
+        pytest.skip(f"{name} not on disk — run scripts/download_{name}.py first")
+    return resolve_config(name, _ROOT / "configs")
 
-    def test_single_sample_shapes_match_yaml_resize(self):
-        h, w = _resize_from_yaml(KVASIR_YAML)
-        ds = load_dataset(KVASIR_YAML)
-        sample = ds[0]
+
+@pytest.mark.parametrize("name", sorted(REAL_DATASETS))
+class TestRealDatasetIntegration:
+    def test_config_is_discoverable(self, name):
+        assert name in discover_dataset_configs(_ROOT / "configs")
+
+    def test_len_matches_official_count(self, name):
+        # Also catches a config copied from another dataset without repointing
+        # images_dir/masks_dir — the count would be the wrong dataset's.
+        cfg_path = _require_on_disk(name)
+        assert len(load_dataset(cfg_path)) == REAL_DATASETS[name][1]
+
+    def test_config_points_at_its_own_data(self, name):
+        cfg_path = resolve_config(name, _ROOT / "configs")
+        cfg = yaml.safe_load(cfg_path.read_text())
+        expected_root = REAL_DATASETS[name][0].split("/")[1]
+        assert expected_root in cfg["images_dir"]
+        assert expected_root in cfg["masks_dir"]
+
+    def test_single_sample_shapes_match_yaml_resize(self, name):
+        cfg_path = _require_on_disk(name)
+        h, w = _resize_from_yaml(cfg_path)
+        sample = load_dataset(cfg_path)[0]
         assert sample["image"].shape == (3, h, w)
         assert sample["mask"].shape == (1, h, w)
         assert sample["image"].dtype == torch.float32
         assert sample["mask"].dtype == torch.float32
 
-    def test_dataloader_one_batch(self):
-        h, w = _resize_from_yaml(KVASIR_YAML)
-        ds = load_dataset(KVASIR_YAML)
-        loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
-        batch = next(iter(loader))
-        assert batch["image"].shape == (4, 3, h, w)
-        assert batch["mask"].shape == (4, 1, h, w)
-
-
-# ---------------------------------------------------------------------------
-# 7) Integration — real CVC-ClinicDB on disk (auto-skips if not downloaded)
-# ---------------------------------------------------------------------------
-
-CLINICDB_YAML = _ROOT / "configs" / "cvc_clinicdb.yaml"
-CLINICDB_IMAGES = _ROOT / "data" / "cvc-clinicdb" / "CVC-ClinicDB" / "Original"
-
-
-@pytest.mark.skipif(
-    not CLINICDB_IMAGES.is_dir(),
-    reason="CVC-ClinicDB not on disk — run scripts/download_cvc_clinicdb.py first",
-)
-class TestClinicDBIntegration:
-    def test_len_matches_official_612(self):
-        # Also catches a cvc_clinicdb.yaml still pointing at Kvasir (would be 1000).
-        ds = load_dataset(CLINICDB_YAML)
-        assert len(ds) == 612
-
-    def test_config_points_at_clinicdb_not_kvasir(self):
-        cfg = yaml.safe_load(CLINICDB_YAML.read_text())
-        assert "cvc-clinicdb" in cfg["images_dir"]
-        assert "cvc-clinicdb" in cfg["masks_dir"]
-
-    def test_single_sample_shapes_match_yaml_resize(self):
-        h, w = _resize_from_yaml(CLINICDB_YAML)
-        ds = load_dataset(CLINICDB_YAML)
-        sample = ds[0]
-        assert sample["image"].shape == (3, h, w)
-        assert sample["mask"].shape == (1, h, w)
-        assert sample["image"].dtype == torch.float32
-        assert sample["mask"].dtype == torch.float32
-
-    def test_masks_are_binary(self):
-        ds = load_dataset(CLINICDB_YAML)
-        mask = ds[0]["mask"]
+    def test_masks_are_binary(self, name):
+        cfg_path = _require_on_disk(name)
+        mask = load_dataset(cfg_path)[0]["mask"]
         assert torch.all((mask == 0.0) | (mask == 1.0))
 
-    def test_transforms_match_kvasir_for_controlled_ablation(self):
-        kvasir = yaml.safe_load(KVASIR_YAML.read_text())["transforms"]
-        clinic = yaml.safe_load(CLINICDB_YAML.read_text())["transforms"]
-        assert kvasir == clinic
-
-    def test_dataloader_one_batch(self):
-        h, w = _resize_from_yaml(CLINICDB_YAML)
-        ds = load_dataset(CLINICDB_YAML)
-        loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
+    def test_dataloader_one_batch(self, name):
+        cfg_path = _require_on_disk(name)
+        h, w = _resize_from_yaml(cfg_path)
+        loader = DataLoader(load_dataset(cfg_path), batch_size=4, shuffle=False, num_workers=0)
         batch = next(iter(loader))
         assert batch["image"].shape == (4, 3, h, w)
         assert batch["mask"].shape == (4, 1, h, w)
+
+
+# ---------------------------------------------------------------------------
+# 7) Cross-dataset invariants
+# ---------------------------------------------------------------------------
+
+class TestDatasetConsistency:
+    def test_all_dataset_configs_share_a_transform_pipeline(self):
+        """An ablation across datasets is only controlled if preprocessing matches."""
+        configs = discover_dataset_configs(_ROOT / "configs")
+        pipelines = {
+            name: yaml.safe_load(path.read_text()).get("transforms")
+            for name, path in configs.items()
+        }
+        assert len(configs) >= 2, "expected at least two dataset configs"
+        reference_name, reference = next(iter(pipelines.items()))
+        for name, pipeline in pipelines.items():
+            assert pipeline == reference, (
+                f"{name} transforms differ from {reference_name}; "
+                "cross-dataset comparisons would be confounded"
+            )
+
+    def test_splits_are_deterministic_and_disjoint(self):
+        for name in discover_dataset_configs(_ROOT / "configs"):
+            if not (_ROOT / REAL_DATASETS[name][0]).is_dir():
+                continue
+            first_train, first_val = make_splits(name, config_dir=_ROOT / "configs")
+            again_train, again_val = make_splits(name, config_dir=_ROOT / "configs")
+            assert first_train.indices == again_train.indices
+            assert first_val.indices == again_val.indices
+            assert not set(first_train.indices) & set(first_val.indices)

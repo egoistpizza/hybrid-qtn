@@ -3,10 +3,15 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from dataset import load_dataset
+from dataset import (
+    build_train_val,
+    discover_dataset_configs,
+    parse_dataset_arg,
+    slugify_dataset_arg,
+)
 from models.unet_classic import UNet
 from utils import get_device
 
@@ -65,11 +70,12 @@ def main():
     device = get_device()
     print(f"Evaluating on device: {device}")
 
-    full_dataset = load_dataset("configs/kvasir_seg.yaml")
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    
-    _, val_ds = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    dataset_names = parse_dataset_arg(args.dataset)
+    dataset_slug = slugify_dataset_arg(dataset_names)
+
+    # Same helper train.py uses, so this is exactly the split it held out.
+    _, val_ds = build_train_val(dataset_names)
+    print(f"Dataset '{dataset_slug}': {len(val_ds)} validation samples")
     val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=4)
 
     viz_indices = torch.randperm(len(val_ds), generator=torch.Generator().manual_seed(123))[:args.num_samples]
@@ -78,7 +84,7 @@ def main():
     
     model = UNet(in_channels=3, out_channels=1).to(device)
     
-    checkpoint_path = "checkpoints/best_model.pth"
+    checkpoint_path = os.path.join("checkpoints", dataset_slug, "best_model.pth")
     if os.path.exists(checkpoint_path):
         state_dict = torch.load(checkpoint_path, map_location=device)
 
@@ -102,23 +108,30 @@ def main():
                 
     print(f"Avg Dice: {total_dice / len(val_loader):.4f} | Avg IoU: {total_iou / len(val_loader):.4f}")
 
+    output_dir = args.output_dir or os.path.join("outputs", "visualizations", dataset_slug)
+
     print(f"\nGenerating {args.num_samples} visualizations...")
     viz_count = 0
     with torch.inference_mode():
         for batch in tqdm(viz_loader, desc="Saving visualizations"):
             images, masks = batch["image"].to(device), batch["mask"].to(device)
             outputs = model(images)
-            save_visualizations(images, masks, outputs, batch["metadata"]["sample_id"], args.output_dir, viz_count)
+            save_visualizations(images, masks, outputs, batch["metadata"]["sample_id"], output_dir, viz_count)
             viz_count += images.size(0)
-    print(f"Visualizations saved to: {os.path.abspath(args.output_dir)}")
+    print(f"Visualizations saved to: {os.path.abspath(output_dir)}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate UNet on Kvasir-SEG validation set")
+    available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
+    parser = argparse.ArgumentParser(description="Evaluate UNet on a dataset's validation split")
+    parser.add_argument("--dataset", type=str, default="kvasir_seg",
+                        help="Dataset config stem(s) under configs/, comma-separated "
+                             f"to match a joint run. Available: {available}")
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11),
                         metavar="[5-10]", help="Number of samples to visualize (default: 10)")
-    parser.add_argument("--output_dir", type=str, default="outputs/visualizations",
-                        help="Directory to save visualization PNGs (default: outputs/visualizations)")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Directory to save visualization PNGs "
+                             "(default: outputs/visualizations/<dataset>)")
     return parser.parse_args()
 
 if __name__ == "__main__":

@@ -10,11 +10,16 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.amp import GradScaler
 from torch.optim.swa_utils import AveragedModel, SWALR
-from torch.utils.data import ConcatDataset, DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 
-from dataset import load_dataset
+from dataset import (
+    build_train_val,
+    discover_dataset_configs,
+    parse_dataset_arg,
+    slugify_dataset_arg,
+)
 from utils import get_device
 
 logging.basicConfig(
@@ -307,14 +312,18 @@ class SegmentationTrainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
+    available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
     parser.add_argument("--bond_dim", type=int, default=32, help="Bond dimension for MPS layer")
     parser.add_argument("--dataset", type=str, default="kvasir_seg",
-                        choices=["kvasir_seg", "cvc_clinicdb", "both"],
-                        help="Which dataset config under configs/ to train on")
+                        help="Dataset config stem(s) under configs/, comma-separated "
+                             f"for joint training. Available: {available}")
     args = parser.parse_args()
+
+    dataset_names = parse_dataset_arg(args.dataset)
+    dataset_slug = slugify_dataset_arg(dataset_names)
 
     seed_everything(42)
     device = get_device()
@@ -329,31 +338,12 @@ if __name__ == "__main__":
         "bond_dim": args.bond_dim,
         "swa_start_pct": 0.75,
         "swa_lr": 5e-5,
-        "dataset": args.dataset,
-        "checkpoint_dir": f"./checkpoints/{args.dataset}"
+        "dataset": dataset_slug,
+        "checkpoint_dir": f"./checkpoints/{dataset_slug}"
     }
 
-    def make_splits(config_name: str, seed: int = 42):
-        dataset = load_dataset(f"configs/{config_name}.yaml")
-        train_size = int(0.8 * len(dataset))
-        val_size = len(dataset) - train_size
-        return random_split(
-            dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(seed)
-        )
-
-    # Split each dataset first, then concatenate, so the val halves stay
-    # separable per-dataset for reporting.
-    if args.dataset == "both":
-        kvasir_train, kvasir_val = make_splits("kvasir_seg")
-        clinic_train, clinic_val = make_splits("cvc_clinicdb")
-        train_ds = ConcatDataset([kvasir_train, clinic_train])
-        val_ds = ConcatDataset([kvasir_val, clinic_val])
-    else:
-        train_ds, val_ds = make_splits(args.dataset)
-
-    logger.info(f"Dataset '{args.dataset}': {len(train_ds)} train / {len(val_ds)} val")
+    train_ds, val_ds = build_train_val(dataset_names)
+    logger.info(f"Dataset '{dataset_slug}': {len(train_ds)} train / {len(val_ds)} val")
 
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
@@ -398,7 +388,7 @@ if __name__ == "__main__":
         run_name = "vanilla_unet"
 
     config["model_type"] = args.model
-    run_name = f"{args.dataset}__{run_name}"
+    run_name = f"{dataset_slug}__{run_name}"
 
     model = model.to(device).to(memory_format=torch.channels_last)
     if int(torch.__version__.split('.')[0]) >= 2:

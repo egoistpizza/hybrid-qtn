@@ -1,7 +1,8 @@
 # `dataset/` — YAML-driven segmentation dataloader
 
 Single generic dataset class (`GenericSegmentationDataset`) driven by a YAML config.
-No per-dataset subclasses. A thin wrapper (`load_kvasir_seg`) exists for convenience.
+No per-dataset subclasses and no per-dataset loaders: `load_dataset` reads any
+config, and datasets are addressed by the stem of their YAML under `configs/`.
 
 ## Output contract
 
@@ -49,20 +50,33 @@ against `albumentations.*` plus `ToTensorV2` from `albumentations.pytorch`.
 Order matters. `ToTensorV2` must be last if present.
 
 To match the standard output contract, include a `Normalize` step followed by
-`ToTensorV2` (see `configs/kvasir_seg.yaml`).
+`ToTensorV2` (see any config under `configs/`).
 
 ## Usage
 
 ```python
-from dataset import load_kvasir_seg
+from dataset import load_dataset, resolve_config
 from torch.utils.data import DataLoader
 
-ds = load_kvasir_seg("configs/kvasir_seg.yaml")
+ds = load_dataset(resolve_config("kvasir_seg"))   # or a direct path
 loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=2)
 
 batch = next(iter(loader))
-assert batch["image"].shape == (4, 3, 256, 256)
-assert batch["mask"].shape  == (4, 1, 256, 256)
+assert batch["image"].shape == (4, 3, 512, 512)
+assert batch["mask"].shape  == (4, 1, 512, 512)
+```
+
+Train/val splitting lives in `dataset/splits.py` and is shared by `train.py` and
+`evaluate.py`, so an evaluation run always sees the split its training run held
+out:
+
+```python
+from dataset import build_train_val, discover_dataset_configs
+
+print(sorted(discover_dataset_configs()))       # ['cvc_clinicdb', 'kvasir_seg']
+
+train_ds, val_ds = build_train_val(["kvasir_seg"])
+train_ds, val_ds = build_train_val(["kvasir_seg", "cvc_clinicdb"])  # joint
 ```
 
 Or, with an arbitrary config dict:
@@ -89,10 +103,16 @@ ds = GenericSegmentationDataset({
 Assumes the dataset can be represented as an `images/` + `masks/` folder pair
 with matching stems. No new Python needed — just a new YAML:
 
-1. Copy `configs/kvasir_seg.yaml` to `configs/<name>.yaml`.
+1. Copy an existing config to `configs/<name>.yaml`.
 2. Set `dataset_name`, `images_dir`, `masks_dir`, `image_ext`, `mask_ext`.
+   **Repoint all four** — a half-edited copy silently loads the source dataset.
 3. Tune `mask_threshold` if masks aren't grayscale-thresholded around 127.
-4. Load it: `GenericSegmentationDataset(yaml.safe_load(open(path)))`.
+4. Keep `transforms` identical to the other configs, or cross-dataset
+   comparisons are confounded. `TestDatasetConsistency` enforces this.
+
+That is the whole procedure. `discover_dataset_configs()` picks the file up
+automatically, so `--dataset <name>` works in `train.py` and `evaluate.py`
+with no code change.
 
 If the dataset has a materially different layout (split subdirs, multi-class
 masks, JSON annotations), that's the point where a dedicated loader or a
