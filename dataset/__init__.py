@@ -12,6 +12,7 @@ from .splits import (
     slugify_dataset_arg,
 )
 from .transforms import build_transforms_from_config
+from .groups import grouped_split_indices, groups_for_samples, load_group_map
 
 __all__ = [
     "GenericSegmentationDataset",
@@ -24,4 +25,7 @@ __all__ = [
     "parse_dataset_arg",
     "resolve_config",
     "slugify_dataset_arg",
+    "grouped_split_indices",
+    "groups_for_samples",
+    "load_group_map",
 ]

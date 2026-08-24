@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 import yaml
 from torch.utils.data import ConcatDataset, Subset
-
+from .groups import grouped_split_indices, groups_for_samples
 from .loader import load_dataset
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
@@ -74,11 +74,28 @@ def make_splits(
 ) -> tuple[Subset, Subset]:
     """Deterministic train/val split for a single dataset.
 
+    A dataset whose config declares ``group_map`` is split by group, never by
+    sample: CVC-ClinicDB's frames belong to 29 video sequences, and a
+    frame-level split leaks the same polyp into both halves. Configs without
+    ``group_map`` (Kvasir-SEG) take the original ``random_split`` path
+    unchanged, so their existing checkpoints stay valid.
+
     ``train_size`` uses truncation, not rounding, to stay bit-identical to the
     splits produced before this helper existed — changing it would invalidate
     every checkpoint trained against the old arithmetic.
     """
     dataset = load_dataset(resolve_config(name, config_dir))
+
+    group_spec = dataset.config.get("group_map")
+    if group_spec is not None:
+        groups = groups_for_samples(
+            (sample_id for _, _, sample_id in dataset.samples),
+            group_spec,
+            root=CONFIG_DIR.parent,
+        )
+        train_idx, val_idx = grouped_split_indices(groups, val_fraction, seed)
+        return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
     train_size = int((1.0 - val_fraction) * len(dataset))
     val_size = len(dataset) - train_size
     return torch.utils.data.random_split(

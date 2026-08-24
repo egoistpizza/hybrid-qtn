@@ -395,3 +395,106 @@ class TestDatasetConsistency:
             assert first_train.indices == again_train.indices
             assert first_val.indices == again_val.indices
             assert not set(first_train.indices) & set(first_val.indices)
+
+
+# ---------------------------------------------------------------------------
+# 8) Sequence-aware splitting (CVC-ClinicDB)
+# ---------------------------------------------------------------------------
+
+import csv as _csv
+
+from dataset import grouped_split_indices, load_group_map, groups_for_samples
+
+CVC_GROUP_SPEC = {
+    "csv": "configs/cvc_clinicdb_sequences.csv",
+    "sample_column": "sample_id",
+    "group_column": "sequence_id",
+}
+
+
+class TestSequenceGrouping:
+    def test_group_map_covers_every_cvc_frame(self):
+        _require_on_disk("cvc_clinicdb")
+        mapping = load_group_map(CVC_GROUP_SPEC, root=_ROOT)
+        assert len(mapping) == 612
+        assert len(set(mapping.values())) == 29
+
+    def test_cvc_split_shares_no_sequence(self):
+        """The regression this whole change exists to prevent."""
+        _require_on_disk("cvc_clinicdb")
+        mapping = load_group_map(CVC_GROUP_SPEC, root=_ROOT)
+        train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+
+        def seqs(subset):
+            return {mapping[subset.dataset.samples[i][2]] for i in subset.indices}
+
+        assert not seqs(train) & seqs(val), "sequence appears in both halves"
+        assert len(seqs(val)) >= 4, "too few held-out sequences to report on"
+
+    def test_cvc_split_covers_dataset_exactly_once(self):
+        _require_on_disk("cvc_clinicdb")
+        train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        assert sorted([*train.indices, *val.indices]) == list(range(612))
+
+    def test_cvc_val_fraction_is_near_target(self):
+        _require_on_disk("cvc_clinicdb")
+        _, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        # Whole sequences move together, so the fraction only approximates 0.2.
+        assert 0.15 <= len(val) / 612 <= 0.25
+
+    def test_cvc_split_is_deterministic(self):
+        _require_on_disk("cvc_clinicdb")
+        a_train, a_val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        b_train, b_val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        assert a_train.indices == b_train.indices
+        assert a_val.indices == b_val.indices
+
+    def test_committed_map_matches_mirror_metadata(self):
+        """Guard the committed table against the mirror it was derived from."""
+        metadata = _ROOT / "data/cvc-clinicdb/metadata.csv"
+        if not metadata.is_file():
+            pytest.skip("mirror metadata.csv not present")
+        expected = {
+            str(int(r["frame_id"])): str(int(r["sequence_id"]))
+            for r in _csv.DictReader(metadata.open(newline=""))
+        }
+        assert load_group_map(CVC_GROUP_SPEC, root=_ROOT) == expected
+
+    def test_ungrouped_sample_raises_rather_than_leaking(self, tmp_path):
+        path = tmp_path / "partial.csv"
+        path.write_text("sample_id,sequence_id\n1,1\n")
+        with pytest.raises(KeyError, match="no group"):
+            groups_for_samples(["1", "2"], {"csv": str(path),
+                                            "sample_column": "sample_id",
+                                            "group_column": "sequence_id"})
+
+    def test_missing_group_csv_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="group_map csv not found"):
+            load_group_map({"csv": "nope.csv"}, root=tmp_path)
+
+    def test_grouped_split_is_group_pure_on_synthetic_data(self):
+        groups = [f"s{i // 10}" for i in range(100)]  # 10 groups of 10
+        train, val = grouped_split_indices(groups, 0.2, seed=42)
+        assert not {groups[i] for i in train} & {groups[i] for i in val}
+        assert sorted([*train, *val]) == list(range(100))
+
+
+class TestKvasirSplitUnchanged:
+    def test_kvasir_matches_legacy_random_split_exactly(self):
+        """Kvasir-SEG must be byte-identical to the pre-grouping split."""
+        cfg = _require_on_disk("kvasir_seg")
+        n = len(load_dataset(cfg))
+        train_size = int(0.8 * n)
+        legacy_train, legacy_val = torch.utils.data.random_split(
+            range(n), [train_size, n - train_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        train, val = make_splits("kvasir_seg", config_dir=_ROOT / "configs")
+        assert list(train.indices) == list(legacy_train.indices)
+        assert list(val.indices) == list(legacy_val.indices)
+
+    def test_kvasir_config_declares_no_group_map(self):
+        cfg = yaml.safe_load(
+            resolve_config("kvasir_seg", _ROOT / "configs").read_text()
+        )
+        assert "group_map" not in cfg

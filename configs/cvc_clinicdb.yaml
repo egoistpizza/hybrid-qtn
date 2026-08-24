@@ -6,6 +6,15 @@
 #
 # 612 frames from 29 colonoscopy sequences, natively 384x288.
 
+# Sequence-aware splitting. CVC-ClinicDB's 612 frames come from 29 colonoscopy
+# sequences; frames within a sequence are near-duplicates of one polyp. Splitting
+# by frame put a same-sequence sibling in train for 123/123 validation frames.
+# Whole sequences are now assigned to one side only. See dataset/groups.py.
+group_map:
+  csv: configs/cvc_clinicdb_sequences.csv
+  sample_column: sample_id
+  group_column: sequence_id
+
 dataset_name: cvc-clinicdb
 
 # Quoted: "Ground Truth" contains a space.
