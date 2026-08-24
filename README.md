@@ -66,7 +66,41 @@ This project is licensed under the MIT License - see the `LICENSE` file for deta
 *Note: The exact measurable parameter count for the Axial MPS layer at r=32 is 2,167,840, reducing the Vanilla U-Net bottleneck overhead by approximately 85% without exceeding VRAM limits.*
 
 
-## Install Downloaded CVC-ClinicDB
+## Datasets
+
+Both datasets are mirrored as Hugging Face dataset repos. The repo tree is the
+same layout the loaders expect, so a download is all that is needed — nothing
+under `configs/` changes.
+
+| Dataset | Hub repo | Frames | Size | Config |
+| --- | --- | ---: | ---: | --- |
+| Kvasir-SEG | `<ns>/kvasir-seg` | 1000 | 53 MB | `configs/kvasir_seg.yaml` |
+| CVC-ClinicDB | `<ns>/cvc-clinicdb` | 612 | 53 MB | `configs/cvc_clinicdb.yaml` |
+
+Point the scripts at your namespace once — edit `HF_NAMESPACE` in
+`scripts/hf_hub.py`, or export `HQTN_HF_ORG` — then:
+
+```bash
+python scripts/download_kvasir_seg.py
+python scripts/download_cvc_clinicdb.py
 ```
+
+If the mirrors are private, authenticate first with `hf auth login`.
+
+The original sources still work as fallbacks:
+
+```bash
+python scripts/download_kvasir_seg.py --source simula
+python scripts/download_cvc_clinicdb.py --source kaggle
 python scripts/download_cvc_clinicdb.py --source local --archive local_zip_path.zip
 ```
+
+To (re)publish the mirrors from a complete local copy:
+
+```bash
+python scripts/upload_datasets.py --dry-run
+```
+
+Drop `--dry-run` to upload. Repos are created private; `--public` opts out, and
+`--include-tif` adds CVC-ClinicDB's 264 MB original TIF tree (which Pillow
+cannot decode — the PNG rendering is what the loader uses).

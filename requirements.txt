@@ -14,6 +14,7 @@ fonttools==4.63.0
 fsspec==2026.6.0
 gitdb==4.0.12
 GitPython==3.1.51
+huggingface-hub==1.28.0
 idna==3.18
 iniconfig==2.3.0
 Jinja2==3.1.6

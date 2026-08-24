@@ -7,26 +7,31 @@ Unlike Kvasir-SEG there is no stable direct-download URL: the official page
 
 hands out a JavaScript-rendered Google Drive link to a ``.rar``, which is not
 scriptable and which ``zipfile`` cannot open. This script therefore supports
-three sources:
+four sources:
 
-    --source kaggle   (default) via the `kaggle` CLI, dataset balraj98/cvcclinicdb
+    --source hf       (default) the project's Hugging Face mirror, already in
+                      the canonical layout — no archive, no extract
+    --source kaggle   via the `kaggle` CLI, dataset balraj98/cvcclinicdb
     --source url      any direct HTTP(S) link you supply with --url
     --source local    an archive you already downloaded, passed via --archive
 
-Whatever the source, the archive is extracted, its internal layout is
-normalised, and the result is verified. Target layout (matches
-``configs/cvc_clinicdb.yaml``)::
+Whatever the source, the result is normalised to the same tree and verified.
+Target layout (matches ``configs/cvc_clinicdb.yaml``)::
 
-    data/cvc-clinicdb/<archive>
-    data/cvc-clinicdb/CVC-ClinicDB/Original/*.tif
-    data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/*.tif
+    data/cvc-clinicdb/CVC-ClinicDB/Original/*.png
+    data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/*.png
 
 Mirrors differ in file format (.tif on the official release, .png on several
-Kaggle mirrors). The verification step prints the extensions it actually found
-so you can set ``image_ext`` / ``mask_ext`` in the YAML accordingly.
+Kaggle mirrors, and on the HF mirror). The verification step prints the
+extensions it actually found so you can set ``image_ext`` / ``mask_ext`` in the
+YAML accordingly. The original TIFs declare ``PhotometricInterpretation=1``
+with three samples per pixel, which Pillow refuses to decode — so the PNG
+rendering is the one this project actually loads, and ``--include-tif`` only
+fetches the TIFs as an archival extra.
 
 Usage:
     python scripts/download_cvc_clinicdb.py
+    python scripts/download_cvc_clinicdb.py --source kaggle
     python scripts/download_cvc_clinicdb.py --source url --url https://.../CVC-ClinicDB.zip
     python scripts/download_cvc_clinicdb.py --source local --archive ~/Downloads/CVC-ClinicDB.rar
     python scripts/download_cvc_clinicdb.py --force
@@ -46,6 +51,11 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hf_hub import download_mirror, hub_error_hint, resolve_repo_id  # noqa: E402
+
+MIRROR_NAME = "cvc-clinicdb"
 KAGGLE_DATASET = "balraj98/cvcclinicdb"
 EXTRACTED_MARKER = "CVC-ClinicDB"
 IMAGES_SUBDIR = "Original"
@@ -344,9 +354,13 @@ def _verify(extracted: Path) -> None:
 
 def download_cvc_clinicdb(
     dest: Path,
-    source: str = "kaggle",
+    source: str = "hf",
     url: str | None = None,
     archive: Path | None = None,
+    repo_id: str | None = None,
+    revision: str = "main",
+    token: str | None = None,
+    include_tif: bool = False,
     force: bool = False,
 ) -> Path:
     dest = dest.expanduser().resolve()
@@ -356,6 +370,23 @@ def download_cvc_clinicdb(
     if extracted.is_dir() and not force:
         print(f"Already present: {extracted} (use --force to redo)")
         _verify(extracted)
+        return extracted
+
+    if source == "hf":
+        resolved = resolve_repo_id(MIRROR_NAME, repo_id)
+        try:
+            extracted = download_mirror(
+                MIRROR_NAME,
+                dest=dest,
+                repo_id=resolved,
+                revision=revision,
+                token=token,
+                include_extra=include_tif,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{hub_error_hint(resolved)}\n  ({exc})") from exc
+        _verify(extracted)
+        print(f"Done. Dataset at {extracted}")
         return extracted
 
     if source == "kaggle":
@@ -398,9 +429,34 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--source",
-        choices=["kaggle", "url", "local"],
-        default="kaggle",
-        help="Where to get the archive from (default: kaggle)",
+        choices=["hf", "kaggle", "url", "local"],
+        default="hf",
+        help="Where to get the data from (default: hf)",
+    )
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        default=None,
+        help="Hugging Face dataset repo, e.g. someone/cvc-clinicdb. "
+        "Defaults to HF_NAMESPACE in scripts/hf_hub.py.",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default="main",
+        help="Hub revision to pin — branch, tag, or commit sha (default: main).",
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="HF token, for a private mirror. Defaults to the cached login.",
+    )
+    parser.add_argument(
+        "--include-tif",
+        action="store_true",
+        help="Also fetch the 264 MB original TIF tree (--source hf only). "
+        "Pillow cannot decode these; the PNGs are what the loader uses.",
     )
     parser.add_argument(
         "--url",
@@ -429,5 +485,9 @@ if __name__ == "__main__":
         source=args.source,
         url=args.url,
         archive=args.archive,
+        repo_id=args.repo_id,
+        revision=args.revision,
+        token=args.token,
+        include_tif=args.include_tif,
         force=args.force,
     )
