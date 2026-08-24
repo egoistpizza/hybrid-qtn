@@ -84,7 +84,7 @@ def main():
     
     model = UNet(in_channels=3, out_channels=1).to(device)
     
-    checkpoint_path = os.path.join("checkpoints", dataset_slug, "best_model.pth")
+    checkpoint_path = os.path.join("checkpoints", args.run or dataset_slug, "best_model.pth")
     if os.path.exists(checkpoint_path):
         state_dict = torch.load(checkpoint_path, map_location=device)
 
@@ -132,6 +132,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Directory to save visualization PNGs "
                              "(default: outputs/visualizations/<dataset>)")
+    parser.add_argument("--run", type=str, default=None,
+                        help="Checkpoint dir name under checkpoints/, e.g. cvc_clinicdb__vanilla_unet")
     return parser.parse_args()
 
 if __name__ == "__main__":

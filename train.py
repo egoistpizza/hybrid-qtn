@@ -320,6 +320,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="kvasir_seg",
                         help="Dataset config stem(s) under configs/, comma-separated "
                              f"for joint training. Available: {available}")
+    parser.add_argument("--tag", type=str, default=None, help="Suffix to distinguish runs of the same config")
     args = parser.parse_args()
 
     dataset_names = parse_dataset_arg(args.dataset)
@@ -389,6 +390,9 @@ if __name__ == "__main__":
 
     config["model_type"] = args.model
     run_name = f"{dataset_slug}__{run_name}"
+    if args.tag:
+        run_name = f"{run_name}__{args.tag}"
+    config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
 
     model = model.to(device).to(memory_format=torch.channels_last)
     if int(torch.__version__.split('.')[0]) >= 2:
