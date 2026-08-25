@@ -85,13 +85,16 @@ def load_model_weights(model: torch.nn.Module, checkpoint_path: Path, device: to
     print(f"Loading weights from: {checkpoint_path}")
     state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
     
-    clean_state_dict = {
-        key.replace("_orig_mod.", "").replace("module.", ""): value 
-        for key, value in state_dict.items()
-    }
-    
+    clean_state_dict = {}
+    for key, value in state_dict.items():
+        if "n_averaged" in key:
+            continue
+            
+        clean_key = key.replace("_orig_mod.", "").replace("module.", "")
+        clean_state_dict[clean_key] = value
+        
     model.load_state_dict(clean_state_dict)
-    print("Weights successfully loaded and adapted!")
+    print("Weights loaded successfully!")
 
 
 def build_model(model_type: str, bond_dim: int) -> torch.nn.Module:
