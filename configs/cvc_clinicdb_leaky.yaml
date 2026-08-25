@@ -1,0 +1,38 @@
+# CVC-ClinicDB — DIAGNOSTIC ONLY. LEAKY SPLIT. NOT A REPORTABLE RESULT.
+#
+# Identical to cvc_clinicdb.yaml except the `group_map:` block is absent, so
+# dataset/splits.py falls back to frame-level random_split. Frames from the
+# same colonoscopy sequence land on both sides: 123/123 validation frames get
+# a same-sequence sibling in train.
+#
+# Purpose: measure the leaky upper bound, to separate "the pipeline is broken"
+# from "the sequence-held-out protocol is genuinely hard".
+#
+# images_dir/masks_dir deliberately point at the SAME data as cvc_clinicdb.yaml.
+# This is the one case where dataset/README.md's "repoint all four" warning
+# does not apply — the split is the only variable being changed.
+
+dataset_name: cvc-clinicdb-leaky
+
+images_dir: "data/cvc-clinicdb/CVC-ClinicDB/Original"
+masks_dir:  "data/cvc-clinicdb/CVC-ClinicDB/Ground Truth"
+image_ext:  .png
+mask_ext:   .png
+
+strict_pairing: true
+mask_threshold: 127
+
+# Byte-identical to cvc_clinicdb.yaml and kvasir_seg.yaml.
+transforms:
+  - name: Resize
+    height: 512
+    width: 512
+  - name: HorizontalFlip
+    p: 0.5
+  - name: VerticalFlip
+    p: 0.5
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
