@@ -10,9 +10,10 @@ Semantic categories (one test class per concern):
     TestPairing            — pairing.pair_by_stem behavior
     TestTransforms         — transforms.build_transforms_from_config
     TestOutputContract     — GenericSegmentationDataset output shape/dtype/keys
-    TestConfigLoader       — kvasir_seg.load_kvasir_seg (YAML -> dataset)
+    TestConfigLoader       — loader.load_dataset (YAML -> dataset)
     TestDataLoaderBatching — torch DataLoader collation into batches
-    TestKvasirIntegration  — real Kvasir-SEG on disk (auto-skips if missing)
+    TestRealDatasetIntegration — every dataset on disk (each auto-skips if missing)
+    TestDatasetConsistency — invariants that must hold across all datasets
 """
 
 from __future__ import annotations
@@ -36,8 +37,11 @@ from torch.utils.data import DataLoader
 from dataset import (
     GenericSegmentationDataset,
     build_transforms_from_config,
-    load_kvasir_seg,
+    discover_dataset_configs,
+    load_dataset,
+    make_splits,
     pair_by_stem,
+    resolve_config,
 )
 
 
@@ -265,13 +269,13 @@ class TestOutputContract:
 # ---------------------------------------------------------------------------
 
 class TestConfigLoader:
-    def test_load_kvasir_seg_reads_yaml_and_instantiates(
+    def test_load_dataset_reads_yaml_and_instantiates(
         self, tmp_path, base_config, standard_transforms,
     ):
         base_config["transforms"] = standard_transforms
         yaml_path = tmp_path / "cfg.yaml"
         yaml_path.write_text(yaml.safe_dump(base_config))
-        ds = load_kvasir_seg(yaml_path)
+        ds = load_dataset(yaml_path)
         assert len(ds) == 4
         assert ds[0]["image"].shape == (3, 32, 32)
         assert ds[0]["mask"].shape == (1, 32, 32)
@@ -295,11 +299,14 @@ class TestDataLoaderBatching:
 
 
 # ---------------------------------------------------------------------------
-# 6) Integration — real Kvasir-SEG on disk (auto-skips if not downloaded)
+# 6) Integration — every real dataset on disk (each auto-skips if missing)
 # ---------------------------------------------------------------------------
 
-KVASIR_YAML = _ROOT / "configs" / "kvasir_seg.yaml"
-KVASIR_IMAGES = _ROOT / "data" / "kvasir-seg" / "Kvasir-SEG" / "images"
+# name -> (images_dir relative to repo root, official sample count)
+REAL_DATASETS = {
+    "kvasir_seg": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
+    "cvc_clinicdb": ("data/cvc-clinicdb/CVC-ClinicDB/Original", 612),
+}
 
 
 def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
@@ -307,31 +314,187 @@ def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
     for step in cfg.get("transforms", []):
         if step["name"] == "Resize":
             return step["height"], step["width"]
-    raise AssertionError("no Resize step in kvasir_seg.yaml")
+    raise AssertionError(f"no Resize step in {cfg_path.name}")
 
 
-@pytest.mark.skipif(
-    not KVASIR_IMAGES.is_dir(),
-    reason="Kvasir-SEG not on disk — run scripts/download_kvasir_seg.py first",
-)
-class TestKvasirIntegration:
-    def test_len_matches_official_1000(self):
-        ds = load_kvasir_seg(KVASIR_YAML)
-        assert len(ds) == 1000
+def _require_on_disk(name: str) -> Path:
+    """Return the config path, or skip if the dataset is not downloaded."""
+    images_dir, _ = REAL_DATASETS[name]
+    if not (_ROOT / images_dir).is_dir():
+        pytest.skip(f"{name} not on disk — run scripts/download_{name}.py first")
+    return resolve_config(name, _ROOT / "configs")
 
-    def test_single_sample_shapes_match_yaml_resize(self):
-        h, w = _resize_from_yaml(KVASIR_YAML)
-        ds = load_kvasir_seg(KVASIR_YAML)
-        sample = ds[0]
+
+@pytest.mark.parametrize("name", sorted(REAL_DATASETS))
+class TestRealDatasetIntegration:
+    def test_config_is_discoverable(self, name):
+        assert name in discover_dataset_configs(_ROOT / "configs")
+
+    def test_len_matches_official_count(self, name):
+        # Also catches a config copied from another dataset without repointing
+        # images_dir/masks_dir — the count would be the wrong dataset's.
+        cfg_path = _require_on_disk(name)
+        assert len(load_dataset(cfg_path)) == REAL_DATASETS[name][1]
+
+    def test_config_points_at_its_own_data(self, name):
+        cfg_path = resolve_config(name, _ROOT / "configs")
+        cfg = yaml.safe_load(cfg_path.read_text())
+        expected_root = REAL_DATASETS[name][0].split("/")[1]
+        assert expected_root in cfg["images_dir"]
+        assert expected_root in cfg["masks_dir"]
+
+    def test_single_sample_shapes_match_yaml_resize(self, name):
+        cfg_path = _require_on_disk(name)
+        h, w = _resize_from_yaml(cfg_path)
+        sample = load_dataset(cfg_path)[0]
         assert sample["image"].shape == (3, h, w)
         assert sample["mask"].shape == (1, h, w)
         assert sample["image"].dtype == torch.float32
         assert sample["mask"].dtype == torch.float32
 
-    def test_dataloader_one_batch(self):
-        h, w = _resize_from_yaml(KVASIR_YAML)
-        ds = load_kvasir_seg(KVASIR_YAML)
-        loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=0)
+    def test_masks_are_binary(self, name):
+        cfg_path = _require_on_disk(name)
+        mask = load_dataset(cfg_path)[0]["mask"]
+        assert torch.all((mask == 0.0) | (mask == 1.0))
+
+    def test_dataloader_one_batch(self, name):
+        cfg_path = _require_on_disk(name)
+        h, w = _resize_from_yaml(cfg_path)
+        loader = DataLoader(load_dataset(cfg_path), batch_size=4, shuffle=False, num_workers=0)
         batch = next(iter(loader))
         assert batch["image"].shape == (4, 3, h, w)
         assert batch["mask"].shape == (4, 1, h, w)
+
+
+# ---------------------------------------------------------------------------
+# 7) Cross-dataset invariants
+# ---------------------------------------------------------------------------
+
+class TestDatasetConsistency:
+    def test_all_dataset_configs_share_a_transform_pipeline(self):
+        """An ablation across datasets is only controlled if preprocessing matches."""
+        configs = discover_dataset_configs(_ROOT / "configs")
+        pipelines = {
+            name: yaml.safe_load(path.read_text()).get("transforms")
+            for name, path in configs.items()
+        }
+        assert len(configs) >= 2, "expected at least two dataset configs"
+        reference_name, reference = next(iter(pipelines.items()))
+        for name, pipeline in pipelines.items():
+            assert pipeline == reference, (
+                f"{name} transforms differ from {reference_name}; "
+                "cross-dataset comparisons would be confounded"
+            )
+
+    def test_splits_are_deterministic_and_disjoint(self):
+        for name in discover_dataset_configs(_ROOT / "configs"):
+            if not (_ROOT / REAL_DATASETS[name][0]).is_dir():
+                continue
+            first_train, first_val = make_splits(name, config_dir=_ROOT / "configs")
+            again_train, again_val = make_splits(name, config_dir=_ROOT / "configs")
+            assert first_train.indices == again_train.indices
+            assert first_val.indices == again_val.indices
+            assert not set(first_train.indices) & set(first_val.indices)
+
+
+# ---------------------------------------------------------------------------
+# 8) Sequence-aware splitting (CVC-ClinicDB)
+# ---------------------------------------------------------------------------
+
+import csv as _csv
+
+from dataset import grouped_split_indices, load_group_map, groups_for_samples
+
+CVC_GROUP_SPEC = {
+    "csv": "configs/cvc_clinicdb_sequences.csv",
+    "sample_column": "sample_id",
+    "group_column": "sequence_id",
+}
+
+
+class TestSequenceGrouping:
+    def test_group_map_covers_every_cvc_frame(self):
+        _require_on_disk("cvc_clinicdb")
+        mapping = load_group_map(CVC_GROUP_SPEC, root=_ROOT)
+        assert len(mapping) == 612
+        assert len(set(mapping.values())) == 29
+
+    def test_cvc_split_shares_no_sequence(self):
+        """The regression this whole change exists to prevent."""
+        _require_on_disk("cvc_clinicdb")
+        mapping = load_group_map(CVC_GROUP_SPEC, root=_ROOT)
+        train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+
+        def seqs(subset):
+            return {mapping[subset.dataset.samples[i][2]] for i in subset.indices}
+
+        assert not seqs(train) & seqs(val), "sequence appears in both halves"
+        assert len(seqs(val)) >= 4, "too few held-out sequences to report on"
+
+    def test_cvc_split_covers_dataset_exactly_once(self):
+        _require_on_disk("cvc_clinicdb")
+        train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        assert sorted([*train.indices, *val.indices]) == list(range(612))
+
+    def test_cvc_val_fraction_is_near_target(self):
+        _require_on_disk("cvc_clinicdb")
+        _, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        # Whole sequences move together, so the fraction only approximates 0.2.
+        assert 0.15 <= len(val) / 612 <= 0.25
+
+    def test_cvc_split_is_deterministic(self):
+        _require_on_disk("cvc_clinicdb")
+        a_train, a_val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        b_train, b_val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        assert a_train.indices == b_train.indices
+        assert a_val.indices == b_val.indices
+
+    def test_committed_map_matches_mirror_metadata(self):
+        """Guard the committed table against the mirror it was derived from."""
+        metadata = _ROOT / "data/cvc-clinicdb/metadata.csv"
+        if not metadata.is_file():
+            pytest.skip("mirror metadata.csv not present")
+        expected = {
+            str(int(r["frame_id"])): str(int(r["sequence_id"]))
+            for r in _csv.DictReader(metadata.open(newline=""))
+        }
+        assert load_group_map(CVC_GROUP_SPEC, root=_ROOT) == expected
+
+    def test_ungrouped_sample_raises_rather_than_leaking(self, tmp_path):
+        path = tmp_path / "partial.csv"
+        path.write_text("sample_id,sequence_id\n1,1\n")
+        with pytest.raises(KeyError, match="no group"):
+            groups_for_samples(["1", "2"], {"csv": str(path),
+                                            "sample_column": "sample_id",
+                                            "group_column": "sequence_id"})
+
+    def test_missing_group_csv_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="group_map csv not found"):
+            load_group_map({"csv": "nope.csv"}, root=tmp_path)
+
+    def test_grouped_split_is_group_pure_on_synthetic_data(self):
+        groups = [f"s{i // 10}" for i in range(100)]  # 10 groups of 10
+        train, val = grouped_split_indices(groups, 0.2, seed=42)
+        assert not {groups[i] for i in train} & {groups[i] for i in val}
+        assert sorted([*train, *val]) == list(range(100))
+
+
+class TestKvasirSplitUnchanged:
+    def test_kvasir_matches_legacy_random_split_exactly(self):
+        """Kvasir-SEG must be byte-identical to the pre-grouping split."""
+        cfg = _require_on_disk("kvasir_seg")
+        n = len(load_dataset(cfg))
+        train_size = int(0.8 * n)
+        legacy_train, legacy_val = torch.utils.data.random_split(
+            range(n), [train_size, n - train_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        train, val = make_splits("kvasir_seg", config_dir=_ROOT / "configs")
+        assert list(train.indices) == list(legacy_train.indices)
+        assert list(val.indices) == list(legacy_val.indices)
+
+    def test_kvasir_config_declares_no_group_map(self):
+        cfg = yaml.safe_load(
+            resolve_config("kvasir_seg", _ROOT / "configs").read_text()
+        )
+        assert "group_map" not in cfg
