@@ -57,7 +57,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Evaluating on device: {device}")
     
-    full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
+    # full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
+    full_dataset = load_kvasir_seg(os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs/kvasir_seg.yaml"))
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     

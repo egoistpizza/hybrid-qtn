@@ -17,16 +17,21 @@ def disable_albumentations_update_checks(): # {{{
 # }}}
 
 # Let the compiler cache be saved for faster loads in subsequent runs
-# FIXME: Not yet verified to be working
+# FIXME: Not yet verified to be working (might be because of the existence of the on-ASCII chars such as the “İ” of “İnzva”)
 def init_torch_cache(): # {{{
     import logging
+    import os
+    # ( “” )
     logger = logging.getLogger(__name__)
     
-    
-    import os
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
-    os.environ["TORCHINDUCTOR_CACHE_DIR"]      = "./cache/torch_cache"
-    logger.debug(f"\x1b[38;5;240mTorch cache will be saved to: {os.environ["TORCHINDUCTOR_CACHE_DIR"]}\x1b[0m")
+    
+    # This script is in utils (which is the parent of the parent of this file) (specifically, dirname of the script file
+    # followed by a path starting with "..")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"]      =  os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../cache/torch_cache"))
+
+    
+    logger.debug(f"\x1b[38;5;240mTorch cache will be saved to: {os.environ['TORCHINDUCTOR_CACHE_DIR']}\x1b[0m")
 # }}}
 
 def init_logger_basicconfig(): # {{{

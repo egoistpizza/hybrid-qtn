@@ -27,7 +27,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 import logging
-
+from tqdm import tqdm
 
 # Add parent folder so we can import from there
 def _(): #   {{{
@@ -71,19 +71,22 @@ def _download_with_curl(url: str, dest: Path) -> None: # {{{
     if curl is None:
         # return False
         raise RuntimeError("shutil.which(\"curl\") == None")
+    
     tmp = dest.with_suffix(dest.suffix + ".part")
     print(f"Downloading via curl {url}\n           -> {dest}")
+    
     try:
         subprocess.run(
             [curl, "-fL", "--retry", "3", "-o", str(tmp), url],
             check=True,
         )
+        tmp.replace(dest)
+        
     except subprocess.CalledProcessError as exc:
         tmp.unlink(missing_ok=True)
         # print(f"  curl failed (exit {exc.returncode}); will try urllib fallback")
         # return False
-        raise RuntimeError(f"  curl failed (exit {exc.returncode})")
-    # tmp.replace(dest)
+        raise RuntimeError(f"Download failed (curl) (exit code: {exc.returncode}): {exc}")
     # return True
 # }}}
 
@@ -116,55 +119,97 @@ def _download_with_urllib(url: str, dest: Path, insecure_omit_SSL_context: bool,
     tmp = dest.with_suffix(dest.suffix + ".part")
     print(f"Downloading via urllib {url}\n           -> {dest}")
     
+    from urllib.error import HTTPError, URLError
     
-    with custom_urllib_request_urlopen(url) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        digest = hashlib.sha256()
-        read = 0
-        with tmp.open("wb") as f:
-            while True:
-                block = resp.read(chunk)
-                if not block:
-                    break
-                f.write(block)
-                digest.update(block)
-                read += len(block)
-                if total:
-                    pct = 100.0 * read / total
-                    sys.stdout.write(
-                        f"\r  {read / 1e6:8.2f} / {total / 1e6:.2f} MB "
-                        f"({pct:5.1f}%)"
-                    )
-                else:
-                    sys.stdout.write(f"\r  {read / 1e6:8.2f} MB")
-                sys.stdout.flush()
-    sys.stdout.write("\n")
-    tmp.replace(dest)
+    try:
+        with custom_urllib_request_urlopen(url) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            digest = hashlib.sha256()
+            read = 0
+            with tmp.open("wb") as f:
+                while True:
+                    block = resp.read(chunk)
+                    if not block:
+                        break
+                    f.write(block)
+                    digest.update(block)
+                    read += len(block)
+                    if total:
+                        pct = 100.0 * read / total
+                        sys.stdout.write(
+                            f"\r  {read / 1e6:8.2f} / {total / 1e6:.2f} MB "
+                            f"({pct:5.1f}%)"
+                        )
+                    else:
+                        sys.stdout.write(f"\r  {read / 1e6:8.2f} MB")
+                    sys.stdout.flush()
+        
+        tmp.replace(dest)
+        sys.stdout.write("\n")
+    
+    except (HTTPError, URLError) as exc:
+        tmp.unlink(missing_ok=True)
+        # return False
+        raise RuntimeError(f"Download failed (requests): {exc}")
+    
     print(f"  sha256: {digest.hexdigest()}")
 # }}}
 
-# TODO: Consider adding progress bar
 def _download_with_requests(url: str, dest: Path, insecure_no_verify: bool, chunk: int = 1 << 20) -> None: # {{{
     logger.debug(f"\x1b[38;5;240mdownload_kvasir_seg.py::_download_with_requests(url={url}, dest={dest}, insecure_no_verify={insecure_no_verify}, chunk={chunk})\x1b[0m")
     import requests
-    response = requests.get(url, stream=True, verify = (not insecure_no_verify))
-    response.raise_for_status()
     
-    with dest.open("wb") as file:
-        for chunk in response.iter_content(chunk_size = chunk):
-            if chunk:
-                file.write(chunk)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    print(f"Downloading via requests {url}\n           -> {dest}")
+    
+    from requests.exceptions import ConnectionError, SSLError, HTTPError
+    
+    try:
+        response = requests.get(url, stream=True, verify = (not insecure_no_verify))
+        response.raise_for_status()
+        
+        # Retrieve the total file size from the headers
+        total_size = int(response.headers.get('content-length', 0))
+        
+    
+        with tmp.open("wb") as file, tqdm(
+            desc=dest.name,
+            total=total_size,
+            unit='iB',
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as pbar:
+            
+            for data_chunk in response.iter_content(chunk_size=chunk):
+                if data_chunk:
+                    file.write(data_chunk)
+                    pbar.update(len(data_chunk))
+                
+        tmp.replace(dest)
+                    
+    except (ConnectionError, SSLError, HTTPError) as exc:
+        tmp.unlink(missing_ok=True)
+        # return False
+        raise RuntimeError(f"Download failed (requests): {exc}")
+    
 # }}}
+
+
+
+
+
+
 
 def _download(url: str, dest: Path) -> None: # {{{
     dest.parent.mkdir(parents=True, exist_ok=True)
     logger.debug(f"\x1b[38;5;240mdownload_kvasir_seg.py::_download(url={url}, dest={dest})\x1b[0m")
     
     # Try CURL first...
+    print(f"Will try CURL...")
     try:
         _download_with_curl(url, dest)
         return
-    except Exception as e:
+    except RuntimeError as e:
         print(f"Error:")
         print(f"{str(e)}")
         print()
@@ -174,7 +219,7 @@ def _download(url: str, dest: Path) -> None: # {{{
     try:
         _download_with_requests(url, dest, insecure_no_verify = False)
         return
-    except Exception as e:
+    except RuntimeError as e:
         print(f"Error:")
         print(f"{str(e)}")
         print()
@@ -184,7 +229,7 @@ def _download(url: str, dest: Path) -> None: # {{{
     try:
         _download_with_urllib(url, dest, insecure_omit_SSL_context = False)
         return
-    except Exception as e:
+    except RuntimeError as e:
         print(f"Error:")
         print(f"{str(e)}")
         print()
@@ -194,7 +239,7 @@ def _download(url: str, dest: Path) -> None: # {{{
     try:
         _download_with_requests(url, dest, insecure_no_verify = True)
         return
-    except Exception as e:
+    except RuntimeError as e:
         print(f"Error:")
         print(f"{str(e)}")
         print()

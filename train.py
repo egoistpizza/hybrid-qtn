@@ -20,7 +20,7 @@ from models.unet_classic import UNet
 
 
 logger = None # Will be initialized in main
-device = None # Will be initialized in main
+# device = None # Will be initialized in main
 
 
 
@@ -58,7 +58,8 @@ class SegmentationTrainer:
         config: Dict[str, Any],
         scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
     ):
-        self.model = model.to(device).to(memory_format=torch.channels_last)
+        # self.model = model.to(device).to(memory_format=torch.channels_last)
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.criterion = criterion
@@ -81,7 +82,7 @@ class SegmentationTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            masks = batch["mask"].to(self.device, non_blocking=True)
+            masks  = batch["mask" ].to(self.device, non_blocking=True                                   )
 
             with autocast():
                 outputs = self.model(images)
@@ -185,10 +186,12 @@ def main(): # {{{
     init()
     
     global logger
-    global device
+    # global device
+    
     logger = logging.getLogger(__name__) # Getting it only after we call the init() the first time (which calls init_logger_basicconfig())
     
     seed_everything(42)
+    # TODO: Maybe add xpu and even xla support in future
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # TODO: Maybe get this from a YAML file in /configs
@@ -203,12 +206,13 @@ def main(): # {{{
         "checkpoint_dir": "./checkpoints"
     }
 
-    full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
+    # full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
+    full_dataset = load_kvasir_seg(os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs/kvasir_seg.yaml"))
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     
     train_ds, val_ds = random_split(
-        full_dataset, 
+        full_dataset,
         [train_size, val_size], 
         generator=torch.Generator().manual_seed(42)
     )
@@ -217,11 +221,13 @@ def main(): # {{{
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
     # Model
-    model = UNet(in_channels=3, out_channels=1) 
+    model = UNet(in_channels=3, out_channels=1)
+    # Move right afterwards (especially before an optimizer refers to it)
+    model = model.to(device).to(memory_format=torch.channels_last)
     
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
-            c_model = torch.compile(model)
+            c_model = torch.compile(model).to(device)
             # torch.compile is lazy, it will wrap and successfully get out of the try-catch, and will try to compile only
             # when run something forward/backward.
             # Try actually attempting to run anything through it just to see if it compiles successfully.
@@ -230,8 +236,9 @@ def main(): # {{{
             # Replace it with the compiled only after passing the test
             model = c_model
         except Exception as e:
-            logger.warning("[!] torch.compile(model)(input) failed")
-            # logger.warning(e)
+            # On Windows, torch looks for cl.exe (a tool in Microsoft's MSVC compiler) to compile the model into native code.
+            logger.warning("[!] c_model(input) (where c_model = torch.compile(model).to(device)) failed")
+            logger.warning(e)
     
     criterion = BCEDiceLoss()
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
