@@ -227,9 +227,14 @@ outputs/
 
 # Weights & Biases Logs
 wandb/
+**/wandb/**
 
-# Any data (i.e. to feed into the model)
+# Any data (datasets and raw, i.e. to feed into the model)
+data/
 **/data/*
 
 # Generic directory for cache files
 cache/
+
+# Test Artifacts
+augmentation_preview.png
