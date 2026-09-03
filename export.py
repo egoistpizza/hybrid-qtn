@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import torch
+from torch.export import Dim
 
 from utils import get_device
-
 
 def build_export_model(model_type: str, bond_dim: int) -> torch.nn.Module:
     if model_type == "deep_hybrid":
@@ -27,7 +27,6 @@ def build_export_model(model_type: str, bond_dim: int) -> torch.nn.Module:
         
     from models.unet_classic import UNet
     return UNet(in_channels=3, out_channels=1)
-
 
 def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tensor, total_iterations: int = 100) -> float:
     model.eval()
@@ -55,7 +54,6 @@ def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tens
     
     return frames_per_second
 
-
 def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarray, total_iterations: int = 100) -> float:
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -80,9 +78,9 @@ def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarra
     
     return frames_per_second
 
-
 def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, output_file_path: Path) -> None:
     model.eval()
+    batch_dim = Dim("batch_size", min=1, max=64)
     
     torch.onnx.export(
         model,
@@ -93,12 +91,8 @@ def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, outp
         do_constant_folding=True,
         input_names=["input_image"],
         output_names=["segmentation_mask"],
-        dynamic_axes={
-            "input_image": {0: "batch_size"},
-            "segmentation_mask": {0: "batch_size"}
-        }
+        dynamic_shapes=({0: batch_dim},)  # Note the tuple format here
     )
-
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -109,7 +103,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default="outputs/onnx")
     return parser.parse_args()
-
 
 def main() -> None:
     args = parse_arguments()
@@ -140,7 +133,6 @@ def main() -> None:
     print(f"PyTorch FPS : {pytorch_fps:.2f}")
     print(f"ONNX FPS    : {onnx_fps:.2f}")
     print(f"Speedup     : {speedup_ratio:.2f}x")
-
 
 if __name__ == "__main__":
     main()
