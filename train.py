@@ -441,9 +441,11 @@ def main(): # {{{
     #       Maybe it is unnecessarily redundant and the model may be safely moved at this point too
     # model = model.to(device).to(memory_format=torch.channels_last)
     
+    
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
-            c_model = torch.compile(model).to(device)
+            logger.info("Compiling the model...")
+            c_model = torch.compile(model.to(device)).to(device)
             # torch.compile is lazy, it will wrap and successfully get out of the try-catch, and will try to compile only
             # when run something forward/backward.
             # Try actually attempting to run anything through it just to see if it compiles successfully.
@@ -451,22 +453,20 @@ def main(): # {{{
             _ = c_model(dummy_input)
             # Replace it with the compiled only after passing the test
             model = c_model
+            logger.info("Compiled the model")
         except Exception as e:
             # On Windows, torch looks for cl.exe (a tool in Microsoft's MSVC compiler) to compile the model into native code.
-            logger.warning("[!] c_model(input) (where c_model = torch.compile(model).to(device)) failed")
-            logger.warning(e)
+            logger.warning(f"[!] c_model(input) (where c_model = torch.compile(model.to(device)).to(device)) failed: {e}")
+            # logger.warning(e)
     
-    if int(torch.__version__.split('.')[0]) >= 2:
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            logger.warning(f"torch.compile failed: {e}")
     
     
     criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
-
+    
+    
+    
     trainer = SegmentationTrainer(
         model=model,
         train_loader=train_loader,
@@ -477,6 +477,7 @@ def main(): # {{{
         config=config,
         scheduler=scheduler
     )
+    
     
     trainer.fit(run_name=run_name)
     
