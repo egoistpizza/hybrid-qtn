@@ -20,6 +20,7 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
+from utils.metrics import calculate_all_metrics
 from utils import get_device
 
 logging.basicConfig(
@@ -196,12 +197,12 @@ class SegmentationTrainer:
         return epoch_loss / len(self.train_loader)
 
     @torch.inference_mode()
-    def validate_epoch(self, epoch: int, use_swa: bool = False) -> Tuple[float, float]:
+    def validate_epoch(self, epoch: int, use_swa: bool = False, compute_hd95: bool = False) -> Tuple[float, Dict[str, float]]:
         eval_model = self.swa_model if use_swa else self.model
         eval_model.eval()
         
         epoch_loss = 0.0
-        epoch_dice = 0.0
+        aggregated_metrics = {"dice": 0.0, "iou": 0.0, "mae": 0.0, "f2": 0.0, "hd95": 0.0}
         
         mode_str = "Val-SWA" if use_swa else "Val"
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [{mode_str}]")
@@ -215,21 +216,24 @@ class SegmentationTrainer:
                 loss = self.criterion(outputs, masks)
 
             epoch_loss += loss.item()
+            batch_metrics = calculate_all_metrics(outputs, masks, compute_hd95=compute_hd95)
             
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).float()
+            for k in aggregated_metrics:
+                aggregated_metrics[k] += batch_metrics[k]
             
-            intersection = (preds * masks).sum(dim=(2, 3))
-            union = preds.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
-            dice = (2.0 * intersection + 1e-5) / (union + 1e-5)
-            epoch_dice += dice.mean().item()
-            
-            pbar.set_postfix({
+            postfix_data = {
                 'val_loss': f"{loss.item():.4f}", 
-                'val_dice': f"{dice.mean().item():.4f}"
-            })
+                'dice': f"{batch_metrics['dice']:.4f}"
+            }
+            if compute_hd95:
+                postfix_data['hd95'] = f"{batch_metrics['hd95']:.2f}"
+                
+            pbar.set_postfix(postfix_data)
 
-        return epoch_loss / len(self.val_loader), epoch_dice / len(self.val_loader)
+        for k in aggregated_metrics:
+            aggregated_metrics[k] /= len(self.val_loader)
+
+        return epoch_loss / len(self.val_loader), aggregated_metrics
 
     @torch.no_grad()
     def _update_swa_bn(self) -> None:
@@ -271,13 +275,16 @@ class SegmentationTrainer:
                 elif self.scheduler:
                     self.scheduler.step()
                 
-                val_loss, val_dice = self.validate_epoch(epoch, use_swa=use_swa)
+                val_loss, val_metrics = self.validate_epoch(epoch, use_swa=False, compute_hd95=False)
                 
                 log_data = {
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
-                    "val_dice": val_dice,
+                    "val_dice": val_metrics["dice"],
+                    "val_iou": val_metrics["iou"],
+                    "val_mae": val_metrics["mae"],
+                    "val_f2": val_metrics["f2"],
                     "learning_rate": self.optimizer.param_groups[0]['lr'] if not use_swa else self.swa_scheduler.get_last_lr()[0],
                     "is_swa_active": float(use_swa),
                     **get_vram_metrics()
@@ -286,7 +293,7 @@ class SegmentationTrainer:
                 wandb.log(log_data)
                 
                 if not use_swa:
-                    self.save_checkpoint(val_dice)
+                    self.save_checkpoint(val_metrics["dice"])
                 else:
                     filepath = os.path.join(self.checkpoint_dir, "swa_latest.pth")
                     torch.save(self.swa_model.state_dict(), filepath)
@@ -294,10 +301,15 @@ class SegmentationTrainer:
             if self.config['epochs'] >= self.swa_start_epoch:
                 logger.info("Training complete. Updating SWA BatchNorm statistics...")
                 self._update_swa_bn()
-                final_val_loss, final_val_dice = self.validate_epoch(self.config['epochs'], use_swa=True)
+                final_val_loss, final_val_metrics = self.validate_epoch(self.config['epochs'], use_swa=True, compute_hd95=True)
                 
-                logger.info(f"Final SWA Model - Val Loss: {final_val_loss:.4f} | Val Dice: {final_val_dice:.4f}")
-                wandb.log({"final_swa_val_loss": final_val_loss, "final_swa_val_dice": final_val_dice})
+                logger.info(f"Final SWA Model - Val Loss: {final_val_loss:.4f} | Val Dice: {final_val_metrics['dice']:.4f} | HD95: {final_val_metrics['hd95']:.2f}")
+                wandb.log({
+                    "final_swa_val_loss": final_val_loss, 
+                    "final_swa_val_dice": final_val_metrics["dice"],
+                    "final_swa_val_iou": final_val_metrics["iou"],
+                    "final_swa_val_hd95": final_val_metrics["hd95"]
+                })
                 
                 filepath = os.path.join(self.checkpoint_dir, "best_swa_model.pth")
                 torch.save(self.swa_model.state_dict(), filepath)

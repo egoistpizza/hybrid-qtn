@@ -1,37 +1,22 @@
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+import torch
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import pytest
-import torch
-import numpy as np
-from unittest.mock import patch, MagicMock
-
 from evaluate import (
-    calculate_metrics,
+    build_model,
     denormalize,
-    save_visualizations,
     load_model_weights,
-    build_model
-)
-
-import pytest
-import torch
-import numpy as np
-from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-from evaluate import (
-    calculate_metrics,
-    denormalize,
     save_visualizations,
-    load_model_weights,
-    build_model
 )
-
+from utils.metrics import calculate_all_metrics
 
 @pytest.fixture
 def dummy_logits_and_targets() -> tuple[torch.Tensor, torch.Tensor]:
@@ -39,26 +24,23 @@ def dummy_logits_and_targets() -> tuple[torch.Tensor, torch.Tensor]:
     targets = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
     return logits, targets
 
-
 def test_calculate_metrics_perfect_match():
     logits = torch.tensor([[[[10.0, 10.0], [10.0, 10.0]]]])
     targets = torch.tensor([[[[1.0, 1.0], [1.0, 1.0]]]])
     
-    dice, iou = calculate_metrics(logits, targets)
+    metrics = calculate_all_metrics(logits, targets, compute_hd95=False)
     
-    assert pytest.approx(dice, 0.001) == 1.0
-    assert pytest.approx(iou, 0.001) == 1.0
-
+    assert pytest.approx(metrics["dice"], 0.001) == 1.0
+    assert pytest.approx(metrics["iou"], 0.001) == 1.0
 
 def test_calculate_metrics_partial_match(dummy_logits_and_targets):
     logits, targets = dummy_logits_and_targets
     
-    dice, iou = calculate_metrics(logits, targets)
+    metrics = calculate_all_metrics(logits, targets, compute_hd95=False)
     
-    assert 0.0 < dice < 1.0
-    assert 0.0 < iou < 1.0
-    assert dice > iou
-
+    assert 0.0 < metrics["dice"] < 1.0
+    assert 0.0 < metrics["iou"] < 1.0
+    assert metrics["dice"] > metrics["iou"]
 
 def test_denormalize_bounds_and_shape():
     tensor = torch.randn(3, 32, 32)
@@ -69,7 +51,6 @@ def test_denormalize_bounds_and_shape():
     assert denorm.shape == (32, 32, 3)
     assert np.min(denorm) >= 0.0
     assert np.max(denorm) <= 1.0
-
 
 @patch("evaluate.plt.savefig")
 def test_save_visualizations_creates_files(mock_savefig, tmp_path):
@@ -83,14 +64,12 @@ def test_save_visualizations_creates_files(mock_savefig, tmp_path):
     assert mock_savefig.call_count == 2
     assert tmp_path.exists()
 
-
 def test_load_model_weights_raises_file_not_found(tmp_path):
     dummy_model = MagicMock()
     non_existent_path = tmp_path / "does_not_exist.pth"
     
     with pytest.raises(FileNotFoundError, match="Checkpoint required but not found"):
         load_model_weights(dummy_model, non_existent_path, torch.device("cpu"))
-
 
 @patch("evaluate.torch.load")
 def test_load_model_weights_cleans_state_dict(mock_torch_load, tmp_path):
@@ -117,19 +96,16 @@ def test_load_model_weights_cleans_state_dict(mock_torch_load, tmp_path):
     assert "_orig_mod.conv1.weight" not in passed_dict
     assert "module.conv2.weight" not in passed_dict
 
-
 def test_build_model_vanilla():
     model = build_model("vanilla", bond_dim=32)
     assert model.__class__.__name__ == "UNet"
     assert not hasattr(model, "transform_1024")
-
 
 def test_build_model_hybrid():
     model = build_model("hybrid", bond_dim=32)
     assert model.__class__.__name__ == "UNetDeepHybrid"
     assert getattr(model, "transform_512", None) is None
     assert getattr(model, "transform_1024", None) is not None
-
 
 def test_build_model_deep_hybrid():
     model = build_model("deep_hybrid", bond_dim=64)
