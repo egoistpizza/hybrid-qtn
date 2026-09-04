@@ -22,6 +22,7 @@ from dataset import (
 )
 from utils.metrics import calculate_all_metrics
 from utils import get_device
+from utils.loss import FocalTverskyLoss, BCEDiceLoss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,26 +41,6 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
     logger.info(f"Seed set to {seed}")
-
-class FocalTverskyLoss(nn.Module):
-    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1e-5):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.smooth = smooth
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        
-        tp = (probs * targets).sum(dim=(2, 3))
-        fp = (probs * (1.0 - targets)).sum(dim=(2, 3))
-        fn = ((1.0 - probs) * targets).sum(dim=(2, 3))
-        
-        tversky_index = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        focal_tversky = (1.0 - tversky_index) ** self.gamma
-        
-        return focal_tversky.mean()
 
 def get_vram_metrics() -> Dict[str, float]:
     if not torch.cuda.is_available():
@@ -329,6 +310,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
     parser.add_argument("--bond_dim", type=int, default=32, help="Bond dimension for MPS layer")
+    parser.add_argument("--loss", type=str, default="focal_tversky", choices=["focal_tversky", "bce_dice"], help="Loss function to use")
     parser.add_argument("--dataset", type=str, default="kvasir_seg",
                         help="Dataset config stem(s) under configs/, comma-separated "
                              f"for joint training. Available: {available}")
@@ -349,6 +331,7 @@ if __name__ == "__main__":
         "weight_decay": 1e-4,
         "image_size": 512,
         "bond_dim": args.bond_dim,
+        "loss": args.loss,
         "swa_start_pct": 0.75,
         "swa_lr": 5e-5,
         "dataset": dataset_slug,
@@ -401,7 +384,7 @@ if __name__ == "__main__":
         run_name = "vanilla_unet"
 
     config["model_type"] = args.model
-    run_name = f"{dataset_slug}__{run_name}"
+    run_name = f"{dataset_slug}__{run_name}__{args.loss}"
     if args.tag:
         run_name = f"{run_name}__{args.tag}"
     config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
@@ -413,7 +396,11 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"torch.compile failed: {e}")
     
-    criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    if args.loss == "bce_dice":
+        criterion = BCEDiceLoss(bce_weight=0.5)
+    else:
+        criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+        
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
 
