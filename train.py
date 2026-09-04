@@ -399,7 +399,7 @@ if __name__ == "__main__":
     if args.loss == "bce_dice":
         criterion = BCEDiceLoss(bce_weight=0.5)
     else:
-        criterion = FocalTverskyLoss(alpha=0.3, beta=0.7, gamma=0.75)
+        criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
         
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])

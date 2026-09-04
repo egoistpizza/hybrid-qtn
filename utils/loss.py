@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class FocalTverskyLoss(nn.Module):
-    def __init__(self, alpha: float = 0.3, beta: float = 0.7, gamma: float = 0.75, smooth: float = 1e-5):
+    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1e-5):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
