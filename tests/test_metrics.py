@@ -49,3 +49,15 @@ def test_hd95_partial_overlap():
     hd95 = calculate_hd95(preds, targets)
     
     assert np.isclose(hd95, 2.0, atol=1e-2)
+
+def test_hd95_mutual_offset_no_nesting():
+    # target ve pred birbirinin İÇİNDE değil, kaydırılmış şekilde çakışıyor
+    preds = torch.zeros((1, 1, 64, 64))
+    targets = torch.zeros((1, 1, 64, 64))
+
+    targets[0, 0, :, 10:40] = 1   # sütun 10-39
+    preds[0, 0, :, 20:50] = 1     # sütun 20-49 (10 birim kaydırılmış)
+
+    hd95 = calculate_hd95(preds, targets)
+    # Gerçek Hausdorff: sol kenar farkı = |20-10| = 10, sağ kenar farkı = |50-40| = 10
+    assert np.isclose(hd95, 10.0, atol=1.0)
