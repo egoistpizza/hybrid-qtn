@@ -37,12 +37,18 @@ def calculate_hd95(preds: torch.Tensor, targets: torch.Tensor) -> float:
 
         pred_border = pred_mask ^ binary_erosion(pred_mask, structure=struct)
         target_border = target_mask ^ binary_erosion(target_mask, structure=struct)
-
+        """
         pred_edt = distance_transform_edt(~pred_mask)
         target_edt = distance_transform_edt(~target_mask)
 
         dist_1 = target_edt[pred_border]
         dist_2 = pred_edt[target_border]
+        """
+        pred_border_edt = distance_transform_edt(~pred_border)
+        target_border_edt = distance_transform_edt(~target_border)
+
+        dist_1 = target_border_edt[pred_border]
+        dist_2 = pred_border_edt[target_border]
 
         if dist_1.size == 0 or dist_2.size == 0:
             continue
