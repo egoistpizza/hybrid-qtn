@@ -114,6 +114,13 @@ That is the whole procedure. `discover_dataset_configs()` picks the file up
 automatically, so `--dataset <name>` works in `train.py` and `evaluate.py`
 with no code change.
 
+To get the bytes onto a new machine, `scripts/download_*.py` pulls each dataset
+from its Hugging Face mirror into exactly the paths the configs name — see
+[the Datasets section of the root README](../README.md#datasets). Publishing a
+new mirror is `scripts/upload_datasets.py`; the Hub tree is deliberately a
+byte-for-byte copy of the local layout, so `images_dir` / `masks_dir` stay valid
+whichever way the data arrived.
+
 If the dataset has a materially different layout (split subdirs, multi-class
 masks, JSON annotations), that's the point where a dedicated loader or a
 pairing helper belongs — start by adding a sibling to `pairing.py`.
