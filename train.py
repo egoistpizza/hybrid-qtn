@@ -14,33 +14,111 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
 
+from utils.seed import seed_everything
+from utils.init_first import init
+from utils.metrics import calculate_all_metrics
+from utils.loss import FocalTverskyLoss, BCEDiceLoss
 from dataset import (
     build_train_val,
     discover_dataset_configs,
     parse_dataset_arg,
     slugify_dataset_arg,
 )
-from utils.metrics import calculate_all_metrics
 from utils import get_device
-from utils.loss import FocalTverskyLoss, BCEDiceLoss
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-logger = logging.getLogger(__name__)
+logger = None
 
-def seed_everything(seed: int = 42) -> None:
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
-    logger.info(f"Seed set to {seed}")
+def get_vram_metrics() -> Dict[str, float]:
+    if not torch.cuda.is_available():
+        return {"vram_allocated_mb": 0.0, "vram_reserved_mb": 0.0}
+        
+    allocated_bytes = torch.cuda.memory_allocated()
+    reserved_bytes = torch.cuda.memory_reserved()
+    
+    megabyte_conversion_factor = 1024 ** 2
+    
+    return {
+        "vram_allocated_mb": allocated_bytes / megabyte_conversion_factor,
+        "vram_reserved_mb": reserved_bytes / megabyte_conversion_factor
+    }
+
+def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, Any]) -> None:
+    logger.info("=" * 60)
+    logger.info("MODEL DEBUG INFO")
+    logger.info("=" * 60)
+
+    logger.info(f"Device:               {device}")
+    if device.type == "cuda":
+        logger.info(f"GPU:                  {torch.cuda.get_device_name(device)}")
+        vram = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        logger.info(f"VRAM:                 {vram:.1f} GB")
+        logger.info(f"CUDA version:         {torch.version.cuda}")
+    logger.info(f"PyTorch version:      {torch.__version__}")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters:     {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+
+    logger.info("-" * 60)
+    for name, module in model.named_children():
+        count = sum(p.numel() for p in module.parameters())
+        logger.info(f"  {name:25s} -> {count:>12,}")
+
+    if hasattr(model, 'transform_512') and model.transform_512 is not None:
+        logger.info("-" * 60)
+        for name, param in model.transform_512.named_parameters():
+            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
+
+    if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
+        logger.info("-" * 60)
+        for name, param in model.transform_1024.named_parameters():
+            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
+
+    logger.info("-" * 60)
+    model.to(device)
+    dummy = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
+
+    with torch.no_grad():
+        x1 = model.inc(dummy)
+        x2 = model.down1(x1)
+        x3 = model.down2(x2)
+        
+        x4 = model.down3(x3)
+        if hasattr(model, 'transform_512') and model.transform_512 is not None:
+            x4 = model.transform_512(x4)
+            
+        x5 = model.down4(x4)
+        if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
+            x5 = model.transform_1024(x5)
+
+        x = model.up1(x5, x4)
+        x = model.up2(x, x3)
+        x = model.up3(x, x2)
+        x = model.up4(x, x1)
+        out = model.outc(x)
+
+    logger.info("=" * 60)
+
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1e-5):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        
+        tp = (probs * targets).sum(dim=(2, 3))
+        fp = (probs * (1.0 - targets)).sum(dim=(2, 3))
+        fn = ((1.0 - probs) * targets).sum(dim=(2, 3))
+        
+        tversky_index = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        focal_tversky = (1.0 - tversky_index) ** self.gamma
+        
+        return focal_tversky.mean()
 
 def get_vram_metrics() -> Dict[str, float]:
     if not torch.cuda.is_available():
@@ -126,7 +204,8 @@ class SegmentationTrainer:
         config: Dict[str, Any],
         scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
     ):
-        self.model = model.to(device).to(memory_format=torch.channels_last)
+        # self.model = model.to(device).to(memory_format=torch.channels_last)
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.criterion = criterion
@@ -154,7 +233,7 @@ class SegmentationTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            masks = batch["mask"].to(self.device, non_blocking=True)
+            masks  = batch["mask" ].to(self.device, non_blocking=True                                   )
 
             with torch.autocast(self.device.type, enabled=self.use_amp):
                 outputs = self.model(images)
@@ -245,6 +324,7 @@ class SegmentationTrainer:
         )
         
         logger.info("Starting training...")
+        
         try:
             for epoch in range(1, self.config['epochs'] + 1):
                 train_loss = self.train_epoch(epoch)
@@ -256,7 +336,7 @@ class SegmentationTrainer:
                 elif self.scheduler:
                     self.scheduler.step()
                 
-                val_loss, val_metrics = self.validate_epoch(epoch, use_swa=False, compute_hd95=False)
+                val_loss, val_metrics = self.validate_epoch(epoch, use_swa=use_swa, compute_hd95=False)
                 
                 log_data = {
                     "epoch": epoch,
@@ -299,11 +379,15 @@ class SegmentationTrainer:
             logger.warning("Training interrupted. Saving current state...")
             filepath = os.path.join(self.checkpoint_dir, "interrupted_model.pth")
             torch.save(self.model.state_dict(), filepath)
+        
         finally:
             wandb.finish()
             logger.info("Training finished.")
 
-if __name__ == "__main__":
+def main():
+    global logger
+    init()
+    logger = logging.getLogger(__name__)
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
     available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
@@ -382,7 +466,6 @@ if __name__ == "__main__":
         
         model = UNet(in_channels=3, out_channels=1)
         run_name = "vanilla_unet"
-
     config["model_type"] = args.model
     run_name = f"{dataset_slug}__{run_name}__{args.loss}"
     if args.tag:
@@ -390,20 +473,27 @@ if __name__ == "__main__":
     config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
 
     model = model.to(device).to(memory_format=torch.channels_last)
+
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
-            model = torch.compile(model)
+            logger.info("Compiling the model...")
+            c_model = torch.compile(model)
+            dummy_input = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
+            _ = c_model(dummy_input)
+            model = c_model
+            logger.info("Compiled the model successfully")
         except Exception as e:
-            logger.warning(f"torch.compile failed: {e}")
+            logger.warning(f"[!] torch.compile failed: {e}")
     
     if args.loss == "bce_dice":
         criterion = BCEDiceLoss(bce_weight=0.5)
     else:
         criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
-        
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
-
+    
+    
+    
     trainer = SegmentationTrainer(
         model=model,
         train_loader=train_loader,
@@ -416,3 +506,6 @@ if __name__ == "__main__":
     )
     
     trainer.fit(run_name=run_name)
+
+if __name__ == "__main__":
+    main()

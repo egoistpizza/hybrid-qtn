@@ -19,6 +19,7 @@ from utils import get_device
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 
+
 def denormalize(tensor: torch.Tensor) -> np.ndarray:
     device = tensor.device
     mean = torch.tensor(IMAGE_MEAN, device=device).view(3, 1, 1)
@@ -141,7 +142,7 @@ def main() -> None:
     model = model.to(device).to(memory_format=torch.channels_last)
     
     run_suffix = f"{args.model}_unet" if args.model == "vanilla" else f"{args.model}_unet_b{args.bond_dim}_ckpt"
-    run_name = args.run if args.run else f"{dataset_slug}____{run_suffix}"
+    run_name = args.run if args.run else f"{dataset_slug}__{run_suffix}"
     if args.tag:
         run_name = f"{run_name}__{args.tag}"
         

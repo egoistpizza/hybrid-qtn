@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import torch
-from torch.export import Dim
 
 from utils import get_device
+
 
 def build_export_model(model_type: str, bond_dim: int) -> torch.nn.Module:
     if model_type == "deep_hybrid":
@@ -80,7 +80,6 @@ def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarra
 
 def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, output_file_path: Path) -> None:
     model.eval()
-    batch_dim = Dim("batch_size", min=1, max=64)
     
     torch.onnx.export(
         model,
@@ -91,8 +90,12 @@ def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, outp
         do_constant_folding=True,
         input_names=["input_image"],
         output_names=["segmentation_mask"],
-        dynamic_shapes=({0: batch_dim},)  # Note the tuple format here
+        dynamic_axes={
+            "input_image": {0: "batch_size"},
+            "segmentation_mask": {0: "batch_size"}
+        }
     )
+
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
