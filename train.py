@@ -26,7 +26,7 @@ from dataset import (
 )
 from utils import get_device
 
-logger = None
+logger = logging.getLogger(__name__)
 
 def get_vram_metrics() -> Dict[str, float]:
     if not torch.cuda.is_available():
@@ -100,97 +100,6 @@ def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, A
 
     logger.info("=" * 60)
 
-class FocalTverskyLoss(nn.Module):
-    def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1e-5):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.smooth = smooth
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        
-        tp = (probs * targets).sum(dim=(2, 3))
-        fp = (probs * (1.0 - targets)).sum(dim=(2, 3))
-        fn = ((1.0 - probs) * targets).sum(dim=(2, 3))
-        
-        tversky_index = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        focal_tversky = (1.0 - tversky_index) ** self.gamma
-        
-        return focal_tversky.mean()
-
-def get_vram_metrics() -> Dict[str, float]:
-    if not torch.cuda.is_available():
-        return {"vram_allocated_mb": 0.0, "vram_reserved_mb": 0.0}
-        
-    allocated_bytes = torch.cuda.memory_allocated()
-    reserved_bytes = torch.cuda.memory_reserved()
-    
-    megabyte_conversion_factor = 1024 ** 2
-    
-    return {
-        "vram_allocated_mb": allocated_bytes / megabyte_conversion_factor,
-        "vram_reserved_mb": reserved_bytes / megabyte_conversion_factor
-    }
-
-def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, Any]) -> None:
-    logger.info("=" * 60)
-    logger.info("MODEL DEBUG INFO")
-    logger.info("=" * 60)
-
-    logger.info(f"Device:               {device}")
-    if device.type == "cuda":
-        logger.info(f"GPU:                  {torch.cuda.get_device_name(device)}")
-        vram = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-        logger.info(f"VRAM:                 {vram:.1f} GB")
-        logger.info(f"CUDA version:         {torch.version.cuda}")
-    logger.info(f"PyTorch version:      {torch.__version__}")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Total parameters:     {total_params:,}")
-    logger.info(f"Trainable parameters: {trainable_params:,}")
-
-    logger.info("-" * 60)
-    for name, module in model.named_children():
-        count = sum(p.numel() for p in module.parameters())
-        logger.info(f"  {name:25s} -> {count:>12,}")
-
-    if hasattr(model, 'transform_512') and model.transform_512 is not None:
-        logger.info("-" * 60)
-        for name, param in model.transform_512.named_parameters():
-            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
-
-    if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
-        logger.info("-" * 60)
-        for name, param in model.transform_1024.named_parameters():
-            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
-
-    logger.info("-" * 60)
-    model.to(device)
-    dummy = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
-
-    with torch.no_grad():
-        x1 = model.inc(dummy)
-        x2 = model.down1(x1)
-        x3 = model.down2(x2)
-        
-        x4 = model.down3(x3)
-        if hasattr(model, 'transform_512') and model.transform_512 is not None:
-            x4 = model.transform_512(x4)
-            
-        x5 = model.down4(x4)
-        if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
-            x5 = model.transform_1024(x5)
-
-        x = model.up1(x5, x4)
-        x = model.up2(x, x3)
-        x = model.up3(x, x2)
-        x = model.up4(x, x1)
-        out = model.outc(x)
-
-    logger.info("=" * 60)
 
 class SegmentationTrainer:
     def __init__(
@@ -385,9 +294,7 @@ class SegmentationTrainer:
             logger.info("Training finished.")
 
 def main():
-    global logger
     init()
-    logger = logging.getLogger(__name__)
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
     available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
@@ -478,8 +385,19 @@ def main():
         try:
             logger.info("Compiling the model...")
             c_model = torch.compile(model)
-            dummy_input = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
-            _ = c_model(dummy_input)
+            # Warm up at the real training shape, memory format and precision so we compile
+            # the graph training will actually use. Do NOT bind the result: holding a
+            # reference pins the whole activation graph for the lifetime of the run.
+            dummy_input = torch.randn(
+                config["batch_size"], 3, config["image_size"], config["image_size"],
+                device=device,
+            ).to(memory_format=torch.channels_last)
+            with torch.autocast(device.type, enabled=(device.type == "cuda")):
+                c_model(dummy_input).float().mean().backward()
+            model.zero_grad(set_to_none=True)
+            del dummy_input
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             model = c_model
             logger.info("Compiled the model successfully")
         except Exception as e:
