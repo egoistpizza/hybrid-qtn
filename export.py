@@ -28,7 +28,6 @@ def build_export_model(model_type: str, bond_dim: int) -> torch.nn.Module:
     from models.unet_classic import UNet
     return UNet(in_channels=3, out_channels=1)
 
-
 def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tensor, total_iterations: int = 100) -> float:
     model.eval()
     compute_device = dummy_input.device
@@ -55,7 +54,6 @@ def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tens
     
     return frames_per_second
 
-
 def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarray, total_iterations: int = 100) -> float:
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -79,7 +77,6 @@ def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarra
     frames_per_second = total_iterations / total_execution_time
     
     return frames_per_second
-
 
 def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, output_file_path: Path) -> None:
     model.eval()
@@ -110,7 +107,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default="outputs/onnx")
     return parser.parse_args()
 
-
 def main() -> None:
     args = parse_arguments()
     compute_device = get_device()
@@ -140,7 +136,6 @@ def main() -> None:
     print(f"PyTorch FPS : {pytorch_fps:.2f}")
     print(f"ONNX FPS    : {onnx_fps:.2f}")
     print(f"Speedup     : {speedup_ratio:.2f}x")
-
 
 if __name__ == "__main__":
     main()

@@ -13,23 +13,11 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
+from utils.metrics import calculate_all_metrics
 from utils import get_device
 
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
-
-
-def calculate_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> tuple[float, float]:
-    probs = torch.sigmoid(logits)
-    preds = (probs > 0.5).float()
-    
-    intersection = (preds * targets).sum(dim=(2, 3))
-    union = preds.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
-    
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    iou = (intersection + smooth) / (union - intersection + smooth)
-    
-    return dice.mean().item(), iou.mean().item()
 
 
 def denormalize(tensor: torch.Tensor) -> np.ndarray:
@@ -39,7 +27,6 @@ def denormalize(tensor: torch.Tensor) -> np.ndarray:
     
     tensor = tensor * std + mean
     return torch.clamp(tensor, 0.0, 1.0).cpu().permute(1, 2, 0).numpy()
-
 
 def save_visualizations(
     images: torch.Tensor, 
@@ -57,9 +44,9 @@ def save_visualizations(
         gt_np = masks[i].cpu().squeeze().numpy()
         pred_np = preds[i].cpu().squeeze().numpy()
 
-        dice, iou = calculate_metrics(logits[i:i+1], masks[i:i+1])
+        metrics = calculate_all_metrics(logits[i:i+1], masks[i:i+1], compute_hd95=True)
         
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
         axes[0].imshow(img_np)
         axes[0].set_title(f"Original RGB\n({sample_ids[i]})")
         axes[0].axis("off")
@@ -69,14 +56,16 @@ def save_visualizations(
         axes[1].axis("off")
         
         axes[2].imshow(pred_np, cmap="gray")
-        axes[2].set_title(f"Prediction\nDice: {dice:.4f} | IoU: {iou:.4f}")
+        axes[2].set_title(
+            f"Prediction | Dice: {metrics['dice']:.4f} | IoU: {metrics['iou']:.4f}\n"
+            f"HD95: {metrics['hd95']:.2f} | MAE: {metrics['mae']:.4f} | F2: {metrics['f2']:.4f}"
+        )
         axes[2].axis("off")
         
         plt.tight_layout()
         filename = f"viz_{start_index + i + 1:03d}_{sample_ids[i]}.png"
         plt.savefig(output_dir / filename, bbox_inches="tight", dpi=300)
         plt.close(fig)
-
 
 def load_model_weights(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
     if not checkpoint_path.exists():
@@ -95,7 +84,6 @@ def load_model_weights(model: torch.nn.Module, checkpoint_path: Path, device: to
         
     model.load_state_dict(clean_state_dict)
     print("Weights loaded successfully!")
-
 
 def build_model(model_type: str, bond_dim: int) -> torch.nn.Module:
     if model_type == "deep_hybrid":
@@ -116,7 +104,6 @@ def build_model(model_type: str, bond_dim: int) -> torch.nn.Module:
     from models.unet_classic import UNet
     return UNet(in_channels=3, out_channels=1)
 
-
 def parse_args() -> argparse.Namespace:
     available_datasets = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     
@@ -131,8 +118,6 @@ def parse_args() -> argparse.Namespace:
     
     return parser.parse_args()
 
-
-
 def main() -> None:
     args = parse_args()
     device = get_device()
@@ -140,9 +125,6 @@ def main() -> None:
     
     print(f"Evaluating on device: {device} | AMP Enabled: {use_amp}")
 
-    # full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
-    # full_dataset = load_kvasir_seg(os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs/kvasir_seg.yaml"))
-    
     dataset_names = parse_dataset_arg(args.dataset)
     dataset_slug = slugify_dataset_arg(dataset_names)
 
@@ -172,7 +154,7 @@ def main() -> None:
     load_model_weights(model, load_path, device)
     
     model.eval()
-    total_dice, total_iou = 0.0, 0.0
+    aggregated_metrics = {"dice": 0.0, "iou": 0.0, "mae": 0.0, "f2": 0.0, "hd95": 0.0}
     
     with torch.inference_mode():
         for batch in tqdm(val_loader, desc="Evaluating"):
@@ -182,13 +164,18 @@ def main() -> None:
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 outputs = model(images)
             
-            dice, iou = calculate_metrics(outputs, masks)
-            total_dice += dice
-            total_iou += iou
+            batch_metrics = calculate_all_metrics(outputs, masks, compute_hd95=True)
+            for k in aggregated_metrics:
+                aggregated_metrics[k] += batch_metrics[k]
             
-    avg_dice = total_dice / len(val_loader)
-    avg_iou = total_iou / len(val_loader)
-    print(f"Avg Dice: {avg_dice:.4f} | Avg IoU: {avg_iou:.4f}")
+    for k in aggregated_metrics:
+        aggregated_metrics[k] /= len(val_loader)
+        
+    print(
+        f"Avg Dice: {aggregated_metrics['dice']:.4f} | Avg IoU: {aggregated_metrics['iou']:.4f} | "
+        f"Avg HD95: {aggregated_metrics['hd95']:.4f} | Avg MAE: {aggregated_metrics['mae']:.4f} | "
+        f"Avg F2: {aggregated_metrics['f2']:.4f}"
+    )
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("outputs") / "visualizations" / run_name
     print(f"\nGenerating {args.num_samples} visualizations...")
@@ -206,7 +193,6 @@ def main() -> None:
             viz_count += images.size(0)
             
     print(f"Visualizations saved to: {output_dir.absolute()}")
-
 
 if __name__ == "__main__":
     main()

@@ -16,7 +16,8 @@ import wandb
 
 from utils.seed import seed_everything
 from utils.init_first import init
-
+from utils.metrics import calculate_all_metrics
+from utils.loss import FocalTverskyLoss, BCEDiceLoss
 from dataset import (
     build_train_val,
     discover_dataset_configs,
@@ -25,33 +26,79 @@ from dataset import (
 )
 from utils import get_device
 
+logger = None
 
-logger = None # Will be initialized in main
-# device = None # Will be initialized in main
-
-
-
-
-# BCE (Binary Cross Entropy) Loss for pixelwise comparison + Dice Loss for imbalanced classes
-class BCEDiceLoss(nn.Module):
-    """BCE + Dice Loss for highly imbalanced segmentation tasks."""
-    def __init__(self, smooth: float = 1e-5):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.smooth = smooth
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        bce_loss = self.bce(logits, targets)
+def get_vram_metrics() -> Dict[str, float]:
+    if not torch.cuda.is_available():
+        return {"vram_allocated_mb": 0.0, "vram_reserved_mb": 0.0}
         
-        probs = torch.sigmoid(logits)
-        intersection = (probs * targets).sum(dim=(2, 3))
-        union = probs.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
-        
-        dice_score = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1.0 - dice_score.mean()
-        
-        return bce_loss + dice_loss
+    allocated_bytes = torch.cuda.memory_allocated()
+    reserved_bytes = torch.cuda.memory_reserved()
+    
+    megabyte_conversion_factor = 1024 ** 2
+    
+    return {
+        "vram_allocated_mb": allocated_bytes / megabyte_conversion_factor,
+        "vram_reserved_mb": reserved_bytes / megabyte_conversion_factor
+    }
 
+def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, Any]) -> None:
+    logger.info("=" * 60)
+    logger.info("MODEL DEBUG INFO")
+    logger.info("=" * 60)
+
+    logger.info(f"Device:               {device}")
+    if device.type == "cuda":
+        logger.info(f"GPU:                  {torch.cuda.get_device_name(device)}")
+        vram = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        logger.info(f"VRAM:                 {vram:.1f} GB")
+        logger.info(f"CUDA version:         {torch.version.cuda}")
+    logger.info(f"PyTorch version:      {torch.__version__}")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters:     {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+
+    logger.info("-" * 60)
+    for name, module in model.named_children():
+        count = sum(p.numel() for p in module.parameters())
+        logger.info(f"  {name:25s} -> {count:>12,}")
+
+    if hasattr(model, 'transform_512') and model.transform_512 is not None:
+        logger.info("-" * 60)
+        for name, param in model.transform_512.named_parameters():
+            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
+
+    if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
+        logger.info("-" * 60)
+        for name, param in model.transform_1024.named_parameters():
+            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
+
+    logger.info("-" * 60)
+    model.to(device)
+    dummy = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
+
+    with torch.no_grad():
+        x1 = model.inc(dummy)
+        x2 = model.down1(x1)
+        x3 = model.down2(x2)
+        
+        x4 = model.down3(x3)
+        if hasattr(model, 'transform_512') and model.transform_512 is not None:
+            x4 = model.transform_512(x4)
+            
+        x5 = model.down4(x4)
+        if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
+            x5 = model.transform_1024(x5)
+
+        x = model.up1(x5, x4)
+        x = model.up2(x, x3)
+        x = model.up3(x, x2)
+        x = model.up4(x, x1)
+        out = model.outc(x)
+
+    logger.info("=" * 60)
 
 class FocalTverskyLoss(nn.Module):
     def __init__(self, alpha: float = 0.7, beta: float = 0.3, gamma: float = 0.75, smooth: float = 1e-5):
@@ -210,12 +257,12 @@ class SegmentationTrainer:
         return epoch_loss / len(self.train_loader)
 
     @torch.inference_mode()
-    def validate_epoch(self, epoch: int, use_swa: bool = False) -> Tuple[float, float]:
+    def validate_epoch(self, epoch: int, use_swa: bool = False, compute_hd95: bool = False) -> Tuple[float, Dict[str, float]]:
         eval_model = self.swa_model if use_swa else self.model
         eval_model.eval()
         
         epoch_loss = 0.0
-        epoch_dice = 0.0
+        aggregated_metrics = {"dice": 0.0, "iou": 0.0, "mae": 0.0, "f2": 0.0, "hd95": 0.0}
         
         mode_str = "Val-SWA" if use_swa else "Val"
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [{mode_str}]")
@@ -229,21 +276,24 @@ class SegmentationTrainer:
                 loss = self.criterion(outputs, masks)
 
             epoch_loss += loss.item()
+            batch_metrics = calculate_all_metrics(outputs, masks, compute_hd95=compute_hd95)
             
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).float()
+            for k in aggregated_metrics:
+                aggregated_metrics[k] += batch_metrics[k]
             
-            intersection = (preds * masks).sum(dim=(2, 3))
-            union = preds.sum(dim=(2, 3)) + masks.sum(dim=(2, 3))
-            dice = (2.0 * intersection + 1e-5) / (union + 1e-5)
-            epoch_dice += dice.mean().item()
-            
-            pbar.set_postfix({
+            postfix_data = {
                 'val_loss': f"{loss.item():.4f}", 
-                'val_dice': f"{dice.mean().item():.4f}"
-            })
+                'dice': f"{batch_metrics['dice']:.4f}"
+            }
+            if compute_hd95:
+                postfix_data['hd95'] = f"{batch_metrics['hd95']:.2f}"
+                
+            pbar.set_postfix(postfix_data)
 
-        return epoch_loss / len(self.val_loader), epoch_dice / len(self.val_loader)
+        for k in aggregated_metrics:
+            aggregated_metrics[k] /= len(self.val_loader)
+
+        return epoch_loss / len(self.val_loader), aggregated_metrics
 
     @torch.no_grad()
     def _update_swa_bn(self) -> None:
@@ -267,11 +317,6 @@ class SegmentationTrainer:
 
     def fit(self, run_name: str) -> None:
         total_params = sum(p.numel() for p in self.model.parameters())
-        
-        # TODO: Logger pollutes the STDOUT (with an unicode encode error and its stack trace) due to wandb probably
-        #       trying to print a unicode character to its own logger instance (when seleted [3: don't visualize])
-        #       so suppress that message for now.
-        #       That happens when the directory path contains non-ASCII characters including the uppercase "İ" (as in "İnzva")
         wandb.init(
             project="hybrid-qtn",
             config={**self.config, "total_params": total_params},
@@ -291,13 +336,16 @@ class SegmentationTrainer:
                 elif self.scheduler:
                     self.scheduler.step()
                 
-                val_loss, val_dice = self.validate_epoch(epoch, use_swa=use_swa)
+                val_loss, val_metrics = self.validate_epoch(epoch, use_swa=use_swa, compute_hd95=False)
                 
                 log_data = {
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
-                    "val_dice": val_dice,
+                    "val_dice": val_metrics["dice"],
+                    "val_iou": val_metrics["iou"],
+                    "val_mae": val_metrics["mae"],
+                    "val_f2": val_metrics["f2"],
                     "learning_rate": self.optimizer.param_groups[0]['lr'] if not use_swa else self.swa_scheduler.get_last_lr()[0],
                     "is_swa_active": float(use_swa),
                     **get_vram_metrics()
@@ -306,7 +354,7 @@ class SegmentationTrainer:
                 wandb.log(log_data)
                 
                 if not use_swa:
-                    self.save_checkpoint(val_dice)
+                    self.save_checkpoint(val_metrics["dice"])
                 else:
                     filepath = os.path.join(self.checkpoint_dir, "swa_latest.pth")
                     torch.save(self.swa_model.state_dict(), filepath)
@@ -314,10 +362,15 @@ class SegmentationTrainer:
             if self.config['epochs'] >= self.swa_start_epoch:
                 logger.info("Training complete. Updating SWA BatchNorm statistics...")
                 self._update_swa_bn()
-                final_val_loss, final_val_dice = self.validate_epoch(self.config['epochs'], use_swa=True)
+                final_val_loss, final_val_metrics = self.validate_epoch(self.config['epochs'], use_swa=True, compute_hd95=True)
                 
-                logger.info(f"Final SWA Model - Val Loss: {final_val_loss:.4f} | Val Dice: {final_val_dice:.4f}")
-                wandb.log({"final_swa_val_loss": final_val_loss, "final_swa_val_dice": final_val_dice})
+                logger.info(f"Final SWA Model - Val Loss: {final_val_loss:.4f} | Val Dice: {final_val_metrics['dice']:.4f} | HD95: {final_val_metrics['hd95']:.2f}")
+                wandb.log({
+                    "final_swa_val_loss": final_val_loss, 
+                    "final_swa_val_dice": final_val_metrics["dice"],
+                    "final_swa_val_iou": final_val_metrics["iou"],
+                    "final_swa_val_hd95": final_val_metrics["hd95"]
+                })
                 
                 filepath = os.path.join(self.checkpoint_dir, "best_swa_model.pth")
                 torch.save(self.swa_model.state_dict(), filepath)
@@ -331,22 +384,17 @@ class SegmentationTrainer:
             wandb.finish()
             logger.info("Training finished.")
 
-
-
-
-def main(): # {{{
+def main():
     global logger
-    # global device
-    
     init()
-    logger = logging.getLogger(__name__) # Getting it only after we call the init() the first time (which calls init_logger_basicconfig())
-    
+    logger = logging.getLogger(__name__)
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
     available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
     parser.add_argument("--bond_dim", type=int, default=32, help="Bond dimension for MPS layer")
+    parser.add_argument("--loss", type=str, default="focal_tversky", choices=["focal_tversky", "bce_dice"], help="Loss function to use")
     parser.add_argument("--dataset", type=str, default="kvasir_seg",
                         help="Dataset config stem(s) under configs/, comma-separated "
                              f"for joint training. Available: {available}")
@@ -358,8 +406,7 @@ def main(): # {{{
 
     seed_everything(42)
     device = get_device()
-    
-    # TODO: Maybe get this from a YAML file in /configs
+
     config = {
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -368,16 +415,13 @@ def main(): # {{{
         "weight_decay": 1e-4,
         "image_size": 512,
         "bond_dim": args.bond_dim,
+        "loss": args.loss,
         "swa_start_pct": 0.75,
         "swa_lr": 5e-5,
         "dataset": dataset_slug,
         "checkpoint_dir": f"./checkpoints/{dataset_slug}"
     }
 
-
-    # full_dataset = load_kvasir_seg("configs/kvasir_seg.yaml")
-    # full_dataset = load_kvasir_seg(os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs/kvasir_seg.yaml"))
-    
     train_ds, val_ds = build_train_val(dataset_names)
     logger.info(f"Dataset '{dataset_slug}': {len(train_ds)} train / {len(val_ds)} val")
 
@@ -398,8 +442,6 @@ def main(): # {{{
             transform_512=mps_512, 
             transform_1024=mps_1024
         )
-        # Moving right afterwards (especially before an optimizer refers to it)
-        model = model.to(device).to(memory_format=torch.channels_last)
         run_name = f"deep_hybrid_unet_b{config['bond_dim']}_ckpt"
         debug_model_info(model, device, config)
 
@@ -415,8 +457,6 @@ def main(): # {{{
             transform_512=None, 
             transform_1024=mps_1024
         )
-        # Moving right afterwards (especially before an optimizer refers to it)
-        model = model.to(device).to(memory_format=torch.channels_last)
         run_name = f"hybrid_unet_b{config['bond_dim']}_ckpt"
         debug_model_info(model, device, config) 
         
@@ -425,43 +465,30 @@ def main(): # {{{
         from models.unet_classic import UNet
         
         model = UNet(in_channels=3, out_channels=1)
-        # Moving right afterwards (especially before an optimizer refers to it)
-        model = model.to(device).to(memory_format=torch.channels_last)
         run_name = "vanilla_unet"
-
-    
-    
     config["model_type"] = args.model
-    run_name = f"{dataset_slug}__{run_name}"
+    run_name = f"{dataset_slug}__{run_name}__{args.loss}"
     if args.tag:
         run_name = f"{run_name}__{args.tag}"
     config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
-    
-    # TODO: Model is now moved right after the creation in each if-else branch (before being passed to debug_model_info).
-    #       Maybe it is unnecessarily redundant and the model may be safely moved at this point too
-    # model = model.to(device).to(memory_format=torch.channels_last)
-    
-    
+
+    model = model.to(device).to(memory_format=torch.channels_last)
+
     if int(torch.__version__.split('.')[0]) >= 2:
         try:
             logger.info("Compiling the model...")
-            c_model = torch.compile(model.to(device)).to(device)
-            # torch.compile is lazy, it will wrap and successfully get out of the try-catch, and will try to compile only
-            # when run something forward/backward.
-            # Try actually attempting to run anything through it just to see if it compiles successfully.
+            c_model = torch.compile(model)
             dummy_input = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
             _ = c_model(dummy_input)
-            # Replace it with the compiled only after passing the test
             model = c_model
-            logger.info("Compiled the model")
+            logger.info("Compiled the model successfully")
         except Exception as e:
-            # On Windows, torch looks for cl.exe (a tool in Microsoft's MSVC compiler) to compile the model into native code.
-            logger.warning(f"[!] c_model(input) (where c_model = torch.compile(model.to(device)).to(device)) failed: {e}")
-            # logger.warning(e)
+            logger.warning(f"[!] torch.compile failed: {e}")
     
-    
-    
-    criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    if args.loss == "bce_dice":
+        criterion = BCEDiceLoss(bce_weight=0.5)
+    else:
+        criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
     
@@ -478,11 +505,7 @@ def main(): # {{{
         scheduler=scheduler
     )
     
-    
     trainer.fit(run_name=run_name)
-    
-# }}}
-
 
 if __name__ == "__main__":
     main()
