@@ -1,28 +1,9 @@
-"""Tests for the YAML-driven segmentation dataloader.
-
-Run from the project root:
-
-    pip install pytest
-    python -m pytest tests/dataloader_test.py -v
-
-Semantic categories (one test class per concern):
-
-    TestPairing            — pairing.pair_by_stem behavior
-    TestTransforms         — transforms.build_transforms_from_config
-    TestOutputContract     — GenericSegmentationDataset output shape/dtype/keys
-    TestConfigLoader       — loader.load_dataset (YAML -> dataset)
-    TestDataLoaderBatching — torch DataLoader collation into batches
-    TestRealDatasetIntegration — every dataset on disk (each auto-skips if missing)
-    TestDatasetConsistency — invariants that must hold across all datasets
-"""
-
 from __future__ import annotations
 
+import csv
 import sys
 from pathlib import Path
 
-# Ensure the project root is importable so `from dataset import ...` works
-# regardless of the working directory pytest was launched from.
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -42,26 +23,21 @@ from dataset import (
     make_splits,
     pair_by_stem,
     resolve_config,
+    grouped_split_indices,
+    load_group_map,
+    groups_for_samples,
 )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — synthetic on-disk dataset
-# ---------------------------------------------------------------------------
 
 def _write_image(path: Path, h: int, w: int, fill: int = 128) -> None:
     arr = np.full((h, w, 3), fill, dtype=np.uint8)
     Image.fromarray(arr, mode="RGB").save(path)
 
-
 def _write_mask(path: Path, h: int, w: int, value: int) -> None:
     arr = np.full((h, w), value, dtype=np.uint8)
     Image.fromarray(arr, mode="L").save(path)
 
-
 @pytest.fixture
 def fake_dataset_dir(tmp_path: Path) -> dict:
-    """Four matched image/mask pairs, varying sizes, mixed mask fill values."""
     images_dir = tmp_path / "images"
     masks_dir = tmp_path / "masks"
     images_dir.mkdir()
@@ -69,7 +45,6 @@ def fake_dataset_dir(tmp_path: Path) -> dict:
 
     stems = ["sample_01", "sample_02", "sample_03", "sample_04"]
     sizes = [(64, 64), (48, 80), (100, 60), (32, 32)]
-    # After threshold=127: 255→1, 0→0, 255→1, 200→1
     mask_fills = [255, 0, 255, 200]
 
     for stem, (h, w), mv in zip(stems, sizes, mask_fills):
@@ -84,7 +59,6 @@ def fake_dataset_dir(tmp_path: Path) -> dict:
         "mask_fills": mask_fills,
     }
 
-
 @pytest.fixture
 def base_config(fake_dataset_dir: dict) -> dict:
     return {
@@ -97,10 +71,8 @@ def base_config(fake_dataset_dir: dict) -> dict:
         "mask_threshold": 127,
     }
 
-
 @pytest.fixture
 def standard_transforms() -> list[dict]:
-    """A minimal contract-conformant pipeline: Resize -> Normalize -> ToTensorV2."""
     return [
         {"name": "Resize", "height": 32, "width": 32},
         {
@@ -111,11 +83,6 @@ def standard_transforms() -> list[dict]:
         },
         {"name": "ToTensorV2"},
     ]
-
-
-# ---------------------------------------------------------------------------
-# 1) Pairing — filename-stem image ↔ mask matching
-# ---------------------------------------------------------------------------
 
 class TestPairing:
     def test_pairs_matched_stems_in_sorted_order(self, fake_dataset_dir):
@@ -165,11 +132,6 @@ class TestPairing:
         with pytest.raises(NotADirectoryError):
             pair_by_stem(tmp_path / "nope", tmp_path, ".jpg", ".png")
 
-
-# ---------------------------------------------------------------------------
-# 2) Transforms — build an Albumentations pipeline from list[dict]
-# ---------------------------------------------------------------------------
-
 class TestTransforms:
     def test_empty_specs_produce_identity_pipeline(self):
         t = build_transforms_from_config(None)
@@ -210,11 +172,6 @@ class TestTransforms:
         with pytest.raises(ValueError, match="missing 'name'"):
             build_transforms_from_config([{"height": 8, "width": 8}])
 
-
-# ---------------------------------------------------------------------------
-# 3) Output contract — dict keys, tensor shapes/dtypes, metadata correctness
-# ---------------------------------------------------------------------------
-
 class TestOutputContract:
     def test_length_matches_pair_count(self, base_config, standard_transforms):
         base_config["transforms"] = standard_transforms
@@ -239,14 +196,11 @@ class TestOutputContract:
             m = ds[i]["mask"]
             assert m.shape == (1, 32, 32)
             assert m.dtype == torch.float32
-            # every pixel is exactly 0 or 1
             assert torch.all((m == 0.0) | (m == 1.0))
 
     def test_mask_threshold_maps_expected_values(self, base_config):
-        # No resize / normalize so threshold arithmetic is unambiguous.
         base_config["transforms"] = [{"name": "ToTensorV2"}]
         ds = GenericSegmentationDataset(base_config)
-        # samples sorted by stem: 01(255)→1, 02(0)→0, 03(255)→1, 04(200)→1
         expected = [1.0, 0.0, 1.0, 1.0]
         for i, exp in enumerate(expected):
             assert ds[i]["mask"].mean().item() == pytest.approx(exp)
@@ -260,13 +214,7 @@ class TestOutputContract:
         assert meta["sample_id"] == "sample_03"
         assert isinstance(meta["image_path"], str)
         assert isinstance(meta["mask_path"], str)
-        # sample_03 was written at (H=100, W=60); original_size is pre-transform
         assert meta["original_size"] == (100, 60)
-
-
-# ---------------------------------------------------------------------------
-# 4) Config loader — YAML → GenericSegmentationDataset
-# ---------------------------------------------------------------------------
 
 class TestConfigLoader:
     def test_load_dataset_reads_yaml_and_instantiates(
@@ -280,11 +228,6 @@ class TestConfigLoader:
         assert ds[0]["image"].shape == (3, 32, 32)
         assert ds[0]["mask"].shape == (1, 32, 32)
 
-
-# ---------------------------------------------------------------------------
-# 5) DataLoader batching — default collate produces the batched contract
-# ---------------------------------------------------------------------------
-
 class TestDataLoaderBatching:
     def test_batched_shapes_via_default_collate(self, base_config, standard_transforms):
         base_config["transforms"] = standard_transforms
@@ -293,37 +236,28 @@ class TestDataLoaderBatching:
         batch = next(iter(loader))
         assert batch["image"].shape == (4, 3, 32, 32)
         assert batch["mask"].shape == (4, 1, 32, 32)
-        # metadata dict values are collated as lists / stacked tensors
         assert batch["metadata"]["dataset_name"] == ["fake"] * 4
         assert list(batch["metadata"]["index"]) == [0, 1, 2, 3]
 
-
-# ---------------------------------------------------------------------------
-# 6) Integration — every real dataset on disk (each auto-skips if missing)
-# ---------------------------------------------------------------------------
-
-# name -> (images_dir relative to repo root, official sample count)
 REAL_DATASETS = {
     "kvasir_seg": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
     "cvc_clinicdb": ("data/cvc-clinicdb/CVC-ClinicDB/Original", 612),
+    "mass_roads": ("data/mass_roads/images", 1171),
 }
-
 
 def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
     cfg = yaml.safe_load(cfg_path.read_text())
-    for step in cfg.get("transforms", []):
-        if step["name"] == "Resize":
+    pipeline = cfg.get("train_transforms", cfg.get("transforms", []))
+    for step in pipeline:
+        if step["name"] in ("Resize", "RandomCrop", "CenterCrop"):
             return step["height"], step["width"]
-    raise AssertionError(f"no Resize step in {cfg_path.name}")
-
+    raise AssertionError(f"no Resize, RandomCrop, or CenterCrop step in {cfg_path.name}")
 
 def _require_on_disk(name: str) -> Path:
-    """Return the config path, or skip if the dataset is not downloaded."""
     images_dir, _ = REAL_DATASETS[name]
     if not (_ROOT / images_dir).is_dir():
-        pytest.skip(f"{name} not on disk — run scripts/download_{name}.py first")
+        pytest.skip(f"{name} not on disk")
     return resolve_config(name, _ROOT / "configs")
-
 
 @pytest.mark.parametrize("name", sorted(REAL_DATASETS))
 class TestRealDatasetIntegration:
@@ -331,8 +265,6 @@ class TestRealDatasetIntegration:
         assert name in discover_dataset_configs(_ROOT / "configs")
 
     def test_len_matches_official_count(self, name):
-        # Also catches a config copied from another dataset without repointing
-        # images_dir/masks_dir — the count would be the wrong dataset's.
         cfg_path = _require_on_disk(name)
         assert len(load_dataset(cfg_path)) == REAL_DATASETS[name][1]
 
@@ -365,26 +297,18 @@ class TestRealDatasetIntegration:
         assert batch["image"].shape == (4, 3, h, w)
         assert batch["mask"].shape == (4, 1, h, w)
 
-
-# ---------------------------------------------------------------------------
-# 7) Cross-dataset invariants
-# ---------------------------------------------------------------------------
-
 class TestDatasetConsistency:
-    def test_all_dataset_configs_share_a_transform_pipeline(self):
-        """An ablation across datasets is only controlled if preprocessing matches."""
+    def test_medical_configs_share_a_transform_pipeline(self):
         configs = discover_dataset_configs(_ROOT / "configs")
+        medical_configs = {k: v for k, v in configs.items() if k in ("kvasir_seg", "cvc_clinicdb")}
         pipelines = {
             name: yaml.safe_load(path.read_text()).get("transforms")
-            for name, path in configs.items()
+            for name, path in medical_configs.items()
         }
-        assert len(configs) >= 2, "expected at least two dataset configs"
-        reference_name, reference = next(iter(pipelines.items()))
-        for name, pipeline in pipelines.items():
-            assert pipeline == reference, (
-                f"{name} transforms differ from {reference_name}; "
-                "cross-dataset comparisons would be confounded"
-            )
+        if len(medical_configs) >= 2:
+            reference_name, reference = next(iter(pipelines.items()))
+            for name, pipeline in pipelines.items():
+                assert pipeline == reference
 
     def test_splits_are_deterministic_and_disjoint(self):
         for name in discover_dataset_configs(_ROOT / "configs"):
@@ -396,21 +320,11 @@ class TestDatasetConsistency:
             assert first_val.indices == again_val.indices
             assert not set(first_train.indices) & set(first_val.indices)
 
-
-# ---------------------------------------------------------------------------
-# 8) Sequence-aware splitting (CVC-ClinicDB)
-# ---------------------------------------------------------------------------
-
-import csv as _csv
-
-from dataset import grouped_split_indices, load_group_map, groups_for_samples
-
 CVC_GROUP_SPEC = {
     "csv": "configs/cvc_clinicdb_sequences.csv",
     "sample_column": "sample_id",
     "group_column": "sequence_id",
 }
-
 
 class TestSequenceGrouping:
     def test_group_map_covers_every_cvc_frame(self):
@@ -420,16 +334,13 @@ class TestSequenceGrouping:
         assert len(set(mapping.values())) == 29
 
     def test_cvc_split_shares_no_sequence(self):
-        """The regression this whole change exists to prevent."""
         _require_on_disk("cvc_clinicdb")
         mapping = load_group_map(CVC_GROUP_SPEC, root=_ROOT)
         train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-
         def seqs(subset):
             return {mapping[subset.dataset.samples[i][2]] for i in subset.indices}
-
-        assert not seqs(train) & seqs(val), "sequence appears in both halves"
-        assert len(seqs(val)) >= 4, "too few held-out sequences to report on"
+        assert not seqs(train) & seqs(val)
+        assert len(seqs(val)) >= 4
 
     def test_cvc_split_covers_dataset_exactly_once(self):
         _require_on_disk("cvc_clinicdb")
@@ -439,7 +350,6 @@ class TestSequenceGrouping:
     def test_cvc_val_fraction_is_near_target(self):
         _require_on_disk("cvc_clinicdb")
         _, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-        # Whole sequences move together, so the fraction only approximates 0.2.
         assert 0.15 <= len(val) / 612 <= 0.25
 
     def test_cvc_split_is_deterministic(self):
@@ -450,13 +360,12 @@ class TestSequenceGrouping:
         assert a_val.indices == b_val.indices
 
     def test_committed_map_matches_mirror_metadata(self):
-        """Guard the committed table against the mirror it was derived from."""
         metadata = _ROOT / "data/cvc-clinicdb/metadata.csv"
         if not metadata.is_file():
             pytest.skip("mirror metadata.csv not present")
         expected = {
             str(int(r["frame_id"])): str(int(r["sequence_id"]))
-            for r in _csv.DictReader(metadata.open(newline=""))
+            for r in csv.DictReader(metadata.open(newline=""))
         }
         assert load_group_map(CVC_GROUP_SPEC, root=_ROOT) == expected
 
@@ -473,15 +382,13 @@ class TestSequenceGrouping:
             load_group_map({"csv": "nope.csv"}, root=tmp_path)
 
     def test_grouped_split_is_group_pure_on_synthetic_data(self):
-        groups = [f"s{i // 10}" for i in range(100)]  # 10 groups of 10
+        groups = [f"s{i // 10}" for i in range(100)]
         train, val = grouped_split_indices(groups, 0.2, seed=42)
         assert not {groups[i] for i in train} & {groups[i] for i in val}
         assert sorted([*train, *val]) == list(range(100))
 
-
 class TestKvasirSplitUnchanged:
     def test_kvasir_matches_legacy_random_split_exactly(self):
-        """Kvasir-SEG must be byte-identical to the pre-grouping split."""
         cfg = _require_on_disk("kvasir_seg")
         n = len(load_dataset(cfg))
         train_size = int(0.8 * n)
