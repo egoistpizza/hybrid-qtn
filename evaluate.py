@@ -110,6 +110,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Segmentation Models")
     parser.add_argument("--model", type=str, default="vanilla", choices=["vanilla", "hybrid", "deep_hybrid"])
     parser.add_argument("--bond_dim", type=int, default=32)
+    parser.add_argument("--loss", type=str, default="focal_tversky", choices=["focal_tversky", "bce_dice"],
+                         help="Loss function used during training, for reconstructing the checkpoint dir name "
+                              "(ignored if --run is given).")
     parser.add_argument("--tag", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Available: {available_datasets}")
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11))
@@ -142,7 +145,7 @@ def main() -> None:
     model = model.to(device).to(memory_format=torch.channels_last)
     
     run_suffix = f"{args.model}_unet" if args.model == "vanilla" else f"{args.model}_unet_b{args.bond_dim}_ckpt"
-    run_name = args.run if args.run else f"{dataset_slug}__{run_suffix}"
+    run_name = args.run if args.run else f"{dataset_slug}__{run_suffix}__{args.loss}"
     if args.tag:
         run_name = f"{run_name}__{args.tag}"
         
