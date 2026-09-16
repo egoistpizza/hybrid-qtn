@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from export import (
-    build_export_model,
+    build_model,
     export_model_to_onnx,
     benchmark_pytorch_throughput,
     benchmark_onnx_throughput
@@ -37,14 +37,14 @@ def minimal_pytorch_model() -> torch.nn.Module:
 
 
 def test_build_export_model_returns_correct_instances():
-    vanilla_model = build_export_model("vanilla", bond_dim=16)
+    vanilla_model = build_model("vanilla", bond_dim=16)
     assert vanilla_model.__class__.__name__ == "UNet"
-    
-    hybrid_model = build_export_model("hybrid", bond_dim=16)
+
+    hybrid_model = build_model("hybrid", bond_dim=16)
     assert hybrid_model.__class__.__name__ == "UNetDeepHybrid"
     assert getattr(hybrid_model, "transform_1024", None) is not None
-    
-    deep_hybrid_model = build_export_model("deep_hybrid", bond_dim=16)
+
+    deep_hybrid_model = build_model("deep_hybrid", bond_dim=16)
     assert getattr(deep_hybrid_model, "transform_512", None) is not None
 
 

@@ -70,3 +70,10 @@ This project is licensed under the MIT License - see the `LICENSE` file for deta
 ```
 python scripts/download_cvc_clinicdb.py --source local --archive local_zip_path.zip
 ```
+
+## Download DUTS
+DUTS-TR is used for training and DUTS-TE for validation, at 256x256 (see `configs/duts.yaml`).
+```
+python scripts/download_duts.py
+python scripts/download_duts.py --source local --tr-archive DUTS-TR.zip --te-archive DUTS-TE.zip
+```

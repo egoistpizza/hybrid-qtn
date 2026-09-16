@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dataset import discover_dataset_configs, load_dataset
+from dataset import dataset_image_size, discover_dataset_configs, load_dataset
 
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -16,12 +16,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 DATASET_IMAGE_DIRS = {
     "kvasir_seg": "data/kvasir-seg/Kvasir-SEG/images",
     "cvc_clinicdb": "data/cvc-clinicdb/CVC-ClinicDB/Original",
+    "duts": "data/duts/DUTS-TR/DUTS-TR-Image",
 }
 
 
 @pytest.mark.parametrize("dataset_name", sorted(DATASET_IMAGE_DIRS))
 def test_augmentations_and_visualization(dataset_name):
-    image_size = 512
     num_samples = 3
 
     configs = discover_dataset_configs(_ROOT / "configs")
@@ -34,6 +34,7 @@ def test_augmentations_and_visualization(dataset_name):
     output_path = _ROOT / f"augmentation_preview_{dataset_name}.png"
 
     dataset = load_dataset(config_path)
+    image_size = dataset_image_size(dataset.config, dataset_name)
 
     assert len(dataset) > 0, "Dataset must not be empty."
 

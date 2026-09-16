@@ -6,27 +6,9 @@ import numpy as np
 import onnxruntime as ort
 import torch
 
+from models import DEFAULT_IMAGE_SIZE, MODEL_TYPES, build_model
 from utils import get_device
 
-
-def build_export_model(model_type: str, bond_dim: int) -> torch.nn.Module:
-    if model_type == "deep_hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_512 = MPSBottleneck(in_channels=512, bond_dim=bond_dim, height=64, width=64)
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=mps_512, transform_1024=mps_1024)
-        
-    if model_type == "hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=None, transform_1024=mps_1024)
-        
-    from models.unet_classic import UNet
-    return UNet(in_channels=3, out_channels=1)
 
 def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tensor, total_iterations: int = 100) -> float:
     model.eval()
@@ -99,10 +81,10 @@ def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, outp
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
+    parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
     parser.add_argument("--bond_dim", type=int, default=32)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--image_size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default="outputs/onnx")
     return parser.parse_args()
@@ -117,7 +99,7 @@ def main() -> None:
     onnx_filename = f"{args.model}_b{args.bond_dim}_s{args.image_size}.onnx"
     onnx_file_path = output_directory / onnx_filename
     
-    model = build_export_model(args.model, args.bond_dim).to(compute_device)
+    model = build_model(args.model, args.bond_dim, args.image_size).to(compute_device)
     model = model.to(memory_format=torch.channels_last)
     
     dummy_input_tensor = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=compute_device)

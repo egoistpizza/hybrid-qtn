@@ -38,10 +38,25 @@ image_ext:      str            # e.g. ".jpg"
 mask_ext:       str            # e.g. ".jpg" or ".png"
 strict_pairing: bool = true    # raise on orphan; false = warn + skip
 mask_threshold: int = 127      # foreground cutoff for raw grayscale mask
+image_size:     int = 512      # model input size; must match the pipeline's final Resize/Crop
 transforms:                    # optional list of Albumentations specs
   - name: <ClassName>
     <kwargs>: ...
+train_transforms: [...]        # optional; with val_transforms, replaces transforms per split
+val_transforms:   [...]
+val_images_dir: str            # optional; official val split (e.g. DUTS-TE) instead of random 80/20
+val_masks_dir:  str            # set together with val_images_dir; not combinable with group_map
 ```
+
+### Image size
+
+`image_size` drives the model, not the data: `train.py` and `evaluate.py` read it
+from the dataset config and size the MPS bottleneck from it (`image_size // 8`
+and `image_size // 16`). It must be a multiple of 16, every pipeline in the
+config must end at `image_size x image_size` (checked at startup), and datasets
+trained jointly must share it. Run and checkpoint names end in `__s<image_size>`.
+
+Current sizes: `kvasir_seg` and `mass_roads` 512, `cvc_clinicdb` and `duts` 256.
 
 ### Transforms
 
@@ -73,10 +88,10 @@ out:
 ```python
 from dataset import build_train_val, discover_dataset_configs
 
-print(sorted(discover_dataset_configs()))       # ['cvc_clinicdb', 'kvasir_seg']
+print(sorted(discover_dataset_configs()))       # ['cvc_clinicdb', 'duts', 'kvasir_seg', 'mass_roads']
 
 train_ds, val_ds = build_train_val(["kvasir_seg"])
-train_ds, val_ds = build_train_val(["kvasir_seg", "cvc_clinicdb"])  # joint
+train_ds, val_ds = build_train_val(["cvc_clinicdb", "duts"])  # joint (both 256)
 ```
 
 Or, with an arbitrary config dict:

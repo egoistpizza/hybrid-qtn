@@ -5,10 +5,12 @@ from .loader import load_dataset
 from .pairing import pair_by_stem
 from .splits import (
     build_train_val,
+    dataset_image_size,
     discover_dataset_configs,
     make_splits,
     parse_dataset_arg,
     resolve_config,
+    resolve_image_size,
     slugify_dataset_arg,
 )
 from .transforms import build_transforms_from_config
@@ -20,10 +22,12 @@ __all__ = [
     "pair_by_stem",
     "build_transforms_from_config",
     "build_train_val",
+    "dataset_image_size",
     "discover_dataset_configs",
     "make_splits",
     "parse_dataset_arg",
     "resolve_config",
+    "resolve_image_size",
     "slugify_dataset_arg",
     "grouped_split_indices",
     "groups_for_samples",

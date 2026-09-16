@@ -19,6 +19,9 @@ strict_pairing: true
 # become foreground (1.0), the rest background (0.0).
 mask_threshold: 127
 
+# Model input size. Must match the Resize below.
+image_size: 512
+
 # Albumentations pipeline. Applied jointly to image and mask.
 # Order matters. ToTensorV2 must be last.
 transforms:

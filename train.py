@@ -22,8 +22,10 @@ from dataset import (
     build_train_val,
     discover_dataset_configs,
     parse_dataset_arg,
+    resolve_image_size,
     slugify_dataset_arg,
 )
+from models import MODEL_TYPES, build_model, build_run_name
 from utils import get_device
 
 logger = logging.getLogger(__name__)
@@ -297,7 +299,7 @@ def main():
     init()
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
     available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
-    parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
+    parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
     parser.add_argument("--bond_dim", type=int, default=32, help="Bond dimension for MPS layer")
@@ -310,6 +312,7 @@ def main():
 
     dataset_names = parse_dataset_arg(args.dataset)
     dataset_slug = slugify_dataset_arg(dataset_names)
+    image_size = resolve_image_size(dataset_names)
 
     seed_everything(42)
     device = get_device()
@@ -320,7 +323,7 @@ def main():
         "accumulation_steps": 8,
         "learning_rate": 2e-4,
         "weight_decay": 1e-4,
-        "image_size": 512,
+        "image_size": image_size,
         "bond_dim": args.bond_dim,
         "loss": args.loss,
         "swa_start_pct": 0.75,
@@ -335,48 +338,18 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
-    if args.model == "deep_hybrid":
-        logger.info("Initializing DEEP Hybrid UNet with Dual MPS Bottlenecks...")
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_512 = MPSBottleneck(in_channels=512, bond_dim=config["bond_dim"], height=64, width=64)
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
-        
-        model = UNetDeepHybrid(
-            in_channels=3, 
-            out_channels=1, 
-            transform_512=mps_512, 
-            transform_1024=mps_1024
-        )
-        run_name = f"deep_hybrid_unet_b{config['bond_dim']}_ckpt"
+    model_labels = {
+        "deep_hybrid": "DEEP Hybrid UNet with Dual MPS Bottlenecks",
+        "hybrid": "Standard Hybrid UNet",
+        "vanilla": "Vanilla UNet",
+    }
+    logger.info(f"Initializing {model_labels[args.model]} for {image_size}x{image_size} input...")
+    model = build_model(args.model, config["bond_dim"], image_size)
+    if args.model != "vanilla":
         debug_model_info(model, device, config)
 
-    elif args.model == "hybrid":
-        logger.info("Initializing Standard Hybrid UNet...")
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
-        model = UNetDeepHybrid(
-            in_channels=3, 
-            out_channels=1, 
-            transform_512=None, 
-            transform_1024=mps_1024
-        )
-        run_name = f"hybrid_unet_b{config['bond_dim']}_ckpt"
-        debug_model_info(model, device, config) 
-        
-    else:
-        logger.info("Initializing Vanilla UNet...")
-        from models.unet_classic import UNet
-        
-        model = UNet(in_channels=3, out_channels=1)
-        run_name = "vanilla_unet"
     config["model_type"] = args.model
-    run_name = f"{dataset_slug}__{run_name}__{args.loss}"
-    if args.tag:
-        run_name = f"{run_name}__{args.tag}"
+    run_name = build_run_name(dataset_slug, args.model, config["bond_dim"], args.loss, image_size, args.tag)
     config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
 
     model = model.to(device).to(memory_format=torch.channels_last)

@@ -11,8 +11,10 @@ from dataset import (
     build_train_val,
     discover_dataset_configs,
     parse_dataset_arg,
+    resolve_image_size,
     slugify_dataset_arg,
 )
+from models import MODEL_TYPES, build_model, build_run_name
 from utils.metrics import calculate_all_metrics
 from utils import get_device
 
@@ -85,31 +87,14 @@ def load_model_weights(model: torch.nn.Module, checkpoint_path: Path, device: to
     model.load_state_dict(clean_state_dict)
     print("Weights loaded successfully!")
 
-def build_model(model_type: str, bond_dim: int) -> torch.nn.Module:
-    if model_type == "deep_hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_512 = MPSBottleneck(in_channels=512, bond_dim=bond_dim, height=64, width=64)
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=mps_512, transform_1024=mps_1024)
-        
-    if model_type == "hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=None, transform_1024=mps_1024)
-        
-    from models.unet_classic import UNet
-    return UNet(in_channels=3, out_channels=1)
-
 def parse_args() -> argparse.Namespace:
     available_datasets = ", ".join(sorted(discover_dataset_configs())) or "(none)"
-    
+
     parser = argparse.ArgumentParser(description="Evaluate Segmentation Models")
-    parser.add_argument("--model", type=str, default="vanilla", choices=["vanilla", "hybrid", "deep_hybrid"])
+    parser.add_argument("--model", type=str, default="vanilla", choices=MODEL_TYPES)
     parser.add_argument("--bond_dim", type=int, default=32)
+    parser.add_argument("--loss", type=str, default="focal_tversky", choices=["focal_tversky", "bce_dice"],
+                        help="Loss the run was trained with; part of the checkpoint directory name")
     parser.add_argument("--tag", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Available: {available_datasets}")
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11))
@@ -127,6 +112,7 @@ def main() -> None:
 
     dataset_names = parse_dataset_arg(args.dataset)
     dataset_slug = slugify_dataset_arg(dataset_names)
+    image_size = resolve_image_size(dataset_names)
 
     _, val_ds = build_train_val(dataset_names)
     print(f"Dataset '{dataset_slug}': {len(val_ds)} validation samples")
@@ -138,13 +124,13 @@ def main() -> None:
     viz_subset = Subset(val_ds, viz_indices.tolist())
     viz_loader = DataLoader(viz_subset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
     
-    model = build_model(args.model, args.bond_dim)
+    model = build_model(args.model, args.bond_dim, image_size)
     model = model.to(device).to(memory_format=torch.channels_last)
-    
-    run_suffix = f"{args.model}_unet" if args.model == "vanilla" else f"{args.model}_unet_b{args.bond_dim}_ckpt"
-    run_name = args.run if args.run else f"{dataset_slug}__{run_suffix}"
-    if args.tag:
-        run_name = f"{run_name}__{args.tag}"
+
+    if args.run:
+        run_name = f"{args.run}__{args.tag}" if args.tag else args.run
+    else:
+        run_name = build_run_name(dataset_slug, args.model, args.bond_dim, args.loss, image_size, args.tag)
         
     checkpoint_dir = Path("checkpoints") / run_name
     swa_checkpoint_path = checkpoint_dir / "best_swa_model.pth"

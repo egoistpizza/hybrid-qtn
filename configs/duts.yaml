@@ -1,0 +1,62 @@
+# DUTS salient object detection dataset config
+#
+# Layout expected after running `python scripts/download_duts.py`:
+#   data/duts/DUTS-TR/DUTS-TR-Image/*.jpg   10,553 images
+#   data/duts/DUTS-TR/DUTS-TR-Mask/*.png
+#   data/duts/DUTS-TE/DUTS-TE-Image/*.jpg    5,019 images
+#   data/duts/DUTS-TE/DUTS-TE-Mask/*.png
+
+dataset_name: duts
+
+# Official split: DUTS-TR trains, DUTS-TE validates. Setting val_images_dir /
+# val_masks_dir replaces the random 80/20 split. See dataset/splits.py.
+images_dir:     data/duts/DUTS-TR/DUTS-TR-Image
+masks_dir:      data/duts/DUTS-TR/DUTS-TR-Mask
+val_images_dir: data/duts/DUTS-TE/DUTS-TE-Image
+val_masks_dir:  data/duts/DUTS-TE/DUTS-TE-Mask
+image_ext:      .jpg
+mask_ext:       .png
+
+# Pairing behavior. When true, an unpaired image or mask raises.
+strict_pairing: true
+
+# Raw mask is grayscale 0-255; values strictly greater than this threshold
+# become foreground (1.0), the rest background (0.0).
+mask_threshold: 127
+
+# Model input size. Must match every Resize below.
+image_size: 256
+
+# Natural images have a canonical "up", so no VerticalFlip.
+train_transforms:
+  - name: Resize
+    height: 256
+    width: 256
+  - name: HorizontalFlip
+    p: 0.5
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+val_transforms:
+  - name: Resize
+    height: 256
+    width: 256
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+# Used by load_dataset() outside of make_splits (tests, previews).
+transforms:
+  - name: Resize
+    height: 256
+    width: 256
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2

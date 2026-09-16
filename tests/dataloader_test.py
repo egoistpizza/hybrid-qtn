@@ -18,11 +18,13 @@ from torch.utils.data import DataLoader
 from dataset import (
     GenericSegmentationDataset,
     build_transforms_from_config,
+    dataset_image_size,
     discover_dataset_configs,
     load_dataset,
     make_splits,
     pair_by_stem,
     resolve_config,
+    resolve_image_size,
     grouped_split_indices,
     load_group_map,
     groups_for_samples,
@@ -243,6 +245,7 @@ REAL_DATASETS = {
     "kvasir_seg": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
     "cvc_clinicdb": ("data/cvc-clinicdb/CVC-ClinicDB/Original", 612),
     "mass_roads": ("data/mass_roads/images", 1171),
+    "duts": ("data/duts/DUTS-TR/DUTS-TR-Image", 10553),
 }
 
 def _resize_from_yaml(cfg_path: Path) -> tuple[int, int]:
@@ -297,12 +300,20 @@ class TestRealDatasetIntegration:
         assert batch["image"].shape == (4, 3, h, w)
         assert batch["mask"].shape == (4, 1, h, w)
 
+def _without_resize_size(pipeline: list[dict]) -> list[dict]:
+    return [
+        {k: v for k, v in step.items() if not (step["name"] == "Resize" and k in ("height", "width"))}
+        for step in pipeline
+    ]
+
 class TestDatasetConsistency:
     def test_medical_configs_share_a_transform_pipeline(self):
+        # Kvasir-SEG runs at 512 and CVC-ClinicDB at 256; everything but the
+        # Resize size must still match so the augmentation stays controlled.
         configs = discover_dataset_configs(_ROOT / "configs")
         medical_configs = {k: v for k, v in configs.items() if k in ("kvasir_seg", "cvc_clinicdb")}
         pipelines = {
-            name: yaml.safe_load(path.read_text()).get("transforms")
+            name: _without_resize_size(yaml.safe_load(path.read_text()).get("transforms"))
             for name, path in medical_configs.items()
         }
         if len(medical_configs) >= 2:
@@ -318,7 +329,114 @@ class TestDatasetConsistency:
             again_train, again_val = make_splits(name, config_dir=_ROOT / "configs")
             assert first_train.indices == again_train.indices
             assert first_val.indices == again_val.indices
-            assert not set(first_train.indices) & set(first_val.indices)
+            # Compare files, not indices: a predefined val split indexes its own dataset.
+            assert not _subset_image_paths(first_train) & _subset_image_paths(first_val)
+
+def _subset_image_paths(subset) -> set[str]:
+    return {subset.dataset.samples[i][0] for i in subset.indices}
+
+class TestImageSize:
+    def test_real_config_sizes(self):
+        configs = discover_dataset_configs(_ROOT / "configs")
+        expected = {"kvasir_seg": 512, "mass_roads": 512, "cvc_clinicdb": 256, "duts": 256}
+        for name, size in expected.items():
+            assert resolve_image_size([name], _ROOT / "configs") == size
+            assert _resize_from_yaml(configs[name]) == (size, size)
+
+    def test_missing_key_defaults_to_512(self, standard_transforms):
+        standard_transforms[0].update(height=512, width=512)
+        assert dataset_image_size({"transforms": standard_transforms}) == 512
+
+    def test_resize_mismatch_raises(self, standard_transforms):
+        with pytest.raises(ValueError, match="image_size is 256"):
+            dataset_image_size({"image_size": 256, "transforms": standard_transforms})
+
+    def test_each_pipeline_is_checked(self, standard_transforms):
+        good = [dict(step) for step in standard_transforms]
+        good[0].update(height=64, width=64)
+        with pytest.raises(ValueError, match="val_transforms"):
+            dataset_image_size({
+                "image_size": 64,
+                "train_transforms": good,
+                "val_transforms": standard_transforms,
+            })
+
+    def test_pipeline_without_size_step_raises(self):
+        with pytest.raises(ValueError, match="no step with height/width"):
+            dataset_image_size({"transforms": [{"name": "ToTensorV2"}]})
+
+    def test_joint_datasets_must_share_size(self):
+        with pytest.raises(ValueError, match="must share image_size"):
+            resolve_image_size(["kvasir_seg", "cvc_clinicdb"], _ROOT / "configs")
+
+@pytest.fixture
+def predefined_split_config(tmp_path: Path, standard_transforms) -> Path:
+    for split, stems in (("train", ["a", "b", "c"]), ("val", ["d", "e"])):
+        (tmp_path / split / "images").mkdir(parents=True)
+        (tmp_path / split / "masks").mkdir(parents=True)
+        for stem in stems:
+            _write_image(tmp_path / split / "images" / f"{stem}.jpg", 40, 40)
+            _write_mask(tmp_path / split / "masks" / f"{stem}.png", 40, 40, 255)
+
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    train_transforms = [standard_transforms[0], {"name": "HorizontalFlip", "p": 1.0}, *standard_transforms[1:]]
+    config = {
+        "dataset_name": "fake_predefined",
+        "images_dir": str(tmp_path / "train" / "images"),
+        "masks_dir": str(tmp_path / "train" / "masks"),
+        "val_images_dir": str(tmp_path / "val" / "images"),
+        "val_masks_dir": str(tmp_path / "val" / "masks"),
+        "image_ext": ".jpg",
+        "mask_ext": ".png",
+        "image_size": 32,
+        "train_transforms": train_transforms,
+        "val_transforms": standard_transforms,
+    }
+    path = config_dir / "fake_predefined.yaml"
+    path.write_text(yaml.safe_dump(config))
+    return path
+
+class TestPredefinedValSplit:
+    def test_train_and_val_come_from_their_own_folders(self, predefined_split_config):
+        train, val = make_splits("fake_predefined", config_dir=predefined_split_config.parent)
+        assert [train.dataset.samples[i][2] for i in train.indices] == ["a", "b", "c"]
+        assert [val.dataset.samples[i][2] for i in val.indices] == ["d", "e"]
+        assert not _subset_image_paths(train) & _subset_image_paths(val)
+
+    def test_train_and_val_use_their_own_transforms(self, predefined_split_config):
+        train, val = make_splits("fake_predefined", config_dir=predefined_split_config.parent)
+        train_names = [type(t).__name__ for t in train.dataset.transform.transforms]
+        val_names = [type(t).__name__ for t in val.dataset.transform.transforms]
+        assert "HorizontalFlip" in train_names
+        assert "HorizontalFlip" not in val_names
+        assert val[0]["image"].shape == (3, 32, 32)
+
+    def test_split_ignores_val_fraction(self, predefined_split_config):
+        train, val = make_splits("fake_predefined", val_fraction=0.5, config_dir=predefined_split_config.parent)
+        assert (len(train), len(val)) == (3, 2)
+
+    def test_val_dirs_must_be_set_together(self, predefined_split_config):
+        config = yaml.safe_load(predefined_split_config.read_text())
+        del config["val_masks_dir"]
+        predefined_split_config.write_text(yaml.safe_dump(config))
+        with pytest.raises(ValueError, match="must be set together"):
+            make_splits("fake_predefined", config_dir=predefined_split_config.parent)
+
+    def test_group_map_conflicts_with_val_dirs(self, predefined_split_config):
+        config = yaml.safe_load(predefined_split_config.read_text())
+        config["group_map"] = {"csv": "unused.csv"}
+        predefined_split_config.write_text(yaml.safe_dump(config))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            make_splits("fake_predefined", config_dir=predefined_split_config.parent)
+
+    def test_duts_uses_official_split(self):
+        _require_on_disk("duts")
+        if not (_ROOT / "data/duts/DUTS-TE/DUTS-TE-Image").is_dir():
+            pytest.skip("DUTS-TE not on disk")
+        train, val = make_splits("duts", config_dir=_ROOT / "configs")
+        assert (len(train), len(val)) == (10553, 5019)
+        assert not _subset_image_paths(train) & _subset_image_paths(val)
 
 CVC_GROUP_SPEC = {
     "csv": "configs/cvc_clinicdb_sequences.csv",
