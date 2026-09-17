@@ -1,0 +1,62 @@
+dataset_name: mass_roads
+
+images_dir: data/mass_roads/images
+masks_dir:  data/mass_roads/masks
+image_ext:  .tiff
+mask_ext:   .tif
+
+strict_pairing: true
+mask_threshold: 127
+
+transforms:
+  - name: PadIfNeeded
+    min_height: 512
+    min_width: 512
+    border_mode: 0
+    fill: 0
+    fill_mask: 0
+  - name: CenterCrop
+    height: 512
+    width: 512
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+train_transforms:
+  - name: PadIfNeeded
+    min_height: 512
+    min_width: 512
+    border_mode: 0
+    fill: 0
+    fill_mask: 0
+  - name: RandomCrop
+    height: 512
+    width: 512
+  - name: HorizontalFlip
+    p: 0.5
+  - name: VerticalFlip
+    p: 0.5
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+val_transforms:
+  - name: PadIfNeeded
+    min_height: 512
+    min_width: 512
+    border_mode: 0
+    fill: 0
+    fill_mask: 0
+  - name: CenterCrop
+    height: 512
+    width: 512
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+  
