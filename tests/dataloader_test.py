@@ -241,6 +241,8 @@ class TestDataLoaderBatching:
 
 REAL_DATASETS = {
     "kvasir_seg": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
+    "kvasir_seg_augmented": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
+    "kvasir_seg_no_aug": ("data/kvasir-seg/Kvasir-SEG/images", 1000),
     "cvc_clinicdb": ("data/cvc-clinicdb/CVC-ClinicDB/Original", 612),
     "mass_roads": ("data/mass_roads/images", 1171),
 }

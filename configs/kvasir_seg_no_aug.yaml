@@ -1,0 +1,26 @@
+# Kvasir-SEG — augmentation-ablation "control" arm.
+#
+# Same images/masks as configs/kvasir_seg.yaml, but with every stochastic
+# augmentation removed: train and val get identical, deterministic
+# preprocessing (resize + normalize + tensor conversion only, no flips).
+# Pairs with configs/kvasir_seg_augmented.yaml for the ablation.
+
+dataset_name: kvasir-seg-no-aug
+
+images_dir: data/kvasir-seg/Kvasir-SEG/images
+masks_dir:  data/kvasir-seg/Kvasir-SEG/masks
+image_ext:  .jpg
+mask_ext:   .jpg
+
+strict_pairing: true
+mask_threshold: 127
+
+transforms:
+  - name: Resize
+    height: 512
+    width: 512
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
