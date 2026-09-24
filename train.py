@@ -25,6 +25,8 @@ from dataset import (
     slugify_dataset_arg,
 )
 from utils import get_device
+from utils import argparse_str_to_bool, argparse_str_to_bool_fn_extra
+
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,9 @@ class SegmentationTrainer:
             wandb.finish()
             logger.info("Training finished.")
 
+
+
+
 def main():
     init()
     parser = argparse.ArgumentParser(description="Train Segmentation Model")
@@ -306,14 +311,28 @@ def main():
                         help="Dataset config stem(s) under configs/, comma-separated "
                              f"for joint training. Available: {available}")
     parser.add_argument("--tag", type=str, default=None, help="Suffix to distinguish runs of the same config")
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--compile', type=argparse_str_to_bool_fn_extra(["lazy", "instant", "none"]), default="lazy")
+    parser.add_argument('--show-model-info', type=argparse_str_to_bool, default=True)
+    
     args = parser.parse_args()
 
     dataset_names = parse_dataset_arg(args.dataset)
     dataset_slug = slugify_dataset_arg(dataset_names)
 
-    seed_everything(42)
+    seed_everything(args.seed)
     device = get_device()
 
+    compile_model = args.compile
+    if args.compile == True: # True means instant
+        compile_model = "instant"
+    elif args.compile == False:
+        compile_model = "none"
+    else: # "none", "lazy" or "instant"
+        compile_model = args.compile
+    
+    show_model_info = args.show_model_info
+    
     config = {
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -350,7 +369,6 @@ def main():
             transform_1024=mps_1024
         )
         run_name = f"deep_hybrid_unet_b{config['bond_dim']}_ckpt"
-        debug_model_info(model, device, config)
 
     elif args.model == "hybrid":
         logger.info("Initializing Standard Hybrid UNet...")
@@ -365,7 +383,6 @@ def main():
             transform_1024=mps_1024
         )
         run_name = f"hybrid_unet_b{config['bond_dim']}_ckpt"
-        debug_model_info(model, device, config) 
         
     else:
         logger.info("Initializing Vanilla UNet...")
@@ -373,6 +390,10 @@ def main():
         
         model = UNet(in_channels=3, out_channels=1)
         run_name = "vanilla_unet"
+    
+    if show_model_info:
+        debug_model_info(model, device, config)
+    
     config["model_type"] = args.model
     run_name = f"{dataset_slug}__{run_name}__{args.loss}"
     if args.tag:
@@ -380,28 +401,47 @@ def main():
     config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
 
     model = model.to(device).to(memory_format=torch.channels_last)
-
-    if int(torch.__version__.split('.')[0]) >= 2:
-        try:
-            logger.info("Compiling the model...")
-            c_model = torch.compile(model)
-            # Warm up at the real training shape, memory format and precision so we compile
-            # the graph training will actually use. Do NOT bind the result: holding a
-            # reference pins the whole activation graph for the lifetime of the run.
-            dummy_input = torch.randn(
-                config["batch_size"], 3, config["image_size"], config["image_size"],
-                device=device,
-            ).to(memory_format=torch.channels_last)
-            with torch.autocast(device.type, enabled=(device.type == "cuda")):
-                c_model(dummy_input).float().mean().backward()
-            model.zero_grad(set_to_none=True)
-            del dummy_input
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            model = c_model
-            logger.info("Compiled the model successfully")
-        except Exception as e:
-            logger.warning(f"[!] torch.compile failed: {e}")
+    
+    if compile_model in ("lazy", "instant"):
+        if int(torch.__version__.split('.')[0]) >= 2:
+            try:
+                c_model = torch.compile(model)
+                
+                if compile_model == "instant":
+                    # Warm up at the real training shape, memory format and precision so we compile
+                    # the graph training will actually use. Do NOT bind the result: holding a
+                    # reference pins the whole activation graph for the lifetime of the run.
+                    dummy_input = torch.randn(
+                        config["batch_size"], 3, config["image_size"], config["image_size"],
+                        device=device,
+                    )
+                    dummy_input = dummy_input.to(memory_format=torch.channels_last)
+                    with torch.autocast(device.type, enabled=(device.type == "cuda")):
+                        logger.info("Compiling the model...")
+                        c_model(dummy_input).float().mean().backward()
+                        logger.info("Compiled the model successfully")
+                    model.zero_grad(set_to_none=True)
+                    del dummy_input
+                    
+                else:
+                    logger.info(f"Argument 'compile' is lazy: The model is wrapped into a lazy compilation and will be compiled by torch. This may fail")
+                
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                
+                model = c_model
+                
+            except Exception as e:
+                logger.warning(f"[!] torch.compile failed: {e}")
+        else:
+            logger.warning("Argument 'compile' is instant or lazy but torch version smaller than 2: Could not compile the model.")
+    
+    elif compile_model == "none":
+        logger.info(f"Skipping model compilation")
+    
+    else:
+        raise AssertionError()
+    
     
     if args.loss == "bce_dice":
         criterion = BCEDiceLoss(bce_weight=0.5)
