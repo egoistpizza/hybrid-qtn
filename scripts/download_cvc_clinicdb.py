@@ -63,7 +63,15 @@ MASK_DIR_ALIASES = {
     "mask",
     "annotations",
 }
-IMAGE_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+
+# Path.rglob("*") in _find_layout() gets sorted items in Windows, and unsorted inode nodes in Linux. Therefore
+# it may get *.tif versions, which clash with what is defined in cvc_clinicdb.yaml. Both of the folders have exact same
+# number of valid images so the tie is broken by the OS' file handlings. Even if the YAML file also specified to accept
+# all, one machine could have been working differently than the other just because one is training on PNG and other is
+# on TIFF.
+# Let's just specify PNG here too (rather than all those formats)
+# IMAGE_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+IMAGE_EXTS = {".png"}
 
 
 def _ssl_context() -> ssl.SSLContext:
