@@ -1,19 +1,3 @@
-"""Build an Albumentations pipeline from a YAML-friendly list of specs.
-
-Config shape::
-
-    transforms:
-      - name: Resize
-        height: 256
-        width: 256
-      - name: HorizontalFlip
-        p: 0.5
-      - name: Normalize
-        mean: [0.485, 0.456, 0.406]
-        std:  [0.229, 0.224, 0.225]
-      - name: ToTensorV2
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -21,40 +5,67 @@ from typing import Any
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+TRAIN_STAGE = "train"
+EVAL_STAGE = "eval"
+STAGES = (TRAIN_STAGE, EVAL_STAGE)
+SHARED_TRANSFORMS_KEY = "transforms"
+DEFAULT_AUGMENTATION_SEED = 0
 
-_EXTRA_TRANSFORMS: dict[str, Any] = {
-    "ToTensorV2": ToTensorV2,
-}
+DETERMINISTIC_TRANSFORMS = frozenset(
+    {
+        "Resize",
+        "LongestMaxSize",
+        "SmallestMaxSize",
+        "PadIfNeeded",
+        "CenterCrop",
+        "Normalize",
+        "ToTensorV2",
+    }
+)
+
+_EXTRA_TRANSFORMS: dict[str, Any] = {"ToTensorV2": ToTensorV2}
 
 
 def _resolve_transform(name: str) -> Any:
     if name in _EXTRA_TRANSFORMS:
         return _EXTRA_TRANSFORMS[name]
-    cls = getattr(A, name, None)
-    if cls is None:
+    transform_class = getattr(A, name, None)
+    if transform_class is None:
         raise ValueError(
             f"Unknown Albumentations transform: {name!r}. "
             "Use the exact class name from `albumentations` "
             "(or 'ToTensorV2' for the tensor conversion)."
         )
-    return cls
+    return transform_class
+
+
+def _spec_name(spec: dict) -> str:
+    if "name" not in spec:
+        raise ValueError(f"Transform spec missing 'name' key: {spec!r}")
+    return spec["name"]
 
 
 def build_transforms_from_config(
     specs: list[dict] | None,
+    seed: int = DEFAULT_AUGMENTATION_SEED,
 ) -> A.Compose:
-    """Build an ``A.Compose`` from a list of ``{name, ...kwargs}`` dicts.
+    pipeline = [
+        _resolve_transform(_spec_name(spec))(**{key: value for key, value in spec.items() if key != "name"})
+        for spec in specs or []
+    ]
+    return A.Compose(pipeline, seed=seed)
 
-    The pipeline is constructed with ``additional_targets={"mask": "mask"}`` implicit
-    to Albumentations — call sites should pass ``transform(image=img, mask=msk)``.
-    An empty or missing list produces an identity pipeline.
-    """
-    specs = specs or []
-    pipeline: list[Any] = []
-    for spec in specs:
-        if "name" not in spec:
-            raise ValueError(f"Transform spec missing 'name' key: {spec!r}")
-        kwargs = {k: v for k, v in spec.items() if k != "name"}
-        cls = _resolve_transform(spec["name"])
-        pipeline.append(cls(**kwargs))
-    return A.Compose(pipeline)
+
+def stage_transform_specs(config: dict[str, Any], stage: str) -> list[dict]:
+    if stage not in STAGES:
+        raise ValueError(f"Unknown stage {stage!r}. Expected one of {STAGES}.")
+    return config.get(f"{stage}_transforms", config.get(SHARED_TRANSFORMS_KEY)) or []
+
+
+def assert_deterministic_pipeline(specs: list[dict]) -> None:
+    stochastic = [_spec_name(spec) for spec in specs if _spec_name(spec) not in DETERMINISTIC_TRANSFORMS]
+    if stochastic:
+        raise ValueError(
+            f"Evaluation pipelines must be deterministic; found stochastic transform(s) {stochastic}. "
+            f"Allowed: {sorted(DETERMINISTIC_TRANSFORMS)}."
+        )

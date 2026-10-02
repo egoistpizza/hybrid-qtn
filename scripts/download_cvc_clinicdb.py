@@ -1,37 +1,3 @@
-"""Download and extract the CVC-ClinicDB dataset.
-
-CVC-ClinicDB is 612 frames from 29 colonoscopy sequences (Bernal et al., 2015).
-Unlike Kvasir-SEG there is no stable direct-download URL: the official page
-
-    https://polyp.grand-challenge.org/CVCClinicDB/
-
-hands out a JavaScript-rendered Google Drive link to a ``.rar``, which is not
-scriptable and which ``zipfile`` cannot open. This script therefore supports
-three sources:
-
-    --source kaggle   (default) via the `kaggle` CLI, dataset balraj98/cvcclinicdb
-    --source url      any direct HTTP(S) link you supply with --url
-    --source local    an archive you already downloaded, passed via --archive
-
-Whatever the source, the archive is extracted, its internal layout is
-normalised, and the result is verified. Target layout (matches
-``configs/cvc_clinicdb.yaml``)::
-
-    data/cvc-clinicdb/<archive>
-    data/cvc-clinicdb/CVC-ClinicDB/Original/*.tif
-    data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/*.tif
-
-Mirrors differ in file format (.tif on the official release, .png on several
-Kaggle mirrors). The verification step prints the extensions it actually found
-so you can set ``image_ext`` / ``mask_ext`` in the YAML accordingly.
-
-Usage:
-    python scripts/download_cvc_clinicdb.py
-    python scripts/download_cvc_clinicdb.py --source url --url https://.../CVC-ClinicDB.zip
-    python scripts/download_cvc_clinicdb.py --source local --archive ~/Downloads/CVC-ClinicDB.rar
-    python scripts/download_cvc_clinicdb.py --force
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -52,7 +18,6 @@ IMAGES_SUBDIR = "Original"
 MASKS_SUBDIR = "Ground Truth"
 EXPECTED_COUNT = 612
 
-# Directory names used by the various mirrors, lowercased for matching.
 IMAGE_DIR_ALIASES = {"original", "originals", "images", "image", "img", "frames"}
 MASK_DIR_ALIASES = {
     "ground truth",
@@ -67,7 +32,6 @@ IMAGE_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 
 
 def _ssl_context() -> ssl.SSLContext:
-    """Build an SSL context using certifi's CA bundle when available."""
     try:
         import certifi
 
@@ -77,7 +41,6 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 def _download_with_curl(url: str, dest: Path) -> bool:
-    """Try curl first — it does AIA chasing, which some servers rely on."""
     curl = shutil.which("curl")
     if curl is None:
         return False
@@ -132,7 +95,6 @@ def _download(url: str, dest: Path, chunk: int = 1 << 20) -> None:
 
 
 def _download_from_kaggle(dest: Path) -> Path:
-    """Fetch the dataset zip with the `kaggle` CLI. Returns the archive path."""
     kaggle = shutil.which("kaggle")
     if kaggle is None:
         raise RuntimeError(
@@ -168,7 +130,6 @@ def _download_from_kaggle(dest: Path) -> Path:
 
 
 def _extract_rar(archive: Path, dest: Path) -> None:
-    """Extract a .rar via the `rarfile` module, else an external unrar/7z."""
     try:
         import rarfile
 
@@ -177,7 +138,7 @@ def _extract_rar(archive: Path, dest: Path) -> None:
         return
     except ImportError:
         pass
-    except Exception as exc:  # rarfile present but no backend binary
+    except Exception as exc:
         print(f"  rarfile failed ({exc}); trying an external extractor")
 
     for exe, args in (
@@ -224,11 +185,6 @@ def _count_images(directory: Path) -> int:
 
 
 def _find_layout(root: Path) -> tuple[Path, Path]:
-    """Locate the image/mask directory pair inside an extracted tree.
-
-    Mirrors nest the pair at different depths and under different names, so
-    walk the tree and pick the sibling pair holding the most image files.
-    """
     best: tuple[int, Path, Path] | None = None
 
     for parent in [root, *(p for p in root.rglob("*") if p.is_dir())]:
@@ -263,7 +219,6 @@ def _find_layout(root: Path) -> tuple[Path, Path]:
 
 
 def _normalize_layout(dest: Path) -> Path:
-    """Move the discovered image/mask pair into the canonical layout."""
     extracted = dest / EXTRACTED_MARKER
     target_images = extracted / IMAGES_SUBDIR
     target_masks = extracted / MASKS_SUBDIR
@@ -287,7 +242,6 @@ def _normalize_layout(dest: Path) -> Path:
 
 
 def _verify(extracted: Path) -> None:
-    """Check pair counts and report the extensions found, for the YAML."""
     images_dir = extracted / IMAGES_SUBDIR
     masks_dir = extracted / MASKS_SUBDIR
 
@@ -375,7 +329,7 @@ def download_cvc_clinicdb(
         archive_path = archive.expanduser().resolve()
         if not archive_path.is_file():
             raise FileNotFoundError(f"No such archive: {archive_path}")
-    else:  # pragma: no cover - argparse constrains this
+    else:
         raise ValueError(f"Unknown source: {source!r}")
 
     _extract(archive_path, dest)

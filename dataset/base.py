@@ -1,23 +1,6 @@
-"""Generic YAML-based segmentation dataset.
-
-Output contract (per ``__getitem__``)::
-
-    {
-        "image": torch.FloatTensor,   # (C, H, W), float32
-        "mask":  torch.FloatTensor,   # (1, H, W), float32, values in {0.0, 1.0}
-        "metadata": {
-            "image_path":    str,
-            "mask_path":     str,
-            "sample_id":     str,             # filename stem
-            "original_size": tuple[int, int], # (H0, W0) pre-transform
-            "dataset_name":  str,
-            "index":         int,
-        },
-    }
-"""
-
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import numpy as np
@@ -26,29 +9,21 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .pairing import pair_by_stem
-from .transforms import build_transforms_from_config
+from .transforms import (
+    DEFAULT_AUGMENTATION_SEED,
+    EVAL_STAGE,
+    TRAIN_STAGE,
+    assert_deterministic_pipeline,
+    build_transforms_from_config,
+    stage_transform_specs,
+)
 
 
 class GenericSegmentationDataset(Dataset):
-    """Config-driven binary segmentation dataset.
-
-    Expected ``config`` keys:
-
-    - ``images_dir`` (str)
-    - ``masks_dir`` (str)
-    - ``image_ext`` (str, e.g. ``".jpg"``)
-    - ``mask_ext`` (str, e.g. ``".jpg"`` or ``".png"``)
-    - ``dataset_name`` (str)
-    - ``strict_pairing`` (bool, default True)
-    - ``mask_threshold`` (int, 0–255, default 127) — foreground cutoff for the raw mask
-    - ``transforms`` (list[dict], optional) — see ``build_transforms_from_config``
-    """
-
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], stage: str = TRAIN_STAGE) -> None:
         self.config = config
         self.dataset_name: str = config["dataset_name"]
         self.mask_threshold: int = int(config.get("mask_threshold", 127))
-
         self.samples: list[tuple[str, str, str]] = pair_by_stem(
             images_dir=config["images_dir"],
             masks_dir=config["masks_dir"],
@@ -56,53 +31,66 @@ class GenericSegmentationDataset(Dataset):
             mask_ext=config["mask_ext"],
             strict_pairing=bool(config.get("strict_pairing", True)),
         )
+        self._apply_stage(stage)
 
-        self.transform = build_transforms_from_config(config.get("transforms"))
+    def _apply_stage(self, stage: str) -> None:
+        specs = stage_transform_specs(self.config, stage)
+        if stage == EVAL_STAGE:
+            assert_deterministic_pipeline(specs)
+        self.stage = stage
+        self.transform = build_transforms_from_config(specs, seed=DEFAULT_AUGMENTATION_SEED)
+
+    def with_stage(self, stage: str) -> GenericSegmentationDataset:
+        staged = copy.copy(self)
+        staged._apply_stage(stage)
+        return staged
+
+    def reseed_augmentations(self, seed: int) -> None:
+        self.transform.set_random_seed(seed)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _load_image(self, path: str) -> np.ndarray:
-        with Image.open(path) as im:
-            return np.array(im.convert("RGB"), dtype=np.uint8)
+        with Image.open(path) as image:
+            return np.array(image.convert("RGB"), dtype=np.uint8)
 
     def _load_mask(self, path: str) -> np.ndarray:
-        with Image.open(path) as im:
-            raw = np.array(im.convert("L"), dtype=np.uint8)
+        with Image.open(path) as mask:
+            raw = np.array(mask.convert("L"), dtype=np.uint8)
         return (raw > self.mask_threshold).astype(np.uint8)
+
+    @staticmethod
+    def _as_image_tensor(image: Any) -> torch.Tensor:
+        if isinstance(image, torch.Tensor):
+            return image.float()
+        tensor = torch.from_numpy(np.ascontiguousarray(image))
+        if tensor.ndim == 3 and tensor.shape[-1] in (1, 3):
+            tensor = tensor.permute(2, 0, 1).contiguous()
+        return tensor.float()
+
+    @staticmethod
+    def _as_mask_tensor(mask: Any) -> torch.Tensor:
+        tensor = mask if isinstance(mask, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(mask))
+        tensor = tensor.float()
+        if tensor.ndim == 2 or (tensor.ndim == 3 and tensor.shape[0] != 1):
+            tensor = tensor.unsqueeze(0)
+        return tensor
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         image_path, mask_path, sample_id = self.samples[index]
-
         image = self._load_image(image_path)
         mask = self._load_mask(mask_path)
-        original_size = (int(image.shape[0]), int(image.shape[1]))
-
-        out = self.transform(image=image, mask=mask)
-        image_t, mask_t = out["image"], out["mask"]
-
-        if not isinstance(image_t, torch.Tensor):
-            image_t = torch.from_numpy(np.ascontiguousarray(image_t))
-            if image_t.ndim == 3 and image_t.shape[-1] in (1, 3):
-                image_t = image_t.permute(2, 0, 1).contiguous()
-        image_t = image_t.float()
-
-        if not isinstance(mask_t, torch.Tensor):
-            mask_t = torch.from_numpy(np.ascontiguousarray(mask_t))
-        mask_t = mask_t.float()
-        if mask_t.ndim == 2:
-            mask_t = mask_t.unsqueeze(0)
-        elif mask_t.ndim == 3 and mask_t.shape[0] != 1:
-            mask_t = mask_t.unsqueeze(0)
+        transformed = self.transform(image=image, mask=mask)
 
         return {
-            "image": image_t,
-            "mask": mask_t,
+            "image": self._as_image_tensor(transformed["image"]),
+            "mask": self._as_mask_tensor(transformed["mask"]),
             "metadata": {
                 "image_path": image_path,
                 "mask_path": mask_path,
                 "sample_id": sample_id,
-                "original_size": original_size,
+                "original_size": (int(image.shape[0]), int(image.shape[1])),
                 "dataset_name": self.dataset_name,
                 "index": index,
             },

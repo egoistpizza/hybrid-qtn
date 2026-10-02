@@ -20,12 +20,17 @@ from dataset import (
     build_transforms_from_config,
     discover_dataset_configs,
     load_dataset,
+    EVAL_STAGE,
+    SplitFractions,
+    TRAIN_STAGE,
+    assert_deterministic_pipeline,
     make_splits,
     pair_by_stem,
     resolve_config,
-    grouped_split_indices,
+    grouped_partition_indices,
     load_group_map,
     groups_for_samples,
+    stage_transform_specs,
 )
 
 def _write_image(path: Path, h: int, w: int, fill: int = 128) -> None:
@@ -297,34 +302,121 @@ class TestRealDatasetIntegration:
         assert batch["image"].shape == (4, 3, h, w)
         assert batch["mask"].shape == (4, 1, h, w)
 
+STOCHASTIC_SPEC = {"name": "HorizontalFlip", "p": 0.5}
+
+
+class TestStageTransforms:
+    def test_stage_specific_key_takes_precedence(self, standard_transforms):
+        config = {"transforms": [STOCHASTIC_SPEC], "eval_transforms": standard_transforms}
+        assert stage_transform_specs(config, EVAL_STAGE) == standard_transforms
+
+    def test_shared_key_is_the_fallback(self, standard_transforms):
+        assert stage_transform_specs({"transforms": standard_transforms}, TRAIN_STAGE) == standard_transforms
+
+    def test_unknown_stage_raises(self):
+        with pytest.raises(ValueError, match="Unknown stage"):
+            stage_transform_specs({}, "inference")
+
+    def test_deterministic_pipeline_is_accepted(self, standard_transforms):
+        assert_deterministic_pipeline(standard_transforms)
+
+    def test_stochastic_pipeline_is_rejected(self, standard_transforms):
+        with pytest.raises(ValueError, match="must be deterministic"):
+            assert_deterministic_pipeline([STOCHASTIC_SPEC, *standard_transforms])
+
+    def test_eval_stage_refuses_stochastic_shared_pipeline(self, base_config, standard_transforms):
+        base_config["transforms"] = [STOCHASTIC_SPEC, *standard_transforms]
+        with pytest.raises(ValueError, match="must be deterministic"):
+            GenericSegmentationDataset(base_config, stage=EVAL_STAGE)
+
+    def test_with_stage_switches_pipeline_without_reloading(self, base_config, standard_transforms):
+        base_config["train_transforms"] = [STOCHASTIC_SPEC, *standard_transforms]
+        base_config["eval_transforms"] = standard_transforms
+        train_dataset = GenericSegmentationDataset(base_config, stage=TRAIN_STAGE)
+        eval_dataset = train_dataset.with_stage(EVAL_STAGE)
+        assert eval_dataset.samples is train_dataset.samples
+        assert train_dataset.stage == TRAIN_STAGE
+        assert eval_dataset.stage == EVAL_STAGE
+
+    def test_eval_samples_are_identical_across_reads(self, base_config, standard_transforms):
+        base_config["train_transforms"] = [STOCHASTIC_SPEC, *standard_transforms]
+        base_config["eval_transforms"] = standard_transforms
+        eval_dataset = GenericSegmentationDataset(base_config, stage=EVAL_STAGE)
+        assert torch.equal(eval_dataset[0]["image"], eval_dataset[0]["image"])
+
+    def test_reseeded_augmentations_are_reproducible(self, tmp_path, base_config, standard_transforms):
+        gradient = np.tile(np.arange(64, dtype=np.uint8), (64, 1))
+        image = np.stack([gradient] * 3, axis=-1)
+        Image.fromarray(image, mode="RGB").save(Path(base_config["images_dir"]) / "sample_01.jpg")
+        base_config["train_transforms"] = [{"name": "HorizontalFlip", "p": 0.5}, *standard_transforms]
+
+        def draws(seed: int) -> list[torch.Tensor]:
+            dataset = GenericSegmentationDataset(base_config, stage=TRAIN_STAGE)
+            dataset.reseed_augmentations(seed)
+            return [dataset[0]["image"] for _ in range(8)]
+
+        first, second = draws(7), draws(7)
+        assert all(torch.equal(a, b) for a, b in zip(first, second))
+
+
 class TestDatasetConsistency:
-    def test_medical_configs_share_a_transform_pipeline(self):
+    def test_medical_configs_share_transform_pipelines(self):
         configs = discover_dataset_configs(_ROOT / "configs")
-        medical_configs = {k: v for k, v in configs.items() if k in ("kvasir_seg", "cvc_clinicdb")}
-        pipelines = {
-            name: yaml.safe_load(path.read_text()).get("transforms")
-            for name, path in medical_configs.items()
-        }
-        if len(medical_configs) >= 2:
-            reference_name, reference = next(iter(pipelines.items()))
-            for name, pipeline in pipelines.items():
-                assert pipeline == reference
+        medical = [yaml.safe_load(configs[name].read_text()) for name in ("kvasir_seg", "cvc_clinicdb") if name in configs]
+        for key in ("train_transforms", "eval_transforms"):
+            assert all(config[key] == medical[0][key] for config in medical)
+
+    @pytest.mark.parametrize("name", sorted(REAL_DATASETS))
+    def test_real_configs_declare_deterministic_eval_pipelines(self, name):
+        config = yaml.safe_load(resolve_config(name, _ROOT / "configs").read_text())
+        assert "eval_transforms" in config
+        assert_deterministic_pipeline(config["eval_transforms"])
 
     def test_splits_are_deterministic_and_disjoint(self):
         for name in discover_dataset_configs(_ROOT / "configs"):
-            if not (_ROOT / REAL_DATASETS[name][0]).is_dir():
+            if name not in REAL_DATASETS or not (_ROOT / REAL_DATASETS[name][0]).is_dir():
                 continue
-            first_train, first_val = make_splits(name, config_dir=_ROOT / "configs")
-            again_train, again_val = make_splits(name, config_dir=_ROOT / "configs")
-            assert first_train.indices == again_train.indices
-            assert first_val.indices == again_val.indices
-            assert not set(first_train.indices) & set(first_val.indices)
+            first = make_splits(name, config_dir=_ROOT / "configs")
+            again = make_splits(name, config_dir=_ROOT / "configs")
+            partitions = (first.train.indices, first.val.indices, first.test.indices)
+            assert partitions == (again.train.indices, again.val.indices, again.test.indices)
+            assert not set(partitions[0]) & set(partitions[1])
+            assert not set(partitions[0]) & set(partitions[2])
+            assert not set(partitions[1]) & set(partitions[2])
+
+    def test_holdout_splits_use_the_eval_pipeline(self):
+        cfg = _require_on_disk("kvasir_seg")
+        splits = make_splits("kvasir_seg", config_dir=cfg.parent)
+        assert splits.train.dataset.stage == TRAIN_STAGE
+        assert splits.val.dataset.stage == EVAL_STAGE
+        assert splits.test.dataset.stage == EVAL_STAGE
+
+
+class TestSplitFractions:
+    def test_default_is_seventy_fifteen_fifteen(self):
+        fractions = SplitFractions()
+        assert (round(fractions.train, 10), fractions.val, fractions.test) == (0.7, 0.15, 0.15)
+
+    def test_sizes_cover_every_sample(self):
+        assert SplitFractions().sizes(1000) == (700, 150, 150)
+        assert sum(SplitFractions().sizes(1171)) == 1171
+
+    @pytest.mark.parametrize("val, test", [(0.0, 0.15), (0.5, 0.5), (0.15, 1.0)])
+    def test_invalid_fractions_raise(self, val, test):
+        with pytest.raises(ValueError):
+            SplitFractions(val=val, test=test)
+
 
 CVC_GROUP_SPEC = {
     "csv": "configs/cvc_clinicdb_sequences.csv",
     "sample_column": "sample_id",
     "group_column": "sequence_id",
 }
+
+
+def _sequences(subset, mapping: dict[str, str]) -> set[str]:
+    return {mapping[subset.dataset.samples[i][2]] for i in subset.indices}
+
 
 class TestSequenceGrouping:
     def test_group_map_covers_every_cvc_frame(self):
@@ -333,31 +425,24 @@ class TestSequenceGrouping:
         assert len(mapping) == 612
         assert len(set(mapping.values())) == 29
 
-    def test_cvc_split_shares_no_sequence(self):
+    def test_cvc_partitions_share_no_sequence(self):
         _require_on_disk("cvc_clinicdb")
         mapping = load_group_map(CVC_GROUP_SPEC, root=_ROOT)
-        train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-        def seqs(subset):
-            return {mapping[subset.dataset.samples[i][2]] for i in subset.indices}
-        assert not seqs(train) & seqs(val)
-        assert len(seqs(val)) >= 4
+        splits = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        train, val, test = (_sequences(s, mapping) for s in (splits.train, splits.val, splits.test))
+        assert not train & val and not train & test and not val & test
+        assert len(val) >= 3 and len(test) >= 3
 
     def test_cvc_split_covers_dataset_exactly_once(self):
         _require_on_disk("cvc_clinicdb")
-        train, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-        assert sorted([*train.indices, *val.indices]) == list(range(612))
+        splits = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        assert sorted([*splits.train.indices, *splits.val.indices, *splits.test.indices]) == list(range(612))
 
-    def test_cvc_val_fraction_is_near_target(self):
+    def test_cvc_holdout_fractions_are_near_target(self):
         _require_on_disk("cvc_clinicdb")
-        _, val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-        assert 0.15 <= len(val) / 612 <= 0.25
-
-    def test_cvc_split_is_deterministic(self):
-        _require_on_disk("cvc_clinicdb")
-        a_train, a_val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-        b_train, b_val = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
-        assert a_train.indices == b_train.indices
-        assert a_val.indices == b_val.indices
+        splits = make_splits("cvc_clinicdb", config_dir=_ROOT / "configs")
+        assert 0.10 <= len(splits.val) / 612 <= 0.20
+        assert 0.10 <= len(splits.test) / 612 <= 0.20
 
     def test_committed_map_matches_mirror_metadata(self):
         metadata = _ROOT / "data/cvc-clinicdb/metadata.csv"
@@ -381,24 +466,29 @@ class TestSequenceGrouping:
         with pytest.raises(FileNotFoundError, match="group_map csv not found"):
             load_group_map({"csv": "nope.csv"}, root=tmp_path)
 
-    def test_grouped_split_is_group_pure_on_synthetic_data(self):
+    def test_grouped_partition_is_group_pure_on_synthetic_data(self):
         groups = [f"s{i // 10}" for i in range(100)]
-        train, val = grouped_split_indices(groups, 0.2, seed=42)
-        assert not {groups[i] for i in train} & {groups[i] for i in val}
-        assert sorted([*train, *val]) == list(range(100))
+        train, val, test = grouped_partition_indices(groups, (0.15, 0.15), seed=42)
+        owners = [{groups[i] for i in part} for part in (train, val, test)]
+        assert not owners[0] & owners[1] and not owners[0] & owners[2] and not owners[1] & owners[2]
+        assert sorted([*train, *val, *test]) == list(range(100))
+        assert val and test and train
 
-class TestKvasirSplitUnchanged:
-    def test_kvasir_matches_legacy_random_split_exactly(self):
-        cfg = _require_on_disk("kvasir_seg")
-        n = len(load_dataset(cfg))
-        train_size = int(0.8 * n)
-        legacy_train, legacy_val = torch.utils.data.random_split(
-            range(n), [train_size, n - train_size],
-            generator=torch.Generator().manual_seed(42),
-        )
-        train, val = make_splits("kvasir_seg", config_dir=_ROOT / "configs")
-        assert list(train.indices) == list(legacy_train.indices)
-        assert list(val.indices) == list(legacy_val.indices)
+    def test_grouped_partition_keeps_training_non_empty_with_few_groups(self):
+        groups = ["a", "b", "c"]
+        train, val, test = grouped_partition_indices(groups, (0.45, 0.45), seed=0)
+        assert len(train) == len(val) == len(test) == 1
+
+    def test_grouped_partition_rejects_too_few_groups(self):
+        with pytest.raises(ValueError, match="at least 3 groups"):
+            grouped_partition_indices(["a", "a", "b"], (0.15, 0.15), seed=0)
+
+
+class TestKvasirSplit:
+    def test_kvasir_split_is_seventy_fifteen_fifteen(self):
+        _require_on_disk("kvasir_seg")
+        splits = make_splits("kvasir_seg", config_dir=_ROOT / "configs")
+        assert (len(splits.train), len(splits.val), len(splits.test)) == (700, 150, 150)
 
     def test_kvasir_config_declares_no_group_map(self):
         cfg = yaml.safe_load(

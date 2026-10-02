@@ -8,7 +8,7 @@ if str(_ROOT) not in sys.path:
 import pytest
 import torch
 
-from models.mps_layer import PositionalEncoding2D, AxialMPSLayer, MPSBottleneck
+from models.mps_layer import AxialMPSLayer, MPSBottleneck, SeparablePositionalEncoding2D
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def test_positional_encoding_preserves_shape(sample_tensor: torch.Tensor):
     height = sample_tensor.size(2)
     width = sample_tensor.size(3)
     
-    encoder = PositionalEncoding2D(channels=channels, height=height, width=width)
+    encoder = SeparablePositionalEncoding2D(channels=channels, height=height, width=width)
     encoded_tensor = encoder(sample_tensor)
     
     assert encoded_tensor.shape == sample_tensor.shape
@@ -68,8 +68,10 @@ def test_mps_bottleneck_gradient_flow(sample_tensor: torch.Tensor):
     dummy_loss = output_tensor.mean()
     dummy_loss.backward()
     
-    assert bottleneck.axial_mps.T_mid_H.grad is not None
-    assert bottleneck.axial_mps.T_mid_W.grad is not None
-    assert bottleneck.local_bypass.weight.grad is not None
-    
-    assert torch.any(bottleneck.axial_mps.T_mid_H.grad != 0)
+    tensor_train_cores = [
+        *bottleneck.axial_mps.row_operator.chain.cores,
+        *bottleneck.axial_mps.column_operator.chain.cores,
+        *bottleneck.local_bypass.chain.cores,
+    ]
+    assert all(core.grad is not None for core in tensor_train_cores)
+    assert all(torch.any(core.grad != 0) for core in tensor_train_cores)

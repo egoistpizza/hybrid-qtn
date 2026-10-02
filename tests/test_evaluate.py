@@ -11,7 +11,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from evaluate import (
-    build_model,
+    clean_state_dict,
     denormalize,
     load_model_weights,
     save_visualizations,
@@ -96,19 +96,6 @@ def test_load_model_weights_cleans_state_dict(mock_torch_load, tmp_path):
     assert "_orig_mod.conv1.weight" not in passed_dict
     assert "module.conv2.weight" not in passed_dict
 
-def test_build_model_vanilla():
-    model = build_model("vanilla", bond_dim=32)
-    assert model.__class__.__name__ == "UNet"
-    assert not hasattr(model, "transform_1024")
-
-def test_build_model_hybrid():
-    model = build_model("hybrid", bond_dim=32)
-    assert model.__class__.__name__ == "UNetDeepHybrid"
-    assert getattr(model, "transform_512", None) is None
-    assert getattr(model, "transform_1024", None) is not None
-
-def test_build_model_deep_hybrid():
-    model = build_model("deep_hybrid", bond_dim=64)
-    assert model.__class__.__name__ == "UNetDeepHybrid"
-    assert getattr(model, "transform_512", None) is not None
-    assert getattr(model, "transform_1024", None) is not None
+def test_clean_state_dict_drops_swa_metadata():
+    cleaned = clean_state_dict({"n_averaged": torch.tensor(3), "module._orig_mod.head.weight": torch.tensor([1.0])})
+    assert list(cleaned) == ["head.weight"]

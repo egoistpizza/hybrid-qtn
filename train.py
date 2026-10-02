@@ -1,104 +1,79 @@
 import argparse
 import logging
 import os
-import random
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler
-from torch.optim.swa_utils import AveragedModel, SWALR
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 import wandb
+from torch.amp import GradScaler
+from torch.optim.swa_utils import SWALR, AveragedModel
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
-from utils.seed import seed_everything
-from utils.init_first import init
-from utils.metrics import calculate_all_metrics
-from utils.loss import FocalTverskyLoss, BCEDiceLoss
 from dataset import (
-    build_train_val,
+    build_splits,
     discover_dataset_configs,
     parse_dataset_arg,
+    seed_dataloader_worker,
     slugify_dataset_arg,
 )
+from models.factory import MODEL_TYPES, build_segmentation_model
 from utils import get_device
+from utils.hardware import reset_peak_vram, vram_metrics
+from utils.init_first import init
+from utils.loss import (
+    FOCAL_TVERSKY_GAMMA,
+    TVERSKY_ALPHA_FALSE_NEGATIVE,
+    TVERSKY_BETA_FALSE_POSITIVE,
+    BCEDiceLoss,
+    FocalTverskyLoss,
+)
+from utils.metrics import MetricAccumulator
+from utils.run_naming import build_run_name
+from utils.seed import seed_everything, seeded_generator
 
 logger = logging.getLogger(__name__)
 
-def get_vram_metrics() -> Dict[str, float]:
-    if not torch.cuda.is_available():
-        return {"vram_allocated_mb": 0.0, "vram_reserved_mb": 0.0}
-        
-    allocated_bytes = torch.cuda.memory_allocated()
-    reserved_bytes = torch.cuda.memory_reserved()
-    
-    megabyte_conversion_factor = 1024 ** 2
-    
-    return {
-        "vram_allocated_mb": allocated_bytes / megabyte_conversion_factor,
-        "vram_reserved_mb": reserved_bytes / megabyte_conversion_factor
-    }
+LOSS_CHOICES = ("focal_tversky", "bce_dice")
+IMAGE_SIZE = 512
+DATALOADER_WORKERS = 4
+GRADIENT_CLIP_NORM = 1.0
+BEST_LIVE_CHECKPOINT = "best_model.pth"
+SWA_CHECKPOINT = "best_swa_model.pth"
+INTERRUPTED_CHECKPOINT = "interrupted_model.pth"
 
-def debug_model_info(model: nn.Module, device: torch.device, config: Dict[str, Any]) -> None:
-    logger.info("=" * 60)
-    logger.info("MODEL DEBUG INFO")
-    logger.info("=" * 60)
 
-    logger.info(f"Device:               {device}")
-    if device.type == "cuda":
-        logger.info(f"GPU:                  {torch.cuda.get_device_name(device)}")
-        vram = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-        logger.info(f"VRAM:                 {vram:.1f} GB")
-        logger.info(f"CUDA version:         {torch.version.cuda}")
-    logger.info(f"PyTorch version:      {torch.__version__}")
+@dataclass
+class TrainingConfig:
+    model_type: str
+    dataset: str
+    loss: str
+    seed: int
+    epochs: int
+    batch_size: int
+    bond_dim: int
+    tversky_alpha: float
+    tversky_beta: float
+    focal_gamma: float
+    image_size: int = IMAGE_SIZE
+    accumulation_steps: int = 8
+    learning_rate: float = 2e-4
+    weight_decay: float = 1e-4
+    swa_start_pct: float = 0.75
+    swa_lr: float = 5e-5
+    checkpoint_dir: str = "checkpoints"
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Total parameters:     {total_params:,}")
-    logger.info(f"Trainable parameters: {trainable_params:,}")
+    @property
+    def swa_start_epoch(self) -> int:
+        return int(self.epochs * self.swa_start_pct)
 
-    logger.info("-" * 60)
-    for name, module in model.named_children():
-        count = sum(p.numel() for p in module.parameters())
-        logger.info(f"  {name:25s} -> {count:>12,}")
 
-    if hasattr(model, 'transform_512') and model.transform_512 is not None:
-        logger.info("-" * 60)
-        for name, param in model.transform_512.named_parameters():
-            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
-
-    if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
-        logger.info("-" * 60)
-        for name, param in model.transform_1024.named_parameters():
-            logger.info(f"  {name:25s} -> shape {str(list(param.shape)):20s} = {param.numel():>10,}")
-
-    logger.info("-" * 60)
-    model.to(device)
-    dummy = torch.randn(1, 3, config["image_size"], config["image_size"]).to(device)
-
-    with torch.no_grad():
-        x1 = model.inc(dummy)
-        x2 = model.down1(x1)
-        x3 = model.down2(x2)
-        
-        x4 = model.down3(x3)
-        if hasattr(model, 'transform_512') and model.transform_512 is not None:
-            x4 = model.transform_512(x4)
-            
-        x5 = model.down4(x4)
-        if hasattr(model, 'transform_1024') and model.transform_1024 is not None:
-            x5 = model.transform_1024(x5)
-
-        x = model.up1(x5, x4)
-        x = model.up2(x, x3)
-        x = model.up3(x, x2)
-        x = model.up4(x, x1)
-        out = model.outc(x)
-
-    logger.info("=" * 60)
+def prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}_{name}": value for name, value in metrics.items()}
 
 
 class SegmentationTrainer:
@@ -107,323 +82,273 @@ class SegmentationTrainer:
         model: nn.Module,
         train_loader: DataLoader,
         val_loader: DataLoader,
+        test_loader: DataLoader,
         criterion: nn.Module,
         optimizer: optim.Optimizer,
+        scheduler: optim.lr_scheduler.LRScheduler,
         device: torch.device,
-        config: Dict[str, Any],
-        scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
+        config: TrainingConfig,
     ):
-        # self.model = model.to(device).to(memory_format=torch.channels_last)
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.test_loader = test_loader
         self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.config = config
-        
+
         self.use_amp = device.type == "cuda"
         self.scaler = GradScaler(enabled=self.use_amp)
-        self.best_val_dice = 0.0 
-        self.checkpoint_dir = config.get("checkpoint_dir", "checkpoints")
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-
-        self.swa_start_epoch = int(self.config["epochs"] * self.config.get("swa_start_pct", 0.75))
         self.swa_model = AveragedModel(self.model)
-        self.swa_scheduler = SWALR(self.optimizer, swa_lr=self.config.get("swa_lr", 5e-5))
+        self.swa_scheduler = SWALR(self.optimizer, swa_lr=config.swa_lr)
+        self.best_val_dice = float("-inf")
+        self.checkpoint_dir = Path(config.checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def _images(self, batch: dict[str, Any]) -> torch.Tensor:
+        return batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
+
+    def _masks(self, batch: dict[str, Any]) -> torch.Tensor:
+        return batch["mask"].to(self.device, non_blocking=True)
+
+    def _optimizer_step(self) -> None:
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=GRADIENT_CLIP_NORM)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
 
     def train_epoch(self, epoch: int) -> float:
         self.model.train()
-        epoch_loss = 0.0
-        acc_steps = self.config.get("accumulation_steps", 1)
-        
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [Train]")
-        
-        for batch_idx, batch in enumerate(pbar):
-            images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            masks  = batch["mask" ].to(self.device, non_blocking=True                                   )
+        accumulation_steps = self.config.accumulation_steps
+        total_loss = 0.0
+        progress = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.epochs} [Train]")
 
+        for batch_index, batch in enumerate(progress, start=1):
             with torch.autocast(self.device.type, enabled=self.use_amp):
-                outputs = self.model(images)
-                loss = self.criterion(outputs, masks)
-                loss = loss / acc_steps
+                loss = self.criterion(self.model(self._images(batch)), self._masks(batch))
+            self.scaler.scale(loss / accumulation_steps).backward()
 
-            self.scaler.scale(loss).backward()
+            if batch_index % accumulation_steps == 0 or batch_index == len(self.train_loader):
+                self._optimizer_step()
 
-            if ((batch_idx + 1) % acc_steps == 0) or (batch_idx + 1 == len(self.train_loader)):
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
+            total_loss += loss.item()
+            progress.set_postfix({"loss": f"{loss.item():.4f}"})
 
-            current_loss = loss.item() * acc_steps
-            epoch_loss += current_loss
-            pbar.set_postfix({'loss': f"{current_loss:.4f}"})
-
-        return epoch_loss / len(self.train_loader)
+        return total_loss / len(self.train_loader)
 
     @torch.inference_mode()
-    def validate_epoch(self, epoch: int, use_swa: bool = False, compute_hd95: bool = False) -> Tuple[float, Dict[str, float]]:
-        eval_model = self.swa_model if use_swa else self.model
-        eval_model.eval()
-        
-        epoch_loss = 0.0
-        aggregated_metrics = {"dice": 0.0, "iou": 0.0, "mae": 0.0, "f2": 0.0, "hd95": 0.0}
-        
-        mode_str = "Val-SWA" if use_swa else "Val"
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['epochs']} [{mode_str}]")
-        
-        for batch in pbar:
-            images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            masks = batch["mask"].to(self.device, non_blocking=True)
+    def evaluate(self, model: nn.Module, loader: DataLoader, description: str, compute_hd95: bool) -> tuple[float, dict[str, float]]:
+        model.eval()
+        accumulator = MetricAccumulator(compute_hd95=compute_hd95)
+        weighted_loss, image_count = 0.0, 0
 
+        for batch in tqdm(loader, desc=description):
+            masks = self._masks(batch)
             with torch.autocast(self.device.type, enabled=self.use_amp):
-                outputs = eval_model(images)
-                loss = self.criterion(outputs, masks)
+                logits = model(self._images(batch))
+                loss = self.criterion(logits, masks)
+            accumulator.update(logits, masks)
+            weighted_loss += loss.item() * masks.size(0)
+            image_count += masks.size(0)
 
-            epoch_loss += loss.item()
-            batch_metrics = calculate_all_metrics(outputs, masks, compute_hd95=compute_hd95)
-            
-            for k in aggregated_metrics:
-                aggregated_metrics[k] += batch_metrics[k]
-            
-            postfix_data = {
-                'val_loss': f"{loss.item():.4f}", 
-                'dice': f"{batch_metrics['dice']:.4f}"
-            }
-            if compute_hd95:
-                postfix_data['hd95'] = f"{batch_metrics['hd95']:.2f}"
-                
-            pbar.set_postfix(postfix_data)
-
-        for k in aggregated_metrics:
-            aggregated_metrics[k] /= len(self.val_loader)
-
-        return epoch_loss / len(self.val_loader), aggregated_metrics
+        return weighted_loss / image_count, accumulator.compute()
 
     @torch.no_grad()
-    def _update_swa_bn(self) -> None:
+    def _recompute_swa_batchnorm(self) -> None:
         self.swa_model.train()
         for module in self.swa_model.modules():
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
                 module.reset_running_stats()
                 module.momentum = None
-        
         for batch in self.train_loader:
-            images = batch["image"].to(self.device, non_blocking=True, memory_format=torch.channels_last)
             with torch.autocast(self.device.type, enabled=self.use_amp):
-                self.swa_model(images)
+                self.swa_model(self._images(batch))
 
-    def save_checkpoint(self, val_dice: float, filename: str = "best_model.pth") -> None:
+    def _save(self, module: nn.Module, filename: str) -> Path:
+        path = self.checkpoint_dir / filename
+        torch.save(module.state_dict(), path)
+        return path
+
+    def _save_if_best(self, val_dice: float) -> None:
         if val_dice > self.best_val_dice:
             self.best_val_dice = val_dice
-            filepath = os.path.join(self.checkpoint_dir, filename)
-            torch.save(self.model.state_dict(), filepath)
-            logger.info(f"New best model saved! Val Dice: {val_dice:.4f}")
+            self._save(self.model, BEST_LIVE_CHECKPOINT)
+            logger.info(f"New best live model saved. Val Dice: {val_dice:.4f}")
 
-    def fit(self, run_name: str) -> None:
-        total_params = sum(p.numel() for p in self.model.parameters())
-        wandb.init(
-            project="hybrid-qtn",
-            config={**self.config, "total_params": total_params},
-            name=run_name
+    def _advance_schedule(self, in_swa_phase: bool) -> float:
+        if in_swa_phase:
+            self.swa_model.update_parameters(self.model)
+            self.swa_scheduler.step()
+            return self.swa_scheduler.get_last_lr()[0]
+        self.scheduler.step()
+        return self.optimizer.param_groups[0]["lr"]
+
+    def _run_epoch(self, epoch: int) -> None:
+        reset_peak_vram(self.device)
+        train_loss = self.train_epoch(epoch)
+        in_swa_phase = epoch >= self.config.swa_start_epoch
+        learning_rate = self._advance_schedule(in_swa_phase)
+        val_loss, val_metrics = self.evaluate(self.model, self.val_loader, f"Epoch {epoch} [Val]", compute_hd95=False)
+
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                **prefixed("val", val_metrics),
+                "learning_rate": learning_rate,
+                "is_swa_active": float(in_swa_phase),
+                **vram_metrics(self.device),
+            }
         )
-        
-        logger.info("Starting training...")
-        
-        try:
-            for epoch in range(1, self.config['epochs'] + 1):
-                train_loss = self.train_epoch(epoch)
-                
-                use_swa = epoch >= self.swa_start_epoch
-                if use_swa:
-                    self.swa_model.update_parameters(self.model)
-                    self.swa_scheduler.step()
-                elif self.scheduler:
-                    self.scheduler.step()
-                
-                val_loss, val_metrics = self.validate_epoch(epoch, use_swa=use_swa, compute_hd95=False)
-                
-                log_data = {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_dice": val_metrics["dice"],
-                    "val_iou": val_metrics["iou"],
-                    "val_mae": val_metrics["mae"],
-                    "val_f2": val_metrics["f2"],
-                    "learning_rate": self.optimizer.param_groups[0]['lr'] if not use_swa else self.swa_scheduler.get_last_lr()[0],
-                    "is_swa_active": float(use_swa),
-                    **get_vram_metrics()
-                }
-                
-                wandb.log(log_data)
-                
-                if not use_swa:
-                    self.save_checkpoint(val_metrics["dice"])
-                else:
-                    filepath = os.path.join(self.checkpoint_dir, "swa_latest.pth")
-                    torch.save(self.swa_model.state_dict(), filepath)
+        self._save_if_best(val_metrics["dice"])
 
-            if self.config['epochs'] >= self.swa_start_epoch:
-                logger.info("Training complete. Updating SWA BatchNorm statistics...")
-                self._update_swa_bn()
-                final_val_loss, final_val_metrics = self.validate_epoch(self.config['epochs'], use_swa=True, compute_hd95=True)
-                
-                logger.info(f"Final SWA Model - Val Loss: {final_val_loss:.4f} | Val Dice: {final_val_metrics['dice']:.4f} | HD95: {final_val_metrics['hd95']:.2f}")
-                wandb.log({
-                    "final_swa_val_loss": final_val_loss, 
-                    "final_swa_val_dice": final_val_metrics["dice"],
-                    "final_swa_val_iou": final_val_metrics["iou"],
-                    "final_swa_val_hd95": final_val_metrics["hd95"]
-                })
-                
-                filepath = os.path.join(self.checkpoint_dir, "best_swa_model.pth")
-                torch.save(self.swa_model.state_dict(), filepath)
-                
+    def _finalize_swa(self) -> Optional[nn.Module]:
+        if self.swa_model.n_averaged.item() == 0:
+            return None
+        logger.info("Recomputing SWA BatchNorm statistics...")
+        self._recompute_swa_batchnorm()
+        self._save(self.swa_model, SWA_CHECKPOINT)
+        swa_val_loss, swa_val_metrics = self.evaluate(self.swa_model, self.val_loader, "SWA [Val]", compute_hd95=True)
+        wandb.log({"swa_val_loss": swa_val_loss, **prefixed("swa_val", swa_val_metrics)})
+        return self.swa_model
+
+    def _report_test_metrics(self, swa_model: Optional[nn.Module]) -> None:
+        self.model.load_state_dict(torch.load(self.checkpoint_dir / BEST_LIVE_CHECKPOINT, map_location=self.device))
+        candidates = {"test_best_live": self.model}
+        if swa_model is not None:
+            candidates["test_swa"] = swa_model
+
+        for prefix, model in candidates.items():
+            test_loss, test_metrics = self.evaluate(model, self.test_loader, f"{prefix} [Test]", compute_hd95=True)
+            results = {f"{prefix}_loss": test_loss, **prefixed(prefix, test_metrics)}
+            wandb.log(results)
+            wandb.run.summary.update(results)
+            logger.info(" | ".join(f"{name}: {value:.4f}" for name, value in results.items()))
+
+    def fit(self, run_name: str, total_params: int) -> None:
+        wandb.init(project="hybrid-qtn", config={**asdict(self.config), "total_params": total_params}, name=run_name)
+        logger.info("Starting training...")
+        try:
+            for epoch in range(1, self.config.epochs + 1):
+                self._run_epoch(epoch)
+            swa_model = self._finalize_swa()
+            self._report_test_metrics(swa_model)
         except KeyboardInterrupt:
             logger.warning("Training interrupted. Saving current state...")
-            filepath = os.path.join(self.checkpoint_dir, "interrupted_model.pth")
-            torch.save(self.model.state_dict(), filepath)
-        
+            self._save(self.model, INTERRUPTED_CHECKPOINT)
         finally:
             wandb.finish()
             logger.info("Training finished.")
 
-def main():
-    init()
-    parser = argparse.ArgumentParser(description="Train Segmentation Model")
+
+def parse_arguments() -> argparse.Namespace:
     available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
-    parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
-    parser.add_argument("--bond_dim", type=int, default=32, help="Bond dimension for MPS layer")
-    parser.add_argument("--loss", type=str, default="focal_tversky", choices=["focal_tversky", "bce_dice"], help="Loss function to use")
-    parser.add_argument("--dataset", type=str, default="kvasir_seg",
-                        help="Dataset config stem(s) under configs/, comma-separated "
-                             f"for joint training. Available: {available}")
+    parser = argparse.ArgumentParser(description="Train a segmentation model")
+    parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--bond_dim", type=int, default=32)
+    parser.add_argument("--loss", type=str, default="focal_tversky", choices=LOSS_CHOICES)
+    parser.add_argument("--tversky_alpha", type=float, default=TVERSKY_ALPHA_FALSE_NEGATIVE, help="Focal Tversky weight on false negatives")
+    parser.add_argument("--tversky_beta", type=float, default=TVERSKY_BETA_FALSE_POSITIVE, help="Focal Tversky weight on false positives")
+    parser.add_argument("--focal_gamma", type=float, default=FOCAL_TVERSKY_GAMMA, help="Focal Tversky gamma; the loss exponent is 1/gamma")
+    parser.add_argument("--seed", type=int, default=42, help="Training seed; the data split seed stays fixed")
+    parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Comma-separated dataset configs. Available: {available}")
     parser.add_argument("--tag", type=str, default=None, help="Suffix to distinguish runs of the same config")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    dataset_names = parse_dataset_arg(args.dataset)
-    dataset_slug = slugify_dataset_arg(dataset_names)
 
-    seed_everything(42)
+def build_criterion(config: TrainingConfig) -> nn.Module:
+    if config.loss == "bce_dice":
+        return BCEDiceLoss(bce_weight=0.5)
+    return FocalTverskyLoss(alpha=config.tversky_alpha, beta=config.tversky_beta, gamma=config.focal_gamma)
+
+
+def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=DATALOADER_WORKERS,
+        pin_memory=True,
+        worker_init_fn=seed_dataloader_worker,
+        generator=seeded_generator(seed),
+    )
+
+
+def log_parameter_breakdown(model: nn.Module) -> int:
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    logger.info(f"Total parameters: {total_params:,}")
+    for name, module in model.named_children():
+        logger.info(f"  {name:25s} -> {sum(parameter.numel() for parameter in module.parameters()):>12,}")
+    return total_params
+
+
+def compile_with_warmup(model: nn.Module, config: TrainingConfig, device: torch.device) -> nn.Module:
+    try:
+        compiled_model = torch.compile(model)
+        warmup_input = torch.randn(config.batch_size, 3, config.image_size, config.image_size, device=device)
+        with torch.autocast(device.type, enabled=device.type == "cuda"):
+            compiled_model(warmup_input.to(memory_format=torch.channels_last)).float().mean().backward()
+        model.zero_grad(set_to_none=True)
+        del warmup_input
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        logger.info("Compiled the model successfully")
+        return compiled_model
+    except Exception as error:
+        logger.warning(f"torch.compile failed, continuing in eager mode: {error}")
+        return model
+
+
+def main() -> None:
+    init()
+    arguments = parse_arguments()
+    dataset_names = parse_dataset_arg(arguments.dataset)
+    seed_everything(arguments.seed)
     device = get_device()
 
-    config = {
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "accumulation_steps": 8,
-        "learning_rate": 2e-4,
-        "weight_decay": 1e-4,
-        "image_size": 512,
-        "bond_dim": args.bond_dim,
-        "loss": args.loss,
-        "swa_start_pct": 0.75,
-        "swa_lr": 5e-5,
-        "dataset": dataset_slug,
-        "checkpoint_dir": f"./checkpoints/{dataset_slug}"
-    }
+    config = TrainingConfig(
+        model_type=arguments.model,
+        dataset=slugify_dataset_arg(dataset_names),
+        loss=arguments.loss,
+        seed=arguments.seed,
+        epochs=arguments.epochs,
+        batch_size=arguments.batch_size,
+        bond_dim=arguments.bond_dim,
+        tversky_alpha=arguments.tversky_alpha,
+        tversky_beta=arguments.tversky_beta,
+        focal_gamma=arguments.focal_gamma,
+    )
+    run_name = build_run_name(config.dataset, config.model_type, config.bond_dim, config.loss, config.seed, arguments.tag)
+    config.checkpoint_dir = os.path.join("checkpoints", run_name)
 
-    train_ds, val_ds = build_train_val(dataset_names)
-    logger.info(f"Dataset '{dataset_slug}': {len(train_ds)} train / {len(val_ds)} val")
+    splits = build_splits(dataset_names)
+    logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val)} val / {len(splits.test)} test")
 
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
-
-    if args.model == "deep_hybrid":
-        logger.info("Initializing DEEP Hybrid UNet with Dual MPS Bottlenecks...")
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_512 = MPSBottleneck(in_channels=512, bond_dim=config["bond_dim"], height=64, width=64)
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
-        
-        model = UNetDeepHybrid(
-            in_channels=3, 
-            out_channels=1, 
-            transform_512=mps_512, 
-            transform_1024=mps_1024
-        )
-        run_name = f"deep_hybrid_unet_b{config['bond_dim']}_ckpt"
-        debug_model_info(model, device, config)
-
-    elif args.model == "hybrid":
-        logger.info("Initializing Standard Hybrid UNet...")
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=config["bond_dim"], height=32, width=32)
-        model = UNetDeepHybrid(
-            in_channels=3, 
-            out_channels=1, 
-            transform_512=None, 
-            transform_1024=mps_1024
-        )
-        run_name = f"hybrid_unet_b{config['bond_dim']}_ckpt"
-        debug_model_info(model, device, config) 
-        
-    else:
-        logger.info("Initializing Vanilla UNet...")
-        from models.unet_classic import UNet
-        
-        model = UNet(in_channels=3, out_channels=1)
-        run_name = "vanilla_unet"
-    config["model_type"] = args.model
-    run_name = f"{dataset_slug}__{run_name}__{args.loss}"
-    if args.tag:
-        run_name = f"{run_name}__{args.tag}"
-    config["checkpoint_dir"] = os.path.join("checkpoints", run_name)
-
+    model = build_segmentation_model(config.model_type, config.bond_dim, config.image_size)
+    total_params = log_parameter_breakdown(model)
     model = model.to(device).to(memory_format=torch.channels_last)
+    model = compile_with_warmup(model, config, device)
 
-    if int(torch.__version__.split('.')[0]) >= 2:
-        try:
-            logger.info("Compiling the model...")
-            c_model = torch.compile(model)
-            # Warm up at the real training shape, memory format and precision so we compile
-            # the graph training will actually use. Do NOT bind the result: holding a
-            # reference pins the whole activation graph for the lifetime of the run.
-            dummy_input = torch.randn(
-                config["batch_size"], 3, config["image_size"], config["image_size"],
-                device=device,
-            ).to(memory_format=torch.channels_last)
-            with torch.autocast(device.type, enabled=(device.type == "cuda")):
-                c_model(dummy_input).float().mean().backward()
-            model.zero_grad(set_to_none=True)
-            del dummy_input
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            model = c_model
-            logger.info("Compiled the model successfully")
-        except Exception as e:
-            logger.warning(f"[!] torch.compile failed: {e}")
-    
-    if args.loss == "bce_dice":
-        criterion = BCEDiceLoss(bce_weight=0.5)
-    else:
-        criterion = FocalTverskyLoss(alpha=0.7, beta=0.3, gamma=0.75)
-    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
-    
-    
-    
+    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     trainer = SegmentationTrainer(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
+        train_loader=build_loader(splits.train, config.batch_size, shuffle=True, seed=config.seed),
+        val_loader=build_loader(splits.val, config.batch_size, shuffle=False, seed=config.seed),
+        test_loader=build_loader(splits.test, config.batch_size, shuffle=False, seed=config.seed),
+        criterion=build_criterion(config),
         optimizer=optimizer,
+        scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs),
         device=device,
         config=config,
-        scheduler=scheduler
     )
-    
-    trainer.fit(run_name=run_name)
+    trainer.fit(run_name=run_name, total_params=total_params)
+
 
 if __name__ == "__main__":
     main()

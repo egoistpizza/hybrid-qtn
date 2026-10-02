@@ -38,7 +38,9 @@ image_ext:      str            # e.g. ".jpg"
 mask_ext:       str            # e.g. ".jpg" or ".png"
 strict_pairing: bool = true    # raise on orphan; false = warn + skip
 mask_threshold: int = 127      # foreground cutoff for raw grayscale mask
-transforms:                    # optional list of Albumentations specs
+train_transforms:              # Albumentations specs for training (augmentation allowed)
+eval_transforms:               # deterministic specs for validation and test (validated)
+transforms:                    # optional shared fallback when a stage-specific key is absent
   - name: <ClassName>
     <kwargs>: ...
 ```
@@ -66,17 +68,18 @@ assert batch["image"].shape == (4, 3, 512, 512)
 assert batch["mask"].shape  == (4, 1, 512, 512)
 ```
 
-Train/val splitting lives in `dataset/splits.py` and is shared by `train.py` and
+Train/val/test splitting lives in `dataset/splits.py` and is shared by `train.py` and
 `evaluate.py`, so an evaluation run always sees the split its training run held
 out:
 
 ```python
-from dataset import build_train_val, discover_dataset_configs
+from dataset import build_splits, discover_dataset_configs
 
-print(sorted(discover_dataset_configs()))       # ['cvc_clinicdb', 'kvasir_seg']
+print(sorted(discover_dataset_configs()))       # ['cvc_clinicdb', 'kvasir_seg', 'mass_roads']
 
-train_ds, val_ds = build_train_val(["kvasir_seg"])
-train_ds, val_ds = build_train_val(["kvasir_seg", "cvc_clinicdb"])  # joint
+splits = build_splits(["kvasir_seg"])           # 70 / 15 / 15, fixed split seed 42
+splits.train, splits.val, splits.test           # val and test use eval_transforms
+splits = build_splits(["kvasir_seg", "cvc_clinicdb"])  # joint
 ```
 
 Or, with an arbitrary config dict:
@@ -107,8 +110,11 @@ with matching stems. No new Python needed — just a new YAML:
 2. Set `dataset_name`, `images_dir`, `masks_dir`, `image_ext`, `mask_ext`.
    **Repoint all four** — a half-edited copy silently loads the source dataset.
 3. Tune `mask_threshold` if masks aren't grayscale-thresholded around 127.
-4. Keep `transforms` identical to the other configs, or cross-dataset
-   comparisons are confounded. `TestDatasetConsistency` enforces this.
+4. Keep `train_transforms` and `eval_transforms` identical to the other medical
+   configs, or cross-dataset comparisons are confounded. `TestDatasetConsistency`
+   enforces this. `eval_transforms` may only contain deterministic transforms
+   (Resize, LongestMaxSize, SmallestMaxSize, PadIfNeeded, CenterCrop, Normalize,
+   ToTensorV2); anything else raises at load time.
 
 That is the whole procedure. `discover_dataset_configs()` picks the file up
 automatically, so `--dataset <name>` works in `train.py` and `evaluate.py`
@@ -120,7 +126,7 @@ pairing helper belongs — start by adding a sibling to `pairing.py`.
 
 ## Adding / removing transforms
 
-Edit the `transforms:` list in the YAML. Any Albumentations transform is
+Edit the `train_transforms:` / `eval_transforms:` lists in the YAML. Augmentation belongs in `train_transforms` only. Any Albumentations transform is
 valid; kwargs are passed through verbatim. Common tweaks:
 
 - **Resize**: change `height` / `width`.
