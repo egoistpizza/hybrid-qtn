@@ -39,8 +39,10 @@ def count_parameters(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters())
 
 
-def conv3x3_component(name: str, in_channels: int, out_channels: int) -> ParameterComponent:
-    return ParameterComponent(name, f"9·{in_channels}·{out_channels}", CONV_KERNEL_AREA * in_channels * out_channels)
+def conv3x3_component(name: str, in_channels: int, out_channels: int, bias: bool = False) -> ParameterComponent:
+    bias_count = out_channels if bias else 0
+    formula = f"9·{in_channels}·{out_channels}" + (f" + {out_channels}" if bias else "")
+    return ParameterComponent(name, formula, CONV_KERNEL_AREA * in_channels * out_channels + bias_count)
 
 
 def batchnorm_component(name: str, channels: int) -> ParameterComponent:
@@ -74,10 +76,6 @@ def tensor_train_component(
     return ParameterComponent(name, formula, tensor_train_parameter_count(input_modes, output_modes, max_rank))
 
 
-def conv1x1_component(name: str, in_channels: int, out_channels: int) -> ParameterComponent:
-    return ParameterComponent(name, f"{in_channels}·{out_channels} + {out_channels}", in_channels * out_channels + out_channels)
-
-
 def axial_operator_component(name: str, bond_dim: int, spatial_size: int, max_rank: int) -> ParameterComponent:
     site_count = binary_digits(bond_dim) + binary_digits(spatial_size)
     return tensor_train_component(name, (2,) * site_count, (2,) * site_count, max_rank)
@@ -100,10 +98,10 @@ def axial_mps_bottleneck_profile(in_channels: int, channels: int, bond_dim: int,
                 f"{channels}·({spatial_size} + {spatial_size})",
                 channels * (spatial_size + spatial_size),
             ),
-            conv1x1_component("Conv1×1 in_proj (C→D)", channels, bond_dim),
+            conv3x3_component("Conv3×3 in_proj (C→D)", channels, bond_dim, bias=True),
             axial_operator_component("Row MPO chain", bond_dim, spatial_size, AXIAL_OPERATOR_RANK),
             axial_operator_component("Column MPO chain", bond_dim, spatial_size, AXIAL_OPERATOR_RANK),
-            conv1x1_component("Conv1×1 out_proj (D→C)", bond_dim, channels),
+            conv3x3_component("Conv3×3 out_proj (D→C)", bond_dim, channels, bias=True),
             tensor_train_component(
                 f"TT-Conv1×1 bypass (R={BYPASS_TT_RANK})",
                 quantize_dimension(channels),

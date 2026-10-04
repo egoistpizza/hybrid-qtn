@@ -6,6 +6,7 @@ from models.tensor_train import QuantizedAxialOperator, TTConv2d
 
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
+PROJECTION_KERNEL_SIZE = 3
 
 
 class SeparablePositionalEncoding2D(nn.Module):
@@ -31,10 +32,10 @@ class AxialMPSLayer(nn.Module):
     ):
         super().__init__()
         self.positional_encoding = SeparablePositionalEncoding2D(in_channels, height, width)
-        self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=1)
+        self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
         self.row_operator = QuantizedAxialOperator(bond_dim, height, operator_rank)
         self.column_operator = QuantizedAxialOperator(bond_dim, width, operator_rank)
-        self.out_proj = nn.Conv2d(bond_dim, in_channels, kernel_size=1)
+        self.out_proj = nn.Conv2d(bond_dim, in_channels, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         projected = self.in_proj(self.positional_encoding(x))

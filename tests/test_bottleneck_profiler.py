@@ -29,5 +29,5 @@ def test_axial_bottleneck_formula_matches_the_hybrid_unet(bond_dim):
 def test_reduction_at_bond_dimension_thirty_two():
     standard = standard_bottleneck_profile(512, 1024).total
     axial = axial_mps_bottleneck_profile(512, 1024, 32, spatial_size=32).total
-    assert axial == 767_985
-    assert reduction_percentage(standard, axial) == pytest.approx(94.576, abs=1e-3)
+    assert axial == 1_292_273
+    assert reduction_percentage(standard, axial) == pytest.approx(90.874, abs=1e-3)

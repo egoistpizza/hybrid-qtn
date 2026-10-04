@@ -26,10 +26,10 @@ This README is written for external researchers and reviewers. Following the Doc
 **Axial MPS block** (`models/mps_layer.py`):
 1. `BN`
 2. Separable positional encoding: row + column embeddings, C·(H + W) parameters
-3. `Conv1×1 (C → D)`
+3. `Conv3×3 (C → D)`
 4. **Row MPO**: a chain over the 10 binary digits of the joint (channel, row) index (D = 32 = 2⁵, H = 32 = 2⁵). The spatial and channel digits are interleaved, and the bond dimension χ is 64. Followed by `GELU`.
 5. **Column MPO**: the same construction over (channel, column).
-6. `Conv1×1 (D → C)`
+6. `Conv3×3 (D → C)`
 7. Summed with a **TT-Conv1×1** local bypass (5 sites of 4×4, rank 32), followed by `BN → GELU`, plus a residual connection
 
 Here D is the latent width (`--bond_dim`). Every operator's input and output shapes match the dense layers they replace, so the encoder and decoder are unchanged.
@@ -41,11 +41,11 @@ Produced by `python -m scripts.bottleneck_profiler`, which derives each count an
 | Bottleneck | D | Parameters | Change vs. standard |
 |---|---:|---:|---:|
 | Standard (two 3×3 convolutions) | — | 14,159,872 | — |
-| Tensorized Axial MPS | 16 | 702,433 | −95.04 % |
-| Tensorized Axial MPS | 32 | 767,985 | −94.58 % |
-| Tensorized Axial MPS | 64 | 866,321 | −93.88 % |
+| Tensorized Axial MPS | 16 | 964,577 | −93.19 % |
+| Tensorized Axial MPS | 32 | 1,292,273 | −90.87 % |
+| Tensorized Axial MPS | 64 | 1,914,897 | −86.48 % |
 
-At D = 32 the whole network has 15,556,786 parameters, against 28,948,673 for the vanilla U-Net (−46.3 %). The remaining parameters sit in the unmodified encoder and decoder stages.
+At D = 32 the whole network has 16,081,074 parameters, against 28,948,673 for the vanilla U-Net (−44.4 %). The remaining parameters sit in the unmodified encoder and decoder stages.
 
 ---
 
