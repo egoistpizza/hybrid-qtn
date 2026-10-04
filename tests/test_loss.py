@@ -39,25 +39,37 @@ def test_focal_tversky_loss(setup_tensors):
     assert not torch.isnan(logits.grad).any()
 
 
-def test_focal_tversky_defaults_follow_abraham_and_khan():
+def test_focal_tversky_defaults_weight_false_positives():
     criterion = FocalTverskyLoss()
-    assert (criterion.alpha, criterion.beta) == (0.7, 0.3)
+    assert (criterion.fn_weight, criterion.fp_weight) == (0.3, 0.7)
     assert criterion.gamma == pytest.approx(4.0 / 3.0)
+    assert criterion.smooth == pytest.approx(1e-5)
 
 
-def test_alpha_penalizes_false_negatives_more_than_false_positives():
+def test_fp_weight_penalizes_false_positives_more_than_false_negatives():
     criterion = FocalTverskyLoss(smooth=0.0)
     false_negative_loss = criterion(*_single_pixel_error(false_negative=True))
     false_positive_loss = criterion(*_single_pixel_error(false_negative=False))
-    assert false_negative_loss > false_positive_loss
+    assert false_positive_loss > false_negative_loss
 
 
 def test_loss_equals_one_minus_tversky_to_the_inverse_gamma():
     criterion = FocalTverskyLoss(smooth=0.0)
     logits, targets = _single_pixel_error(false_negative=True)
     true_positives, false_negatives = 7.0, 1.0
-    tversky = true_positives / (true_positives + 0.7 * false_negatives)
+    tversky = true_positives / (true_positives + 0.3 * false_negatives)
     assert criterion(logits, targets).item() == pytest.approx((1.0 - tversky) ** 0.75, rel=1e-4)
+
+
+def test_tversky_index_is_computed_per_image():
+    perfect_logits, perfect_targets = _single_pixel_error(false_negative=True)
+    perfect_logits = torch.where(perfect_targets.bool(), CONFIDENT_LOGIT, -CONFIDENT_LOGIT)
+    erroneous_logits, erroneous_targets = _single_pixel_error(false_negative=False)
+    criterion = FocalTverskyLoss(smooth=0.0)
+    batch_loss = criterion(torch.cat([perfect_logits, erroneous_logits]), torch.cat([perfect_targets, erroneous_targets]))
+    expected = (criterion(perfect_logits, perfect_targets) + criterion(erroneous_logits, erroneous_targets)) / 2
+    assert criterion.tversky_index(erroneous_logits, erroneous_targets).shape == (1, 1)
+    assert batch_loss.item() == pytest.approx(expected.item(), rel=1e-6)
 
 
 def test_perfect_prediction_yields_zero_loss():

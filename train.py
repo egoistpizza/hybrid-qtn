@@ -27,8 +27,8 @@ from utils.hardware import reset_peak_vram, vram_metrics
 from utils.init_first import init
 from utils.loss import (
     FOCAL_TVERSKY_GAMMA,
-    TVERSKY_ALPHA_FALSE_NEGATIVE,
-    TVERSKY_BETA_FALSE_POSITIVE,
+    TVERSKY_FN_WEIGHT,
+    TVERSKY_FP_WEIGHT,
     BCEDiceLoss,
     FocalTverskyLoss,
 )
@@ -56,8 +56,8 @@ class TrainingConfig:
     epochs: int
     batch_size: int
     bond_dim: int
-    tversky_alpha: float
-    tversky_beta: float
+    fn_weight: float
+    fp_weight: float
     focal_gamma: float
     image_size: int = IMAGE_SIZE
     accumulation_steps: int = 8
@@ -253,8 +253,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--bond_dim", type=int, default=32)
     parser.add_argument("--loss", type=str, default="focal_tversky", choices=LOSS_CHOICES)
-    parser.add_argument("--tversky_alpha", type=float, default=TVERSKY_ALPHA_FALSE_NEGATIVE, help="Focal Tversky weight on false negatives")
-    parser.add_argument("--tversky_beta", type=float, default=TVERSKY_BETA_FALSE_POSITIVE, help="Focal Tversky weight on false positives")
+    parser.add_argument("--fn_weight", type=float, default=TVERSKY_FN_WEIGHT, help="Focal Tversky weight on false negatives")
+    parser.add_argument("--fp_weight", type=float, default=TVERSKY_FP_WEIGHT, help="Focal Tversky weight on false positives")
     parser.add_argument("--focal_gamma", type=float, default=FOCAL_TVERSKY_GAMMA, help="Focal Tversky gamma; the loss exponent is 1/gamma")
     parser.add_argument("--seed", type=int, default=42, help="Training seed; the data split seed stays fixed")
     parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Comma-separated dataset configs. Available: {available}")
@@ -265,7 +265,7 @@ def parse_arguments() -> argparse.Namespace:
 def build_criterion(config: TrainingConfig) -> nn.Module:
     if config.loss == "bce_dice":
         return BCEDiceLoss(bce_weight=0.5)
-    return FocalTverskyLoss(alpha=config.tversky_alpha, beta=config.tversky_beta, gamma=config.focal_gamma)
+    return FocalTverskyLoss(fn_weight=config.fn_weight, fp_weight=config.fp_weight, gamma=config.focal_gamma)
 
 
 def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
@@ -320,8 +320,8 @@ def main() -> None:
         epochs=arguments.epochs,
         batch_size=arguments.batch_size,
         bond_dim=arguments.bond_dim,
-        tversky_alpha=arguments.tversky_alpha,
-        tversky_beta=arguments.tversky_beta,
+        fn_weight=arguments.fn_weight,
+        fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
     )
     run_name = build_run_name(config.dataset, config.model_type, config.bond_dim, config.loss, config.seed, arguments.tag)

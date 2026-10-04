@@ -57,7 +57,7 @@ def trainer_and_recorder(monkeypatch, tmp_path):
     model = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.BatchNorm2d(4), nn.ReLU(), nn.Conv2d(4, 1, 1))
     config = TrainingConfig(
         model_type="vanilla", dataset="synthetic", loss="focal_tversky", seed=0, epochs=4, batch_size=2,
-        bond_dim=4, tversky_alpha=0.7, tversky_beta=0.3, focal_gamma=4.0 / 3.0, image_size=16,
+        bond_dim=4, fn_weight=0.3, fp_weight=0.7, focal_gamma=4.0 / 3.0, image_size=16,
         accumulation_steps=1, swa_start_pct=0.5, checkpoint_dir=str(tmp_path),
     )
     optimizer = optim.AdamW(model.parameters(), lr=1e-2)

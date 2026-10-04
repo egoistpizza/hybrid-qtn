@@ -55,7 +55,7 @@ At D = 32 the whole network has 15,556,786 parameters, against 28,948,673 for th
 |---|---|
 | Data split | 70 % train / 15 % validation / 15 % test with a **fixed split seed (42)**, independent of the training seed. CVC-ClinicDB is split by **colonoscopy sequence**, so no sequence appears in more than one partition. |
 | Transforms | Training: Resize → random H/V flips → Normalize. Validation and test: **deterministic** Resize → Normalize. Stochastic transforms in an evaluation pipeline raise an error. |
-| Loss | Focal Tversky (Abraham & Khan, 2019): TI = (TP + s) / (TP + α·FN + β·FP + s), L = (1 − TI)^{1/γ}, with α = 0.7 (false negatives), β = 0.3 (false positives), γ = 4/3, s = 1, computed over the flattened batch. BCE + Dice is available via `--loss bce_dice`. |
+| Loss | Focal Tversky (Abraham & Khan, 2019): TI = (TP + s) / (TP + w_FN·FN + w_FP·FP + s), L = (1 − TI)^{1/γ}, computed per image and averaged over the batch, with w_FN = 0.3, w_FP = 0.7, γ = 4/3, s = 1e-5. BCE + Dice is available via `--loss bce_dice`. |
 | Optimisation | AdamW (lr 2·10⁻⁴, weight decay 10⁻⁴), batch 4 × 8 gradient accumulation, cosine schedule, AMP, gradient clipping at 1.0 |
 | SWA | Weights are averaged over the final 25 % of epochs (SWALR, lr 5·10⁻⁵). BatchNorm statistics are recomputed at the end. Per-epoch validation always evaluates the **live** weights. |
 | Model selection | Best live checkpoint by validation Dice. The SWA model is evaluated separately. |
@@ -147,7 +147,7 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 | `--model` | `vanilla`, `hybrid`, `deep_hybrid` |
 | `--bond_dim` | default 32 |
 | `--loss` | `focal_tversky` (default), `bce_dice` |
-| `--tversky_alpha` / `--tversky_beta` / `--focal_gamma` | 0.7 / 0.3 / 4/3 |
+| `--fn_weight` / `--fp_weight` / `--focal_gamma` | 0.3 / 0.7 / 4/3 |
 | `--dataset` | any config stem in `configs/`; comma-separated for joint training |
 | `--epochs` | 100 |
 | `--batch_size` | 4 |

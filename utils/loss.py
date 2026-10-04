@@ -1,40 +1,41 @@
 import torch
 import torch.nn as nn
 
-TVERSKY_ALPHA_FALSE_NEGATIVE = 0.7
-TVERSKY_BETA_FALSE_POSITIVE = 0.3
+TVERSKY_FN_WEIGHT = 0.3
+TVERSKY_FP_WEIGHT = 0.7
 FOCAL_TVERSKY_GAMMA = 4.0 / 3.0
-FOCAL_TVERSKY_SMOOTH = 1.0
+FOCAL_TVERSKY_SMOOTH = 1e-5
+SPATIAL_DIMENSIONS = (2, 3)
 
 
 class FocalTverskyLoss(nn.Module):
     def __init__(
         self,
-        alpha: float = TVERSKY_ALPHA_FALSE_NEGATIVE,
-        beta: float = TVERSKY_BETA_FALSE_POSITIVE,
+        fn_weight: float = TVERSKY_FN_WEIGHT,
+        fp_weight: float = TVERSKY_FP_WEIGHT,
         gamma: float = FOCAL_TVERSKY_GAMMA,
         smooth: float = FOCAL_TVERSKY_SMOOTH,
     ):
         super().__init__()
         if gamma <= 0.0:
             raise ValueError(f"gamma must be positive, got {gamma}")
-        self.alpha = alpha
-        self.beta = beta
+        self.fn_weight = fn_weight
+        self.fp_weight = fp_weight
         self.gamma = gamma
         self.smooth = smooth
 
     def tversky_index(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probabilities = torch.sigmoid(logits.float()).flatten()
-        targets = targets.float().flatten()
-        true_positives = (probabilities * targets).sum()
-        false_negatives = ((1.0 - probabilities) * targets).sum()
-        false_positives = (probabilities * (1.0 - targets)).sum()
+        probabilities = torch.sigmoid(logits.float())
+        targets = targets.float()
+        true_positives = (probabilities * targets).sum(dim=SPATIAL_DIMENSIONS)
+        false_negatives = ((1.0 - probabilities) * targets).sum(dim=SPATIAL_DIMENSIONS)
+        false_positives = (probabilities * (1.0 - targets)).sum(dim=SPATIAL_DIMENSIONS)
         return (true_positives + self.smooth) / (
-            true_positives + self.alpha * false_negatives + self.beta * false_positives + self.smooth
+            true_positives + self.fn_weight * false_negatives + self.fp_weight * false_positives + self.smooth
         )
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return (1.0 - self.tversky_index(logits, targets)) ** (1.0 / self.gamma)
+        return ((1.0 - self.tversky_index(logits, targets)) ** (1.0 / self.gamma)).mean()
 
 
 class BCEDiceLoss(nn.Module):
