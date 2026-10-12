@@ -38,6 +38,7 @@ image_ext:      str            # e.g. ".jpg"
 mask_ext:       str            # e.g. ".jpg" or ".png"
 strict_pairing: bool = true    # raise on orphan; false = warn + skip
 mask_threshold: int = 127      # foreground cutoff for raw grayscale mask
+align_mask_to_image: bool = false  # resize a mask whose size differs from its image (nearest); otherwise raise
 train_transforms:              # Albumentations specs for training (augmentation allowed)
 eval_transforms:               # deterministic specs for validation and test (validated)
 transforms:                    # optional shared fallback when a stage-specific key is absent
@@ -75,12 +76,42 @@ out:
 ```python
 from dataset import build_splits, discover_dataset_configs
 
-print(sorted(discover_dataset_configs()))       # ['cvc_clinicdb', 'kvasir_seg', 'mass_roads']
+print(sorted(discover_dataset_configs()))       # ['cod', 'cvc_clinicdb', 'kvasir_seg', 'mass_roads']
 
 splits = build_splits(["kvasir_seg"])           # 70 / 15 / 15, fixed split seed 42
 splits.train, splits.val, splits.test           # val and test use eval_transforms
-splits = build_splits(["kvasir_seg", "cvc_clinicdb"])  # joint
+splits.test_sets                                # {"test": ...}; one entry per named test set
+splits = build_splits(["kvasir_seg", "cvc_clinicdb"])  # joint; test sets with the same name are concatenated
 ```
+
+`splits.test` is a shortcut for datasets with a single test set and raises when a
+config declares several.
+
+## Predefined splits (official benchmarks)
+
+A benchmark that ships official train and test folders replaces `images_dir` /
+`masks_dir` with named sources:
+
+```yaml
+sources:                       # every folder pair, by name
+  <source>:
+    images_dir: str
+    masks_dir:  str            # per-source keys override the shared ones (e.g. image_ext)
+train_sources: [<source>, ...] # concatenated for training
+test_sources:  [<source>, ...] # each becomes a named test set, evaluated once and logged separately
+validation_fraction: float     # carved from each training source with the split seed (stratified by source)
+foreground_map_metrics: bool = false  # also report S-measure, E-measure, weighted F-measure and map MAE
+```
+
+- The four keys are all required together; `group_map`, `images_dir` and `masks_dir`
+  cannot be combined with them.
+- Training samples whose stem also appears in a test source are excluded with a
+  warning, so the official test sets never leak into training or validation.
+- The official test sets are never used for model selection: validation always comes
+  from the training sources.
+
+`configs/cod.yaml` uses this schema for the camouflaged object detection benchmark
+(COD10K-train + CAMO-train for training; COD10K, CAMO, CHAMELEON and NC4K for testing).
 
 Or, with an arbitrary config dict:
 

@@ -1,22 +1,36 @@
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
-from dataset import build_splits, discover_dataset_configs, parse_dataset_arg, slugify_dataset_arg
+from dataset import (
+    DatasetSplits,
+    build_splits,
+    discover_dataset_configs,
+    parse_dataset_arg,
+    slugify_dataset_arg,
+    uses_foreground_map_metrics,
+)
 from models.factory import MODEL_TYPES, build_segmentation_model
 from utils import get_device
+from utils.foreground_maps import ForegroundMapAccumulator, full_resolution_maps
 from utils.metrics import MetricAccumulator, binarize, calculate_all_metrics
 from utils.run_naming import build_run_name
 
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 IMAGE_SIZE = 512
-EVALUATION_SPLITS = ("test", "val")
+TEST_SPLIT = "test"
+VALIDATION_SPLIT = "val"
+EVALUATION_SPLITS = (TEST_SPLIT, VALIDATION_SPLIT)
+EVALUATION_BATCH_SIZE = 4
+EVALUATION_WORKERS = 4
 CHECKPOINT_PREFIXES_TO_STRIP = ("_orig_mod.", "module.")
 SWA_METADATA_KEY = "n_averaged"
 VISUALIZATION_SEED = 123
@@ -99,19 +113,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11))
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--run", type=str, default=None, help="Checkpoint run name; overrides the derived name")
+    parser.add_argument("--save_maps", action="store_true", help="Save probability maps at ground-truth resolution")
     return parser.parse_args()
 
 
+def evaluation_sets(splits: DatasetSplits, split: str) -> dict[str, Dataset]:
+    return dict(splits.test_sets) if split == TEST_SPLIT else {VALIDATION_SPLIT: splits.val}
+
+
+def save_probability_maps(predictions: list[np.ndarray], sample_ids: list[str], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for prediction, sample_id in zip(predictions, sample_ids, strict=True):
+        Image.fromarray(prediction).save(output_dir / f"{sample_id}.png")
+
+
 @torch.inference_mode()
-def evaluate_split(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> dict[str, float]:
+def evaluate_split(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    foreground_maps: bool,
+    map_dir: Optional[Path] = None,
+) -> dict[str, float]:
     use_amp = device.type == "cuda"
     accumulator = MetricAccumulator(compute_hd95=True)
+    map_accumulator = ForegroundMapAccumulator() if foreground_maps else None
     for batch in tqdm(loader, desc="Evaluating"):
         images = batch["image"].to(device, non_blocking=True, memory_format=torch.channels_last)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
         accumulator.update(logits, batch["mask"].to(device, non_blocking=True))
-    return accumulator.compute()
+        if map_accumulator is None and map_dir is None:
+            continue
+        maps = list(full_resolution_maps(logits, batch["metadata"]["mask_path"]))
+        if map_accumulator is not None:
+            for prediction, ground_truth in maps:
+                map_accumulator.update(prediction, ground_truth)
+        if map_dir is not None:
+            save_probability_maps([prediction for prediction, _ in maps], batch["metadata"]["sample_id"], map_dir)
+
+    metrics = accumulator.compute()
+    if map_accumulator is not None:
+        metrics.update(map_accumulator.compute())
+    return metrics
 
 
 @torch.inference_mode()
@@ -132,23 +176,29 @@ def main() -> None:
     dataset_names = parse_dataset_arg(args.dataset)
     dataset_slug = slugify_dataset_arg(dataset_names)
 
-    evaluation_dataset = getattr(build_splits(dataset_names), args.split)
-    print(f"Dataset '{dataset_slug}': {len(evaluation_dataset)} {args.split} samples on {device}")
+    datasets = evaluation_sets(build_splits(dataset_names), args.split)
+    foreground_maps = uses_foreground_map_metrics(dataset_names)
 
     run_name = args.run or build_run_name(dataset_slug, args.model, args.bond_dim, args.loss, args.seed, args.tag)
     model = build_segmentation_model(args.model, args.bond_dim, IMAGE_SIZE).to(device).to(memory_format=torch.channels_last)
     load_model_weights(model, resolve_checkpoint(Path("checkpoints") / run_name), device)
     model.eval()
 
-    metrics = evaluate_split(model, DataLoader(evaluation_dataset, batch_size=4, shuffle=False, num_workers=4, pin_memory=True), device)
-    print(" | ".join(f"{args.split} {name}: {value:.4f}" for name, value in metrics.items()))
-
-    visualization_indices = torch.randperm(len(evaluation_dataset), generator=torch.Generator().manual_seed(VISUALIZATION_SEED))
-    visualization_loader = DataLoader(
-        Subset(evaluation_dataset, visualization_indices[: args.num_samples].tolist()), batch_size=1, shuffle=False
-    )
     output_dir = Path(args.output_dir) if args.output_dir else Path("outputs") / "visualizations" / run_name
-    render_samples(model, visualization_loader, device, output_dir)
+    for set_name, dataset in datasets.items():
+        print(f"Dataset '{dataset_slug}': {len(dataset)} {set_name} samples on {device}")
+        loader = DataLoader(
+            dataset, batch_size=EVALUATION_BATCH_SIZE, shuffle=False, num_workers=EVALUATION_WORKERS, pin_memory=True
+        )
+        map_dir = Path("outputs") / "prediction_maps" / run_name / set_name if args.save_maps else None
+        metrics = evaluate_split(model, loader, device, foreground_maps, map_dir)
+        print(" | ".join(f"{set_name} {name}: {value:.4f}" for name, value in metrics.items()))
+
+        visualization_indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(VISUALIZATION_SEED))
+        visualization_loader = DataLoader(
+            Subset(dataset, visualization_indices[: args.num_samples].tolist()), batch_size=1, shuffle=False
+        )
+        render_samples(model, visualization_loader, device, output_dir / set_name)
     print(f"Visualizations saved to: {output_dir.absolute()}")
 
 

@@ -10,10 +10,17 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from PIL import Image
+from torch.utils.data import DataLoader
+
+from dataset import DatasetSplits
 from evaluate import (
     clean_state_dict,
     denormalize,
+    evaluate_split,
+    evaluation_sets,
     load_model_weights,
+    save_probability_maps,
     save_visualizations,
 )
 from utils.metrics import calculate_all_metrics
@@ -99,3 +106,54 @@ def test_load_model_weights_cleans_state_dict(mock_torch_load, tmp_path):
 def test_clean_state_dict_drops_swa_metadata():
     cleaned = clean_state_dict({"n_averaged": torch.tensor(3), "module._orig_mod.head.weight": torch.tensor([1.0])})
     assert list(cleaned) == ["head.weight"]
+
+
+def test_test_split_evaluates_every_named_set():
+    splits = DatasetSplits(train=[1], val=[2], test_sets={"cod10k": [3], "nc4k": [4]})
+    assert evaluation_sets(splits, "test") == {"cod10k": [3], "nc4k": [4]}
+    assert evaluation_sets(splits, "val") == {"val": [2]}
+
+
+def test_probability_maps_are_saved_per_sample(tmp_path):
+    maps = [np.full((5, 7), 200, np.uint8), np.zeros((3, 4), np.uint8)]
+    save_probability_maps(maps, ["first", "second"], tmp_path / "maps")
+    assert np.array_equal(np.array(Image.open(tmp_path / "maps" / "first.png")), maps[0])
+    assert np.array(Image.open(tmp_path / "maps" / "second.png")).shape == (3, 4)
+
+
+class MaskFileSamples(torch.utils.data.Dataset):
+    def __init__(self, directory: Path) -> None:
+        self.paths = []
+        for index, size in enumerate([(30, 40), (22, 26)]):
+            path = directory / f"sample_{index}.png"
+            ground_truth = np.zeros(size, np.uint8)
+            ground_truth[5:15, 6:16] = 255
+            Image.fromarray(ground_truth).save(path)
+            self.paths.append(str(path))
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> dict:
+        mask = torch.zeros(1, 16, 16)
+        mask[:, 4:10, 4:10] = 1.0
+        return {
+            "image": mask.repeat(3, 1, 1),
+            "mask": mask,
+            "metadata": {"mask_path": self.paths[index], "sample_id": f"sample_{index}"},
+        }
+
+
+def test_evaluate_split_adds_foreground_map_metrics_and_saves_maps(tmp_path):
+    model = torch.nn.Conv2d(3, 1, kernel_size=1)
+    loader = DataLoader(MaskFileSamples(tmp_path), batch_size=2)
+    metrics = evaluate_split(model, loader, torch.device("cpu"), foreground_maps=True, map_dir=tmp_path / "maps")
+    assert {"dice", "hd95", "s_measure", "e_measure", "wf_measure", "map_mae"} <= set(metrics)
+    assert np.array(Image.open(tmp_path / "maps" / "sample_1.png")).shape == (22, 26)
+
+
+def test_evaluate_split_skips_foreground_map_metrics_when_disabled(tmp_path):
+    model = torch.nn.Conv2d(3, 1, kernel_size=1)
+    metrics = evaluate_split(model, DataLoader(MaskFileSamples(tmp_path), batch_size=2), torch.device("cpu"), foreground_maps=False)
+    assert "s_measure" not in metrics
+    assert not (tmp_path / "maps").exists()

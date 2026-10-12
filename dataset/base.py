@@ -24,6 +24,7 @@ class GenericSegmentationDataset(Dataset):
         self.config = config
         self.dataset_name: str = config["dataset_name"]
         self.mask_threshold: int = int(config.get("mask_threshold", 127))
+        self.align_mask_to_image: bool = bool(config.get("align_mask_to_image", False))
         self.samples: list[tuple[str, str, str]] = pair_by_stem(
             images_dir=config["images_dir"],
             masks_dir=config["masks_dir"],
@@ -60,6 +61,17 @@ class GenericSegmentationDataset(Dataset):
             raw = np.array(mask.convert("L"), dtype=np.uint8)
         return (raw > self.mask_threshold).astype(np.uint8)
 
+    def _match_image_frame(self, mask: np.ndarray, image: np.ndarray, sample_id: str) -> np.ndarray:
+        height, width = image.shape[:2]
+        if mask.shape == (height, width):
+            return mask
+        if not self.align_mask_to_image:
+            raise ValueError(
+                f"{self.dataset_name}/{sample_id}: mask {mask.shape} and image {(height, width)} differ in size; "
+                "set align_mask_to_image to resize such masks to the image frame"
+            )
+        return np.array(Image.fromarray(mask).resize((width, height), Image.Resampling.NEAREST))
+
     @staticmethod
     def _as_image_tensor(image: Any) -> torch.Tensor:
         if isinstance(image, torch.Tensor):
@@ -80,7 +92,7 @@ class GenericSegmentationDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         image_path, mask_path, sample_id = self.samples[index]
         image = self._load_image(image_path)
-        mask = self._load_mask(mask_path)
+        mask = self._match_image_frame(self._load_mask(mask_path), image, sample_id)
         transformed = self.transform(image=image, mask=mask)
 
         return {

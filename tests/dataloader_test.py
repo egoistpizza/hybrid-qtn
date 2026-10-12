@@ -221,6 +221,24 @@ class TestOutputContract:
         assert isinstance(meta["mask_path"], str)
         assert meta["original_size"] == (100, 60)
 
+class TestMaskImageAlignment:
+    @pytest.fixture
+    def mismatched_config(self, base_config, standard_transforms):
+        _write_mask(Path(base_config["masks_dir"]) / "sample_01.png", 60, 64, 255)
+        base_config["transforms"] = standard_transforms
+        return base_config
+
+    def test_size_mismatch_raises_by_default(self, mismatched_config):
+        with pytest.raises(ValueError, match="sample_01: mask \\(60, 64\\) and image \\(64, 64\\) differ"):
+            GenericSegmentationDataset(mismatched_config)[0]
+
+    def test_opt_in_aligns_the_mask_to_the_image_frame(self, mismatched_config):
+        mismatched_config["align_mask_to_image"] = True
+        sample = GenericSegmentationDataset(mismatched_config)[0]
+        assert sample["mask"].shape == (1, 32, 32)
+        assert torch.all(sample["mask"] == 1.0)
+
+
 class TestConfigLoader:
     def test_load_dataset_reads_yaml_and_instantiates(
         self, tmp_path, base_config, standard_transforms,

@@ -53,13 +53,13 @@ At D = 32 the whole network has 16,081,074 parameters, against 28,948,673 for th
 
 | Aspect | Setting |
 |---|---|
-| Data split | 70 % train / 15 % validation / 15 % test with a **fixed split seed (42)**, independent of the training seed. CVC-ClinicDB is split by **colonoscopy sequence**, so no sequence appears in more than one partition. |
-| Transforms | Training: Resize → random H/V flips → Normalize. Validation and test: **deterministic** Resize → Normalize. Stochastic transforms in an evaluation pipeline raise an error. |
+| Data split | 70 % train / 15 % validation / 15 % test with a **fixed split seed (42)**, independent of the training seed. CVC-ClinicDB is split by **colonoscopy sequence**, so no sequence appears in more than one partition. Camouflaged object detection follows the **official benchmark protocol**: COD10K-train + CAMO-train for training, with 10 % of each carved out for validation; COD10K, CAMO, CHAMELEON and NC4K are separate test sets. The two COD10K images that appear in both the official training and test folders are excluded from training. |
+| Transforms | Training: Resize → random H/V flips → Normalize (horizontal flips only for the natural images of the camouflage benchmark). Validation and test: **deterministic** Resize → Normalize. Stochastic transforms in an evaluation pipeline raise an error. |
 | Loss | Focal Tversky (Abraham & Khan, 2019): TI = (TP + s) / (TP + w_FN·FN + w_FP·FP + s), L = (1 − TI)^{1/γ}, computed per image and averaged over the batch, with w_FN = 0.3, w_FP = 0.7, γ = 4/3, s = 1e-5. BCE + Dice is available via `--loss bce_dice`. |
 | Optimisation | AdamW (lr 2·10⁻⁴, weight decay 10⁻⁴), batch 4 × 8 gradient accumulation, cosine schedule, AMP, gradient clipping at 1.0 |
 | SWA | Weights are averaged over the final 25 % of epochs (SWALR, lr 5·10⁻⁵). BatchNorm statistics are recomputed at the end. Per-epoch validation always evaluates the **live** weights. |
 | Model selection | Best live checkpoint by validation Dice. The SWA model is evaluated separately. |
-| Reported metrics | **Test set only**, computed once after training: Dice, IoU, F2, MAE and HD95, averaged per image. HD95 is the 95th-percentile symmetric border-to-border distance in pixels at the network resolution. Keys are logged as `test_best_live_*` and `test_swa_*`. |
+| Reported metrics | **Test set only**, computed once after training: Dice, IoU, F2, MAE and HD95, averaged per image. HD95 is the 95th-percentile symmetric border-to-border distance in pixels at the network resolution. Keys are logged as `test_best_live_*` and `test_swa_*`; datasets with several test sets log `test_swa_<set>_*`. For the camouflage benchmark, S-measure, mean E-measure, weighted F-measure and MAE are also computed on the probability map resized to the original ground-truth resolution, matching the reference implementation of PySODMetrics 1.6.2 (`s_measure`, `e_measure`, `wf_measure`, `map_mae`). |
 | Memory | `Peak_VRAM_MB` = `torch.cuda.max_memory_allocated()` per epoch, reset at the start of each epoch |
 | Variance | Every configuration is run with seeds 42, 43 and 44 (`scripts/run_seeds.sh`). Report mean ± std. |
 
@@ -116,6 +116,7 @@ Experiment tracking uses Weights & Biases:
 hqtn hybrid-qtn:latest scripts/download_kvasir_seg.py
 hqtn hybrid-qtn:latest scripts/download_cvc_clinicdb.py
 hqtn hybrid-qtn:latest scripts/download_mass_roads.py
+hqtn hybrid-qtn:latest scripts/download_cod.py
 ```
 
 | Dataset | Source | Credentials |
@@ -123,6 +124,7 @@ hqtn hybrid-qtn:latest scripts/download_mass_roads.py
 | Kvasir-SEG (1,000 images) | Simula | none |
 | CVC-ClinicDB (612 frames, 29 sequences) | Kaggle mirror by default; `--source local --archive <file>` for a manually downloaded archive | Kaggle |
 | Massachusetts Roads | Kaggle | Kaggle |
+| Camouflaged objects: COD10K, CAMO, CHAMELEON, NC4K (4,040 train / 6,473 test images) | Official SINet-V2 training and testing archives (Google Drive); non-commercial research use only | none |
 
 For Kaggle, export `KAGGLE_USERNAME` and `KAGGLE_KEY` before running the helper.
 
@@ -173,7 +175,7 @@ Aggregate the `test_swa_*` / `test_best_live_*` summary values across seeds as m
 hqtn hybrid-qtn:latest evaluate.py --model hybrid --bond_dim 32 --dataset kvasir_seg --seed 42 --split test
 ```
 
-This loads `best_swa_model.pth`, falling back to `best_model.pth` if absent. It prints Dice, IoU, MAE, F2 and HD95, and writes 5–10 qualitative panels to `outputs/visualizations/<run>/`. Use `--run <name>` to evaluate a checkpoint directory by name.
+This loads `best_swa_model.pth`, falling back to `best_model.pth` if absent. It evaluates every test set of the dataset and prints Dice, IoU, MAE, F2 and HD95 for each, plus the camouflage metrics when the dataset config enables them. It writes 5–10 qualitative panels per set to `outputs/visualizations/<run>/<set>/`. Use `--run <name>` to evaluate a checkpoint directory by name, and `--save_maps` to save the probability maps at ground-truth resolution to `outputs/prediction_maps/<run>/<set>/`.
 
 ### 3.9 ONNX export and throughput
 
@@ -208,15 +210,15 @@ Run all commands from the repository root. Invoke the profiler as a module: `pyt
 ## 6. Repository structure
 
 ```text
-├── configs/              Dataset YAMLs (paths, train_transforms, eval_transforms, optional group_map)
-├── dataset/              Generic YAML-driven dataset, deterministic 70/15/15 splits, worker seeding
+├── configs/              Dataset YAMLs (paths or predefined sources, train_transforms, eval_transforms, optional group_map)
+├── dataset/              Generic YAML-driven dataset, deterministic 70/15/15 or predefined benchmark splits, worker seeding
 ├── models/
 │   ├── unet_classic.py   Vanilla U-Net
 │   ├── unet_hybrid.py    U-Net with pluggable bottleneck transforms
 │   ├── mps_layer.py      Axial MPS block
 │   └── factory.py        Model construction shared by train, evaluate and export
 ├── scripts/              Dataset downloaders, bottleneck profiler, multi-seed runner
-├── utils/                Loss functions, metrics, seeding, VRAM profiling, run naming
+├── utils/                Loss functions, metrics (incl. full-resolution foreground-map metrics), seeding, VRAM profiling, run naming
 ├── tests/                Pytest suite
 ├── train.py              Training with live validation, SWA and test-set reporting
 ├── evaluate.py           Held-out evaluation and visualisation

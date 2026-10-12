@@ -3,7 +3,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -15,14 +15,17 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from dataset import (
+    DEFAULT_TEST_SET,
     build_splits,
     discover_dataset_configs,
     parse_dataset_arg,
     seed_dataloader_worker,
     slugify_dataset_arg,
+    uses_foreground_map_metrics,
 )
 from models.factory import MODEL_TYPES, build_segmentation_model
 from utils import get_device
+from utils.foreground_maps import ForegroundMapAccumulator, full_resolution_maps
 from utils.hardware import reset_peak_vram, vram_metrics
 from utils.init_first import init
 from utils.loss import (
@@ -60,6 +63,7 @@ class TrainingConfig:
     fp_weight: float
     focal_gamma: float
     image_size: int = IMAGE_SIZE
+    foreground_map_metrics: bool = False
     accumulation_steps: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
@@ -76,13 +80,17 @@ def prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}_{name}": value for name, value in metrics.items()}
 
 
+def qualified_test_prefix(model_prefix: str, test_set: str) -> str:
+    return model_prefix if test_set == DEFAULT_TEST_SET else f"{model_prefix}_{test_set}"
+
+
 class SegmentationTrainer:
     def __init__(
         self,
         model: nn.Module,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        test_loader: DataLoader,
+        test_loaders: Mapping[str, DataLoader],
         criterion: nn.Module,
         optimizer: optim.Optimizer,
         scheduler: optim.lr_scheduler.LRScheduler,
@@ -92,7 +100,7 @@ class SegmentationTrainer:
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.test_loader = test_loader
+        self.test_loaders = test_loaders
         self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -140,9 +148,17 @@ class SegmentationTrainer:
         return total_loss / len(self.train_loader)
 
     @torch.inference_mode()
-    def evaluate(self, model: nn.Module, loader: DataLoader, description: str, compute_hd95: bool) -> tuple[float, dict[str, float]]:
+    def evaluate(
+        self,
+        model: nn.Module,
+        loader: DataLoader,
+        description: str,
+        compute_hd95: bool,
+        foreground_maps: bool = False,
+    ) -> tuple[float, dict[str, float]]:
         model.eval()
         accumulator = MetricAccumulator(compute_hd95=compute_hd95)
+        map_accumulator = ForegroundMapAccumulator() if foreground_maps else None
         weighted_loss, image_count = 0.0, 0
 
         for batch in tqdm(loader, desc=description):
@@ -151,10 +167,16 @@ class SegmentationTrainer:
                 logits = model(self._images(batch))
                 loss = self.criterion(logits, masks)
             accumulator.update(logits, masks)
+            if map_accumulator is not None:
+                for prediction, ground_truth in full_resolution_maps(logits, batch["metadata"]["mask_path"]):
+                    map_accumulator.update(prediction, ground_truth)
             weighted_loss += loss.item() * masks.size(0)
             image_count += masks.size(0)
 
-        return weighted_loss / image_count, accumulator.compute()
+        metrics = accumulator.compute()
+        if map_accumulator is not None:
+            metrics.update(map_accumulator.compute())
+        return weighted_loss / image_count, metrics
 
     @torch.no_grad()
     def _recompute_swa_batchnorm(self) -> None:
@@ -222,12 +244,20 @@ class SegmentationTrainer:
         if swa_model is not None:
             candidates["test_swa"] = swa_model
 
-        for prefix, model in candidates.items():
-            test_loss, test_metrics = self.evaluate(model, self.test_loader, f"{prefix} [Test]", compute_hd95=True)
-            results = {f"{prefix}_loss": test_loss, **prefixed(prefix, test_metrics)}
-            wandb.log(results)
-            wandb.run.summary.update(results)
-            logger.info(" | ".join(f"{name}: {value:.4f}" for name, value in results.items()))
+        for model_prefix, model in candidates.items():
+            for test_set, loader in self.test_loaders.items():
+                prefix = qualified_test_prefix(model_prefix, test_set)
+                test_loss, test_metrics = self.evaluate(
+                    model,
+                    loader,
+                    f"{prefix} [Test]",
+                    compute_hd95=True,
+                    foreground_maps=self.config.foreground_map_metrics,
+                )
+                results = {f"{prefix}_loss": test_loss, **prefixed(prefix, test_metrics)}
+                wandb.log(results)
+                wandb.run.summary.update(results)
+                logger.info(" | ".join(f"{name}: {value:.4f}" for name, value in results.items()))
 
     def fit(self, run_name: str, total_params: int) -> None:
         wandb.init(project="hybrid-qtn", config={**asdict(self.config), "total_params": total_params}, name=run_name)
@@ -323,12 +353,14 @@ def main() -> None:
         fn_weight=arguments.fn_weight,
         fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
+        foreground_map_metrics=uses_foreground_map_metrics(dataset_names),
     )
     run_name = build_run_name(config.dataset, config.model_type, config.bond_dim, config.loss, config.seed, arguments.tag)
     config.checkpoint_dir = os.path.join("checkpoints", run_name)
 
     splits = build_splits(dataset_names)
-    logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val)} val / {len(splits.test)} test")
+    test_sizes = ", ".join(f"{len(dataset)} {name}" for name, dataset in splits.test_sets.items())
+    logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val)} val / test: {test_sizes}")
 
     model = build_segmentation_model(config.model_type, config.bond_dim, config.image_size)
     total_params = log_parameter_breakdown(model)
@@ -340,7 +372,10 @@ def main() -> None:
         model=model,
         train_loader=build_loader(splits.train, config.batch_size, shuffle=True, seed=config.seed),
         val_loader=build_loader(splits.val, config.batch_size, shuffle=False, seed=config.seed),
-        test_loader=build_loader(splits.test, config.batch_size, shuffle=False, seed=config.seed),
+        test_loaders={
+            name: build_loader(dataset, config.batch_size, shuffle=False, seed=config.seed)
+            for name, dataset in splits.test_sets.items()
+        },
         criterion=build_criterion(config),
         optimizer=optimizer,
         scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs),
