@@ -75,19 +75,3 @@ class UNet(nn.Module):
         
         logits = self.outc(x)
         return logits
-
-if __name__ == "__main__":
-    print("🚀 Dummy Tensor Test starting..")
-    
-    model = UNet(in_channels=3, out_channels=1)
-    
-    dummy_input = torch.randn(1, 3, 512, 512)
-    print(f"📥 Input size:  {dummy_input.shape}")
-    
-    with torch.no_grad():
-        output = model(dummy_input)
-        
-    print(f"📤 Output size: {output.shape}")
-    
-    assert output.shape == (1, 1, 512, 512), "Error: Shape mismatch!"
-    print("✅ SUCCESS: 512x512 RGB images can be processed...")

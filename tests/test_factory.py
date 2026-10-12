@@ -11,6 +11,14 @@ import torch
 from models.factory import build_segmentation_model, spatial_size_at
 
 
+@pytest.mark.parametrize("model_type", ["vanilla", "hybrid", "deep_hybrid"])
+def test_models_return_one_logit_map_at_input_resolution(model_type):
+    model = build_segmentation_model(model_type, bond_dim=16, image_size=64).eval()
+    with torch.no_grad():
+        logits = model(torch.randn(2, 3, 64, 64))
+    assert logits.shape == (2, 1, 64, 64)
+
+
 def test_vanilla_model_has_no_transforms():
     model = build_segmentation_model("vanilla", bond_dim=32)
     assert model.__class__.__name__ == "UNet"

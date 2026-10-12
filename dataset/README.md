@@ -151,9 +151,10 @@ That is the whole procedure. `discover_dataset_configs()` picks the file up
 automatically, so `--dataset <name>` works in `train.py` and `evaluate.py`
 with no code change.
 
-If the dataset has a materially different layout (split subdirs, multi-class
-masks, JSON annotations), that's the point where a dedicated loader or a
-pairing helper belongs — start by adding a sibling to `pairing.py`.
+Official train/test folders need no code either: declare them as predefined
+sources (see "Predefined splits" above). Multi-class masks or JSON annotations
+are the point where a dedicated loader or pairing helper belongs; start by
+adding a sibling to `pairing.py`.
 
 ## Adding / removing transforms
 
