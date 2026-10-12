@@ -1,3 +1,9 @@
+"""Evaluate a trained checkpoint on the validation split or on every test set of a dataset.
+
+Prints the per-image metrics of each set, renders qualitative panels and, with
+``--save_maps``, writes probability maps at ground-truth resolution.
+"""
+
 import argparse
 from pathlib import Path
 from typing import Optional
@@ -37,6 +43,7 @@ VISUALIZATION_SEED = 123
 
 
 def denormalize(tensor: torch.Tensor) -> np.ndarray:
+    """Undo ImageNet normalization and return an HWC array clipped to [0, 1]."""
     mean = torch.tensor(IMAGE_MEAN, device=tensor.device).view(3, 1, 1)
     std = torch.tensor(IMAGE_STD, device=tensor.device).view(3, 1, 1)
     return torch.clamp(tensor * std + mean, 0.0, 1.0).cpu().permute(1, 2, 0).numpy()
@@ -50,6 +57,7 @@ def save_visualizations(
     output_dir: Path,
     start_index: int = 0,
 ) -> None:
+    """Save an image / ground truth / prediction panel with per-image metrics for every sample."""
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions = binarize(logits)
 
@@ -77,6 +85,7 @@ def save_visualizations(
 
 
 def clean_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Strip ``torch.compile`` / ``AveragedModel`` prefixes and SWA bookkeeping from checkpoint keys."""
     cleaned = {}
     for key, value in state_dict.items():
         if SWA_METADATA_KEY in key:
@@ -96,6 +105,7 @@ def load_model_weights(model: torch.nn.Module, checkpoint_path: Path, device: to
 
 
 def resolve_checkpoint(checkpoint_dir: Path) -> Path:
+    """Prefer the SWA checkpoint and fall back to the best live one."""
     swa_checkpoint = checkpoint_dir / "best_swa_model.pth"
     return swa_checkpoint if swa_checkpoint.exists() else checkpoint_dir / "best_model.pth"
 
@@ -118,6 +128,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def evaluation_sets(splits: DatasetSplits, split: str) -> dict[str, Dataset]:
+    """Named datasets to evaluate: every test set, or the validation split."""
     return dict(splits.test_sets) if split == TEST_SPLIT else {VALIDATION_SPLIT: splits.val}
 
 
@@ -135,6 +146,7 @@ def evaluate_split(
     foreground_maps: bool,
     map_dir: Optional[Path] = None,
 ) -> dict[str, float]:
+    """Per-image metrics of one set, optionally with foreground-map metrics and saved maps."""
     use_amp = device.type == "cuda"
     accumulator = MetricAccumulator(compute_hd95=True)
     map_accumulator = ForegroundMapAccumulator() if foreground_maps else None

@@ -1,3 +1,5 @@
+"""Image and mask pairing by filename stem."""
+
 from __future__ import annotations
 
 import warnings
@@ -30,6 +32,18 @@ def pair_by_stem(
     mask_ext: str,
     strict_pairing: bool = True,
 ) -> list[tuple[str, str, str]]:
+    """Pair image and mask files by filename stem.
+
+    Extensions are matched case-insensitively; stems are matched exactly.
+
+    Returns:
+        ``(image_path, mask_path, sample_id)`` tuples sorted by stem.
+
+    Raises:
+        NotADirectoryError: If either directory is missing.
+        FileNotFoundError: If ``strict_pairing`` is set and a file has no partner.
+            Without ``strict_pairing`` unpaired files are skipped with a warning.
+    """
     images_dir = Path(images_dir)
     masks_dir = Path(masks_dir)
 

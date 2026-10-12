@@ -1,3 +1,8 @@
+"""Download the Massachusetts Roads dataset from Kaggle into data/mass_roads/{images,masks}.
+
+Requires the KAGGLE_USERNAME and KAGGLE_KEY environment variables.
+"""
+
 import os
 import shutil
 import sys

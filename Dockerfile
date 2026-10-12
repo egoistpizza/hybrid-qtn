@@ -1,5 +1,7 @@
+# Reproducible training image; datasets, checkpoints and outputs are mounted from the host.
 FROM python:3.12.3-slim-bookworm
 
+# PYTHONHASHSEED and CUBLAS_WORKSPACE_CONFIG support deterministic runs.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONHASHSEED=0 \
@@ -9,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NO_ALBUMENTATIONS_UPDATE=1 \
     ALBUMENTATIONS_DISABLE_VERSION_CHECK=1
 
+# Compiler and C headers for torch.compile (Inductor); GL, GLib and OpenMP runtimes for OpenCV and PyTorch.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \

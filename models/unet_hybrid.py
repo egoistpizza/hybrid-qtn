@@ -1,3 +1,5 @@
+"""U-Net whose deepest encoder stages can host tensorized bottleneck transforms."""
+
 from typing import Optional
 
 import torch
@@ -11,6 +13,11 @@ ENTRY_TT_RANK = 128
 
 
 def encoder_stage(in_channels: int, out_channels: int, tensorized: bool, entry_rank: int) -> nn.Sequential:
+    """Downsampling encoder stage.
+
+    A tensorized stage replaces the :class:`DoubleConv` with a single TT-Conv3x3 entry
+    convolution followed by BatchNorm and ReLU; the stage's transform is applied after it.
+    """
     if not tensorized:
         return nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
     return nn.Sequential(
@@ -22,6 +29,19 @@ def encoder_stage(in_channels: int, out_channels: int, tensorized: bool, entry_r
 
 
 class UNetDeepHybrid(nn.Module):
+    """U-Net with optional transforms after the 512- and 1024-channel encoder stages.
+
+    ``hybrid`` models set only ``transform_1024`` (the bottleneck); ``deep_hybrid`` models
+    set both. A stage that receives a transform uses a tensorized entry convolution.
+
+    Args:
+        in_channels: Input image channels.
+        out_channels: Output logit channels.
+        transform_512: Module applied to the 512-channel features, or ``None``.
+        transform_1024: Module applied to the 1024-channel bottleneck features, or ``None``.
+        entry_rank: Maximum bond rank of the tensorized entry convolutions.
+    """
+
     def __init__(
         self,
         in_channels: int = 3,
@@ -50,6 +70,7 @@ class UNetDeepHybrid(nn.Module):
     def _apply_transform(self, transform: Optional[nn.Module], features: torch.Tensor) -> torch.Tensor:
         if transform is None:
             return features
+        # Recomputing the transform in the backward pass trades compute for activation memory.
         if self.use_checkpointing and self.training:
             return checkpoint.checkpoint(transform, features, use_reentrant=False)
         return transform(features)

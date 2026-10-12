@@ -1,10 +1,21 @@
+# Camouflaged object detection benchmark config
+#
+# Layout expected after running `python scripts/download_cod.py`:
+#   data/cod/train/{cod10k,camo}/{images,masks}
+#   data/cod/test/{cod10k,camo,chameleon,nc4k}/{images,masks}
+#
+# Official protocol: COD10K-train + CAMO-train for training, four separate test sets.
+# Validation is carved from the training sources; see dataset/predefined.py.
+
 dataset_name: cod
 
 image_ext: .jpg
 mask_ext:  .png
 strict_pairing: true
 mask_threshold: 127
+# Two CHAMELEON masks differ in size from their images by a few pixels.
 align_mask_to_image: true
+# Also report S-measure, E-measure, weighted F-measure and MAE at ground-truth resolution.
 foreground_map_metrics: true
 
 sources:
@@ -31,6 +42,7 @@ train_sources: [cod10k_train, camo_train]
 test_sources: [cod10k, camo, chameleon, nc4k]
 validation_fraction: 0.1
 
+# Natural images have a canonical orientation, so only horizontal flips are used.
 train_transforms:
   - name: Resize
     height: 512

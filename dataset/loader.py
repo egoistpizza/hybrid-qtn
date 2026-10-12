@@ -1,3 +1,5 @@
+"""Dataset construction from YAML configs; a dataset is defined by its config, not by code."""
+
 from __future__ import annotations
 
 from pathlib import Path

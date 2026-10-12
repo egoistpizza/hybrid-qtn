@@ -1,3 +1,5 @@
+"""Segmentation losses for binary logits."""
+
 import torch
 import torch.nn as nn
 
@@ -9,6 +11,19 @@ SPATIAL_DIMENSIONS = (2, 3)
 
 
 class FocalTverskyLoss(nn.Module):
+    """Focal Tversky loss (Abraham & Khan, 2019), computed per image and averaged over the batch.
+
+    ``TI = (TP + s) / (TP + fn_weight * FN + fp_weight * FP + s)`` and
+    ``L = (1 - TI) ** (1 / gamma)``. With the defaults, false positives cost more than
+    false negatives (0.7 vs 0.3), which favours tight boundaries over recall.
+
+    Args:
+        fn_weight: Weight on soft false negatives.
+        fp_weight: Weight on soft false positives.
+        gamma: Focal parameter; the loss exponent is ``1 / gamma``.
+        smooth: Additive smoothing for empty masks.
+    """
+
     def __init__(
         self,
         fn_weight: float = TVERSKY_FN_WEIGHT,
@@ -25,6 +40,7 @@ class FocalTverskyLoss(nn.Module):
         self.smooth = smooth
 
     def tversky_index(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Soft Tversky index per image and channel, computed in float32."""
         probabilities = torch.sigmoid(logits.float())
         targets = targets.float()
         true_positives = (probabilities * targets).sum(dim=SPATIAL_DIMENSIONS)
@@ -39,6 +55,8 @@ class FocalTverskyLoss(nn.Module):
 
 
 class BCEDiceLoss(nn.Module):
+    """Weighted sum of binary cross-entropy and per-image soft Dice loss."""
+
     def __init__(self, bce_weight: float = 0.5, smooth: float = 1e-5):
         super().__init__()
         self.bce_weight = bce_weight

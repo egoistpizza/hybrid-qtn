@@ -1,3 +1,13 @@
+"""Tensor-train (TT) factorized layers used by the quantum-inspired bottleneck.
+
+A weight matrix ``W`` of shape ``(prod(n_k), prod(m_k))`` is stored as a chain of
+cores ``G_k`` with shape ``(r_{k-1}, m_k, n_k, r_k)``, where ``m_k`` / ``n_k`` are
+the input / output modes of site ``k`` and ``r_k`` the bond ranks. This is the
+matrix product operator (MPO) form of the weight. Every forward pass contracts
+the chain back into a dense weight, so the arithmetic matches a dense layer
+while only the cores are stored and optimized.
+"""
+
 import math
 from typing import Optional, Sequence
 
@@ -14,6 +24,7 @@ def is_power_of_two(value: int) -> bool:
 
 
 def binary_digits(value: int) -> int:
+    """Number of binary digits needed to index ``value`` items; ``value`` must be a power of two."""
     if not is_power_of_two(value):
         raise ValueError(f"Expected a power of two, got {value}")
     return value.bit_length() - 1
@@ -24,6 +35,13 @@ def quantize_dimension(
     mode_count: int = CHANNEL_MODE_COUNT,
     max_mode_size: int = MAX_CHANNEL_MODE_SIZE,
 ) -> tuple[int, ...]:
+    """Factor a power-of-two dimension into ``mode_count`` modes of size at most ``max_mode_size``.
+
+    Larger modes are placed last, e.g. ``1024 -> (4, 4, 4, 4, 4)`` and ``512 -> (2, 4, 4, 4, 4)``.
+
+    Raises:
+        ValueError: If ``value`` is not a power of two or does not fit into the modes.
+    """
     remaining_bits = binary_digits(value)
     bits_per_mode = binary_digits(max_mode_size)
     modes = []
@@ -37,6 +55,12 @@ def quantize_dimension(
 
 
 def capped_ranks(site_sizes: Sequence[int], max_rank: int) -> list[int]:
+    """Bond ranks of a chain with the given site sizes (``m_k * n_k``).
+
+    Each inner rank is capped by ``max_rank`` and by the sizes of the two unfoldings it
+    separates, the largest rank that can carry information; anything above would only
+    add redundant parameters. The boundary ranks are 1.
+    """
     return [1] + [
         min(max_rank, math.prod(site_sizes[:bond]), math.prod(site_sizes[bond:]))
         for bond in range(1, len(site_sizes))
@@ -44,12 +68,24 @@ def capped_ranks(site_sizes: Sequence[int], max_rank: int) -> list[int]:
 
 
 def tensor_train_parameter_count(input_modes: Sequence[int], output_modes: Sequence[int], max_rank: int) -> int:
+    """Analytic parameter count of a :class:`TensorTrain` with the same arguments."""
     site_sizes = [m * n for m, n in zip(input_modes, output_modes)]
     ranks = capped_ranks(site_sizes, max_rank)
     return sum(ranks[k] * site_sizes[k] * ranks[k + 1] for k in range(len(site_sizes)))
 
 
 class TensorTrain(nn.Module):
+    """Matrix in tensor-train format mapping ``prod(input_modes)`` to ``prod(output_modes)`` values.
+
+    Args:
+        input_modes: Input mode size of each site.
+        output_modes: Output mode size of each site.
+        max_rank: Upper bound on every bond rank, see :func:`capped_ranks`.
+        target_variance: Variance of the materialized dense entries at initialization.
+            Each core receives an equal share, so the contracted product matches the
+            variance of a conventionally initialized dense layer.
+    """
+
     def __init__(
         self,
         input_modes: Sequence[int],
@@ -83,6 +119,11 @@ class TensorTrain(nn.Module):
             nn.init.normal_(core, std=math.sqrt(per_site_variance / core.shape[-1]))
 
     def materialize(self) -> torch.Tensor:
+        """Contract the cores into the dense ``(input_size, output_size)`` matrix.
+
+        The contraction runs in float32 even under autocast: the product of many small
+        cores loses too much precision in half precision.
+        """
         with torch.autocast(device_type=self.cores[0].device.type, enabled=False):
             result = self.cores[0].squeeze(0)
             for core in list(self.cores)[1:]:
@@ -94,6 +135,20 @@ class TensorTrain(nn.Module):
 
 
 class TTConv2d(nn.Module):
+    """2D convolution whose kernel is stored as a tensor train.
+
+    The first site holds the ``kernel_size x kernel_size`` spatial taps (omitted for a
+    1x1 kernel); the remaining sites hold the quantized input and output channels.
+
+    Args:
+        in_channels: Input channels; must be a power of two.
+        out_channels: Output channels; must be a power of two.
+        kernel_size: Odd square kernel size; padding keeps the spatial size.
+        max_rank: Upper bound on the bond ranks.
+        gain: Initialization gain; 2.0 matches Kaiming initialization for ReLU.
+        bias: Whether to add a learnable bias.
+    """
+
     def __init__(
         self,
         in_channels: int,
@@ -119,6 +174,7 @@ class TTConv2d(nn.Module):
         self.bias: Optional[nn.Parameter] = nn.Parameter(torch.zeros(out_channels)) if bias else None
 
     def weight(self) -> torch.Tensor:
+        """Dense convolution kernel of shape ``(out_channels, in_channels, k, k)``."""
         kernel_area = self.kernel_size * self.kernel_size
         return (
             self.chain.materialize()
@@ -132,6 +188,11 @@ class TTConv2d(nn.Module):
 
 
 def interleaved_site_roles(spatial_bits: int, channel_bits: int) -> tuple[str, ...]:
+    """Site order of an axial operator: spatial and channel bits alternate, most significant first.
+
+    Interleaving places the spatial and channel digits of the same scale next to each
+    other, so the chain runs from coarse to fine structure in both indices at once.
+    """
     roles = []
     for position in range(max(spatial_bits, channel_bits)):
         if position < spatial_bits:
@@ -142,6 +203,18 @@ def interleaved_site_roles(spatial_bits: int, channel_bits: int) -> tuple[str, .
 
 
 class QuantizedAxialOperator(nn.Module):
+    """Linear operator along one image axis on the joint (channel, position) index.
+
+    The ``bond_dim * spatial_size`` values of one image column (or row) are indexed by
+    the binary digits of the channel and the position, one chain site per digit. The
+    operator is a matrix product operator over those sites with bond rank ``max_rank``.
+
+    Args:
+        bond_dim: Latent channel width; must be a power of two.
+        spatial_size: Length of the mixed axis; must be a power of two.
+        max_rank: Bond dimension (chi) of the chain.
+    """
+
     def __init__(self, bond_dim: int, spatial_size: int, max_rank: int):
         super().__init__()
         self.bond_dim = bond_dim
@@ -164,6 +237,7 @@ class QuantizedAxialOperator(nn.Module):
         )
 
     def materialize(self) -> torch.Tensor:
+        """Dense operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
         return (
             self.chain.materialize()
             .reshape((2,) * (2 * len(self.site_roles)))

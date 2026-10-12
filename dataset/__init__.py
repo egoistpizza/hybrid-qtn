@@ -1,3 +1,5 @@
+"""YAML-driven segmentation datasets, deterministic splits and DataLoader worker seeding."""
+
 from .base import GenericSegmentationDataset
 from .groups import grouped_partition_indices, groups_for_samples, load_group_map
 from .loader import load_dataset, read_config

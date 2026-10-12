@@ -1,3 +1,10 @@
+"""Train a segmentation model with live validation, SWA and test-set-only reporting.
+
+Every epoch validates the live weights; the best live checkpoint is selected on
+validation Dice. Weights are averaged (SWA) over the final epochs, and both the best
+live and the SWA model are evaluated once on each test set after training.
+"""
+
 import argparse
 import logging
 import os
@@ -52,6 +59,8 @@ INTERRUPTED_CHECKPOINT = "interrupted_model.pth"
 
 @dataclass
 class TrainingConfig:
+    """Hyperparameters and run settings; logged to W&B as the run config."""
+
     model_type: str
     dataset: str
     loss: str
@@ -77,14 +86,18 @@ class TrainingConfig:
 
 
 def prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    """Prefix every metric name, e.g. ``dice`` -> ``val_dice``."""
     return {f"{prefix}_{name}": value for name, value in metrics.items()}
 
 
 def qualified_test_prefix(model_prefix: str, test_set: str) -> str:
+    """Metric prefix of one test set; the default set keeps the unqualified ``test_*`` keys."""
     return model_prefix if test_set == DEFAULT_TEST_SET else f"{model_prefix}_{test_set}"
 
 
 class SegmentationTrainer:
+    """Training loop with gradient accumulation, AMP, gradient clipping, SWA and W&B logging."""
+
     def __init__(
         self,
         model: nn.Module,
@@ -129,6 +142,7 @@ class SegmentationTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
     def train_epoch(self, epoch: int) -> float:
+        """One pass over the training set; returns the mean batch loss."""
         self.model.train()
         accumulation_steps = self.config.accumulation_steps
         total_loss = 0.0
@@ -156,6 +170,11 @@ class SegmentationTrainer:
         compute_hd95: bool,
         foreground_maps: bool = False,
     ) -> tuple[float, dict[str, float]]:
+        """Image-weighted loss and per-image metrics of ``model`` on ``loader``.
+
+        With ``foreground_maps``, the full-resolution foreground-map metrics are added;
+        batches must then carry ``metadata.mask_path``.
+        """
         model.eval()
         accumulator = MetricAccumulator(compute_hd95=compute_hd95)
         map_accumulator = ForegroundMapAccumulator() if foreground_maps else None
@@ -180,6 +199,7 @@ class SegmentationTrainer:
 
     @torch.no_grad()
     def _recompute_swa_batchnorm(self) -> None:
+        """Re-estimate BatchNorm statistics for the averaged weights with one pass over the training set."""
         self.swa_model.train()
         for module in self.swa_model.modules():
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
@@ -229,6 +249,7 @@ class SegmentationTrainer:
         self._save_if_best(val_metrics["dice"])
 
     def _finalize_swa(self) -> Optional[nn.Module]:
+        """Recompute BatchNorm, save and validate the SWA model; ``None`` if no epoch was averaged."""
         if self.swa_model.n_averaged.item() == 0:
             return None
         logger.info("Recomputing SWA BatchNorm statistics...")
@@ -239,6 +260,7 @@ class SegmentationTrainer:
         return self.swa_model
 
     def _report_test_metrics(self, swa_model: Optional[nn.Module]) -> None:
+        """Evaluate the best live and the SWA model once on every test set and store the results in the run summary."""
         self.model.load_state_dict(torch.load(self.checkpoint_dir / BEST_LIVE_CHECKPOINT, map_location=self.device))
         candidates = {"test_best_live": self.model}
         if swa_model is not None:
@@ -260,6 +282,7 @@ class SegmentationTrainer:
                 logger.info(" | ".join(f"{name}: {value:.4f}" for name, value in results.items()))
 
     def fit(self, run_name: str, total_params: int) -> None:
+        """Run training, SWA finalization and test reporting; an interrupt saves the current weights."""
         wandb.init(project="hybrid-qtn", config={**asdict(self.config), "total_params": total_params}, name=run_name)
         logger.info("Starting training...")
         try:
@@ -299,6 +322,7 @@ def build_criterion(config: TrainingConfig) -> nn.Module:
 
 
 def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
+    """Loader whose shuffling order and worker seeds both derive from ``seed``."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -311,6 +335,7 @@ def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) ->
 
 
 def log_parameter_breakdown(model: nn.Module) -> int:
+    """Log the parameter count of every top-level module and return the total."""
     total_params = sum(parameter.numel() for parameter in model.parameters())
     logger.info(f"Total parameters: {total_params:,}")
     for name, module in model.named_children():
@@ -319,8 +344,12 @@ def log_parameter_breakdown(model: nn.Module) -> int:
 
 
 def compile_with_warmup(model: nn.Module, config: TrainingConfig, device: torch.device) -> nn.Module:
+    """Compile the model and trigger compilation with one forward/backward pass; falls back to eager mode."""
     try:
         compiled_model = torch.compile(model)
+        # Warm up at the training shape, memory format and precision so the graph used for
+        # training is compiled. The output is not bound: holding it would keep the whole
+        # activation graph alive for the rest of the run.
         warmup_input = torch.randn(config.batch_size, 3, config.image_size, config.image_size, device=device)
         with torch.autocast(device.type, enabled=device.type == "cuda"):
             compiled_model(warmup_input.to(memory_format=torch.channels_last)).float().mean().backward()

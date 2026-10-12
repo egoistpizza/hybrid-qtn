@@ -1,3 +1,11 @@
+"""Analytic and measured parameter counts of the standard and the tensorized U-Net bottleneck.
+
+Every analytic total is checked against the instantiated model, so the reported numbers
+cannot drift from the implementation. Run as a module from the repository root:
+
+    python -m scripts.bottleneck_profiler --bond_dims 16 32 64
+"""
+
 import argparse
 from dataclasses import dataclass
 
@@ -20,6 +28,8 @@ BATCHNORM_PARAMETERS_PER_CHANNEL = 2
 
 @dataclass(frozen=True)
 class ParameterComponent:
+    """One layer of a profile with its parameter formula and count."""
+
     name: str
     formula: str
     count: int
@@ -27,6 +37,8 @@ class ParameterComponent:
 
 @dataclass(frozen=True)
 class BottleneckProfile:
+    """Ordered layer components of one bottleneck variant."""
+
     title: str
     components: tuple[ParameterComponent, ...]
 
@@ -50,6 +62,7 @@ def batchnorm_component(name: str, channels: int) -> ParameterComponent:
 
 
 def standard_bottleneck_profile(in_channels: int, channels: int) -> BottleneckProfile:
+    """Vanilla U-Net bottleneck: two bias-free 3x3 convolutions, each followed by BatchNorm."""
     return BottleneckProfile(
         title="Standard U-Net bottleneck (two 3×3 convolutions)",
         components=(
@@ -82,6 +95,7 @@ def axial_operator_component(name: str, bond_dim: int, spatial_size: int, max_ra
 
 
 def axial_mps_bottleneck_profile(in_channels: int, channels: int, bond_dim: int, spatial_size: int) -> BottleneckProfile:
+    """Tensorized bottleneck: TT-Conv3x3 entry stage followed by the MPS bottleneck block."""
     return BottleneckProfile(
         title=f"Tensorized Axial MPS bottleneck (D={bond_dim}, H=W={spatial_size}, χ={AXIAL_OPERATOR_RANK})",
         components=(
@@ -118,11 +132,13 @@ def measured_standard_bottleneck(image_size: int) -> int:
 
 
 def measured_axial_mps_bottleneck(bond_dim: int, image_size: int) -> int:
+    """Parameters of the hybrid model's entry stage plus its bottleneck transform."""
     model = build_segmentation_model("hybrid", bond_dim=bond_dim, image_size=image_size)
     return count_parameters(model.down4) + count_parameters(model.transform_1024)
 
 
 def verify_against_implementation(profile: BottleneckProfile, measured: int) -> None:
+    """Raise if the analytic total differs from the count of the instantiated model."""
     if profile.total != measured:
         raise AssertionError(
             f"Analytic count {profile.total:,} for '{profile.title}' disagrees with the implementation ({measured:,})."

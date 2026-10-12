@@ -1,3 +1,10 @@
+"""Albumentations pipelines built from YAML transform specs.
+
+Each spec is ``{name: <Albumentations class>, **kwargs}``; ``ToTensorV2`` is also accepted.
+Training and evaluation use separate pipelines (``train_transforms`` / ``eval_transforms``),
+with ``transforms`` as a shared fallback.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -49,6 +56,10 @@ def build_transforms_from_config(
     specs: list[dict] | None,
     seed: int = DEFAULT_AUGMENTATION_SEED,
 ) -> A.Compose:
+    """Compose the specs into one image/mask pipeline; an empty list gives the identity.
+
+    ``seed`` initializes the Albumentations RNG, which is independent of the global seeds.
+    """
     pipeline = [
         _resolve_transform(_spec_name(spec))(**{key: value for key, value in spec.items() if key != "name"})
         for spec in specs or []
@@ -57,12 +68,18 @@ def build_transforms_from_config(
 
 
 def stage_transform_specs(config: dict[str, Any], stage: str) -> list[dict]:
+    """Specs of ``stage``, falling back to the shared ``transforms`` key."""
     if stage not in STAGES:
         raise ValueError(f"Unknown stage {stage!r}. Expected one of {STAGES}.")
     return config.get(f"{stage}_transforms", config.get(SHARED_TRANSFORMS_KEY)) or []
 
 
 def assert_deterministic_pipeline(specs: list[dict]) -> None:
+    """Reject random transforms, so validation and test scores are reproducible.
+
+    Raises:
+        ValueError: If a spec is not in ``DETERMINISTIC_TRANSFORMS``.
+    """
     stochastic = [_spec_name(spec) for spec in specs if _spec_name(spec) not in DETERMINISTIC_TRANSFORMS]
     if stochastic:
         raise ValueError(

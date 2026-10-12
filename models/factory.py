@@ -1,3 +1,5 @@
+"""Model construction shared by training, evaluation, export and the parameter profiler."""
+
 import torch.nn as nn
 
 from models.mps_layer import MPSBottleneck
@@ -12,6 +14,7 @@ PRE_BOTTLENECK_CHANNELS = 512
 
 
 def spatial_size_at(image_size: int, downsampling_factor: int) -> int:
+    """Feature-map side length after ``downsampling_factor`` for a square input."""
     if image_size % BOTTLENECK_DOWNSAMPLING_FACTOR != 0:
         raise ValueError(
             f"image_size must be divisible by {BOTTLENECK_DOWNSAMPLING_FACTOR}, got {image_size}"
@@ -24,6 +27,15 @@ def build_mps_bottleneck(channels: int, bond_dim: int, spatial_size: int) -> MPS
 
 
 def build_segmentation_model(model_type: str, bond_dim: int, image_size: int = 512) -> nn.Module:
+    """Build a segmentation network.
+
+    Args:
+        model_type: ``vanilla`` (plain U-Net), ``hybrid`` (MPS bottleneck at 1024 channels)
+            or ``deep_hybrid`` (MPS blocks at 512 and 1024 channels).
+        bond_dim: Latent width D of the MPS blocks; ignored for ``vanilla``.
+        image_size: Square input size. The MPS blocks are sized to the resulting feature
+            maps, so hybrid models only accept inputs of this size.
+    """
     if model_type not in MODEL_TYPES:
         raise ValueError(f"Unknown model_type {model_type!r}. Expected one of {MODEL_TYPES}.")
 

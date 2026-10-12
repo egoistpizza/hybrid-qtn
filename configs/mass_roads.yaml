@@ -1,3 +1,12 @@
+# Massachusetts Roads dataset config
+#
+# Layout expected after running `python scripts/download_mass_roads.py`:
+#   data/mass_roads/images/*.tiff
+#   data/mass_roads/masks/*.tif
+#
+# 1,171 aerial tiles of 1500x1500 pixels. Training uses random 512x512 crops;
+# validation and test use the deterministic centre crop.
+
 dataset_name: mass_roads
 
 images_dir: data/mass_roads/images

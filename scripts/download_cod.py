@@ -1,3 +1,16 @@
+"""Download and arrange the camouflaged object detection (COD) benchmark.
+
+Fetches the training and testing archives released with SINet-V2 (Fan et al., TPAMI 2022)
+and arranges them as::
+
+    data/cod/train/{cod10k,camo}/{images,masks}
+    data/cod/test/{cod10k,camo,chameleon,nc4k}/{images,masks}
+
+The training archive mixes COD10K-train and CAMO-train in one folder; samples are
+assigned to their source by filename prefix. Existing archives of the expected size
+are reused, and the final layout is checked against the official image counts.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -43,6 +56,7 @@ TEST_ARCHIVE = Archive("COD-TestDataset.zip", "1V0iSEdYJrT0Y_DHZfVGMg6TySFRNTy4o
 
 
 def download_archive(archive: Archive, directory: Path) -> Path:
+    """Download ``archive`` from Google Drive into ``directory`` unless a complete copy exists."""
     destination = directory / archive.filename
     if destination.is_file() and destination.stat().st_size == archive.size_bytes:
         print(f"Using existing {destination}")
@@ -76,6 +90,13 @@ def _train_source(filename: str) -> str:
 
 
 def destination_for(member: str) -> Optional[PurePosixPath]:
+    """Relative target path of an archive member, or ``None`` for members that are not kept.
+
+    Directories, macOS metadata, edge maps and instance masks are skipped.
+
+    Raises:
+        ValueError: For a training file of unknown source or a file of unexpected type.
+    """
     parts = PurePosixPath(member).parts
     if member.endswith("/") or not parts or parts[0] not in (TRAIN_ARCHIVE.root, TEST_ARCHIVE.root):
         return None
@@ -96,6 +117,7 @@ def destination_for(member: str) -> Optional[PurePosixPath]:
 
 
 def extract_archive(archive_path: Path, data_root: Path) -> None:
+    """Extract the kept members of an archive into the normalized layout under ``data_root``."""
     with zipfile.ZipFile(archive_path) as archive:
         members = [(member, destination_for(member)) for member in archive.namelist()]
         selected = [(member, destination) for member, destination in members if destination is not None]
@@ -107,6 +129,11 @@ def extract_archive(archive_path: Path, data_root: Path) -> None:
 
 
 def verify_layout(data_root: Path) -> None:
+    """Check pairing and image counts of every set.
+
+    Raises:
+        RuntimeError: Listing every set with unpaired files or an unexpected count.
+    """
     problems = []
     for relative, expected in EXPECTED_COUNTS.items():
         images = {path.stem for path in (data_root / relative / "images").glob(f"*{IMAGE_SUFFIX}")}

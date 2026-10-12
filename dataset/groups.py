@@ -1,3 +1,18 @@
+"""Group-aware splitting for datasets whose samples are not independent.
+
+CVC-ClinicDB contains 612 frames from 29 colonoscopy sequences. Frames of one sequence
+show the same polyp from nearly the same pose, so a frame-level random split places
+near-duplicates on both sides: on the seed-42 split, every validation frame had a
+same-sequence sibling in training. A dataset opts in with a ``group_map`` block::
+
+    group_map:
+      csv: configs/cvc_clinicdb_sequences.csv
+      sample_column: sample_id
+      group_column: sequence_id
+
+Datasets without the block keep the plain random split.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -9,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_group_map(spec: dict[str, Any], root: str | Path | None = None) -> dict[str, str]:
+    """Read the ``sample_id -> group_id`` mapping from the CSV named by a ``group_map`` spec."""
     root = Path(root) if root is not None else REPO_ROOT
     csv_path = Path(spec["csv"])
     if not csv_path.is_absolute():
@@ -43,6 +59,11 @@ def groups_for_samples(
     spec: dict[str, Any],
     root: str | Path | None = None,
 ) -> list[str]:
+    """Group of every sample, in dataset order.
+
+    Raises:
+        KeyError: If a sample has no group; falling back to frame-level assignment would leak.
+    """
     mapping = load_group_map(spec, root)
     sample_ids = list(sample_ids)
     unknown = [sample_id for sample_id in sample_ids if sample_id not in mapping]
@@ -71,6 +92,21 @@ def grouped_partition_indices(
     holdout_fractions: Sequence[float],
     seed: int,
 ) -> tuple[list[int], ...]:
+    """Partition indices so that every group lands in exactly one partition.
+
+    Groups are shuffled from sorted order (deterministic across platforms); each holdout
+    partition takes the prefix of remaining groups whose sample count is closest to its
+    target. Because whole groups move together, realized fractions only approximate the
+    targets, and every partition keeps at least one group.
+
+    Args:
+        groups: Group id of every sample.
+        holdout_fractions: Target fractions of the holdout partitions, e.g. ``(val, test)``.
+        seed: Shuffle seed.
+
+    Returns:
+        ``(train, *holdouts)`` index lists, each sorted.
+    """
     if not holdout_fractions or any(not 0.0 < fraction < 1.0 for fraction in holdout_fractions):
         raise ValueError(f"holdout fractions must each lie in (0, 1), got {list(holdout_fractions)}")
     if sum(holdout_fractions) >= 1.0:

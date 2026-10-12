@@ -1,3 +1,12 @@
+"""Download and extract the Kvasir-SEG dataset (1,000 polyp images with masks) from Simula.
+
+Result:
+
+    data/kvasir-seg/kvasir-seg.zip
+    data/kvasir-seg/Kvasir-SEG/images/*.jpg
+    data/kvasir-seg/Kvasir-SEG/masks/*.jpg
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -153,6 +162,11 @@ def _download_with_requests(url: str, dest: Path, insecure_no_verify: bool, chun
 
 
 def _download(url: str, dest: Path) -> None:
+    """Try curl, then requests, then urllib, then both without certificate verification.
+
+    datasets.simula.no has served an incomplete TLS certificate chain, which the Python
+    clients can reject; unverified downloads are therefore only the last resort.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     logger.debug(f"\x1b[38;5;240mdownload_kvasir_seg.py::_download(url={url}, dest={dest})\x1b[0m")
     
@@ -209,6 +223,7 @@ def _extract(archive: Path, dest: Path) -> None:
 
 
 def download_kvasir_seg(dest: Path, force: bool = False) -> Path:
+    """Download and extract Kvasir-SEG into ``dest`` unless it is already present; returns the dataset directory."""
     dest = dest.expanduser().resolve()
     dest.mkdir(parents=True, exist_ok=True)
     archive = dest / ARCHIVE_NAME

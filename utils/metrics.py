@@ -1,3 +1,5 @@
+"""Per-image segmentation metrics on binarized predictions at network resolution."""
+
 import numpy as np
 import torch
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
@@ -8,6 +10,7 @@ HD95_PERCENTILE = 95
 
 
 def binarize(logits: torch.Tensor) -> torch.Tensor:
+    """Foreground where the sigmoid probability exceeds ``PREDICTION_THRESHOLD``."""
     return (torch.sigmoid(logits.float()) > PREDICTION_THRESHOLD).float()
 
 
@@ -16,6 +19,7 @@ def calculate_mae(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 
 def calculate_f2_score(preds: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
+    """F-beta score with beta = 2, weighting recall above precision."""
     tp = (preds * targets).sum(dim=(2, 3))
     fp = (preds * (1.0 - targets)).sum(dim=(2, 3))
     fn = ((1.0 - preds) * targets).sum(dim=(2, 3))
@@ -29,6 +33,11 @@ def _border(mask: np.ndarray, structure: np.ndarray) -> np.ndarray:
 
 
 def hd95_per_image(preds: torch.Tensor, targets: torch.Tensor) -> list[float]:
+    """95th-percentile symmetric Hausdorff distance between mask borders, in pixels.
+
+    Images where both masks are empty are skipped; images where exactly one is empty
+    score the image diagonal, the largest possible distance.
+    """
     preds_np = preds.detach().cpu().numpy().astype(bool)
     targets_np = targets.detach().cpu().numpy().astype(bool)
     structure = generate_binary_structure(2, 1)
@@ -79,6 +88,8 @@ def calculate_all_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: f
 
 
 class MetricAccumulator:
+    """Running per-image averages of Dice, IoU, MAE, F2 and, optionally, HD95 over batches."""
+
     def __init__(self, compute_hd95: bool = False) -> None:
         self.compute_hd95 = compute_hd95
         self._overlap_totals = {name: 0.0 for name in METRIC_NAMES if name != "hd95"}

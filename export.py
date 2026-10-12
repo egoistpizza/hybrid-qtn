@@ -1,3 +1,5 @@
+"""ONNX export of a segmentation model and a PyTorch vs ONNX Runtime throughput benchmark."""
+
 import argparse
 import time
 from pathlib import Path
@@ -11,6 +13,7 @@ from utils import get_device
 
 
 def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tensor, total_iterations: int = 100) -> float:
+    """Forward passes per second in PyTorch after 10 warm-up passes."""
     model.eval()
     compute_device = dummy_input.device
     
@@ -37,6 +40,7 @@ def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tens
     return frames_per_second
 
 def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarray, total_iterations: int = 100) -> float:
+    """Forward passes per second in ONNX Runtime (CUDA if available) after 10 warm-up passes."""
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     
@@ -61,6 +65,7 @@ def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarra
     return frames_per_second
 
 def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, output_file_path: Path) -> None:
+    """Export with opset 18 and a dynamic batch dimension; the spatial size stays fixed."""
     model.eval()
     
     torch.onnx.export(

@@ -1,3 +1,5 @@
+"""Per-worker seeding of DataLoader workers, including the Albumentations RNG."""
+
 from __future__ import annotations
 
 import random
@@ -12,6 +14,7 @@ from .base import GenericSegmentationDataset
 
 
 def iter_segmentation_datasets(dataset: Dataset) -> Iterator[GenericSegmentationDataset]:
+    """Yield every :class:`GenericSegmentationDataset` nested in ``Subset`` / ``ConcatDataset`` wrappers."""
     if isinstance(dataset, GenericSegmentationDataset):
         yield dataset
     elif isinstance(dataset, Subset):
@@ -22,6 +25,11 @@ def iter_segmentation_datasets(dataset: Dataset) -> Iterator[GenericSegmentation
 
 
 def seed_dataloader_worker(worker_id: int) -> None:
+    """``worker_init_fn`` that derives each worker's seed from the loader's seeded generator.
+
+    Albumentations keeps its own RNG, so the datasets in the worker are reseeded as well;
+    otherwise every worker would replay the same augmentations.
+    """
     worker_seed = derived_worker_seed()
     random.seed(worker_seed)
     np.random.seed(worker_seed)

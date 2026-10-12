@@ -1,3 +1,3 @@
 
-""" Other utility function and variables shared across the project """
+"""Utility functions and variables shared across the project."""
 

@@ -1,3 +1,23 @@
+"""Download, extract and normalize the CVC-ClinicDB dataset.
+
+CVC-ClinicDB holds 612 frames from 29 colonoscopy sequences (Bernal et al., 2015). The
+official page only offers a Google Drive link to a .rar archive, which cannot be
+scripted, so three sources are supported:
+
+    --source kaggle   (default) the Kaggle mirror balraj98/cvcclinicdb, via the kaggle CLI
+    --source url      any direct HTTP(S) archive link given with --url
+    --source local    an archive downloaded manually, given with --archive
+
+The archive is extracted, its folders are moved to the layout expected by
+configs/cvc_clinicdb.yaml, and the result is verified:
+
+    data/cvc-clinicdb/CVC-ClinicDB/Original/
+    data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/
+
+Mirrors differ in file format (.tif in the official release, .png in several mirrors);
+the verification prints the extensions found so the YAML can be set accordingly.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -41,6 +61,7 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 def _download_with_curl(url: str, dest: Path) -> bool:
+    """Download with curl; ``False`` if curl is unavailable or the download failed."""
     curl = shutil.which("curl")
     if curl is None:
         return False
@@ -60,6 +81,7 @@ def _download_with_curl(url: str, dest: Path) -> bool:
 
 
 def _download(url: str, dest: Path, chunk: int = 1 << 20) -> None:
+    """Download ``url`` to ``dest``, trying curl first and urllib second."""
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if _download_with_curl(url, dest):
@@ -95,6 +117,7 @@ def _download(url: str, dest: Path, chunk: int = 1 << 20) -> None:
 
 
 def _download_from_kaggle(dest: Path) -> Path:
+    """Fetch the Kaggle mirror with the ``kaggle`` CLI and return the downloaded archive."""
     kaggle = shutil.which("kaggle")
     if kaggle is None:
         raise RuntimeError(
@@ -130,6 +153,7 @@ def _download_from_kaggle(dest: Path) -> Path:
 
 
 def _extract_rar(archive: Path, dest: Path) -> None:
+    """Extract a .rar archive with the ``rarfile`` module, or with an external unrar / 7z."""
     try:
         import rarfile
 
@@ -185,6 +209,11 @@ def _count_images(directory: Path) -> int:
 
 
 def _find_layout(root: Path) -> tuple[Path, Path]:
+    """Locate the image and mask directories in an extracted tree.
+
+    Searches for a directory with one image-named and one mask-named subdirectory (see the
+    alias sets) and keeps the pair containing the most image files.
+    """
     best: tuple[int, Path, Path] | None = None
 
     for parent in [root, *(p for p in root.rglob("*") if p.is_dir())]:
@@ -219,6 +248,7 @@ def _find_layout(root: Path) -> tuple[Path, Path]:
 
 
 def _normalize_layout(dest: Path) -> Path:
+    """Move the discovered image and mask directories into the canonical layout."""
     extracted = dest / EXTRACTED_MARKER
     target_images = extracted / IMAGES_SUBDIR
     target_masks = extracted / MASKS_SUBDIR
@@ -242,6 +272,7 @@ def _normalize_layout(dest: Path) -> Path:
 
 
 def _verify(extracted: Path) -> None:
+    """Report pair counts, unpaired files and the dominant extensions to set in the YAML."""
     images_dir = extracted / IMAGES_SUBDIR
     masks_dir = extracted / MASKS_SUBDIR
 

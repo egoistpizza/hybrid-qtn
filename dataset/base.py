@@ -1,3 +1,16 @@
+"""Config-driven binary segmentation dataset.
+
+Each item is a dict::
+
+    {
+        "image": FloatTensor (C, H, W),
+        "mask": FloatTensor (1, H, W) with values in {0, 1},
+        "metadata": {image_path, mask_path, sample_id, original_size, dataset_name, index},
+    }
+
+``sample_id`` is the filename stem and ``original_size`` the ``(H, W)`` of the image on disk.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -20,6 +33,18 @@ from .transforms import (
 
 
 class GenericSegmentationDataset(Dataset):
+    """Image/mask pairs matched by filename stem, transformed by the pipeline of one stage.
+
+    Config keys: ``dataset_name``, ``images_dir``, ``masks_dir``, ``image_ext``, ``mask_ext``,
+    ``strict_pairing`` (default ``True``), ``mask_threshold`` (default 127; raw mask values
+    above it are foreground), ``align_mask_to_image`` (default ``False``) and the
+    ``train_transforms`` / ``eval_transforms`` / ``transforms`` pipelines.
+
+    Args:
+        config: Parsed dataset YAML.
+        stage: ``train`` or ``eval``; the ``eval`` pipeline must be deterministic.
+    """
+
     def __init__(self, config: dict[str, Any], stage: str = TRAIN_STAGE) -> None:
         self.config = config
         self.dataset_name: str = config["dataset_name"]
@@ -42,11 +67,13 @@ class GenericSegmentationDataset(Dataset):
         self.transform = build_transforms_from_config(specs, seed=DEFAULT_AUGMENTATION_SEED)
 
     def with_stage(self, stage: str) -> GenericSegmentationDataset:
+        """Shallow copy sharing the sample list but using the pipeline of ``stage``."""
         staged = copy.copy(self)
         staged._apply_stage(stage)
         return staged
 
     def reseed_augmentations(self, seed: int) -> None:
+        """Reseed the Albumentations RNG, which does not follow the global seeds."""
         self.transform.set_random_seed(seed)
 
     def __len__(self) -> int:
@@ -62,6 +89,7 @@ class GenericSegmentationDataset(Dataset):
         return (raw > self.mask_threshold).astype(np.uint8)
 
     def _match_image_frame(self, mask: np.ndarray, image: np.ndarray, sample_id: str) -> np.ndarray:
+        """Return the mask in the image frame; resize it (nearest) only if the config allows it."""
         height, width = image.shape[:2]
         if mask.shape == (height, width):
             return mask

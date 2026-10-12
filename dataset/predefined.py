@@ -1,3 +1,11 @@
+"""Splits for benchmarks that ship official training and test folders.
+
+A config declares named ``sources`` (each an ``images_dir`` / ``masks_dir`` pair), the
+``train_sources`` and ``test_sources`` among them, and a ``validation_fraction``.
+Validation is carved from each training source, so the official test sets are never
+used for model selection, and each test source is reported as its own test set.
+"""
+
 from __future__ import annotations
 
 import warnings
@@ -19,6 +27,11 @@ INCOMPATIBLE_KEYS = ("group_map", *SOURCE_DIRECTORY_KEYS)
 
 
 def declares_predefined_splits(config: dict[str, Any]) -> bool:
+    """Whether the config uses predefined splits.
+
+    Raises:
+        ValueError: If only some of the required keys are present.
+    """
     present = [key for key in PREDEFINED_SPLIT_KEYS if key in config]
     if present and len(present) != len(PREDEFINED_SPLIT_KEYS):
         missing = sorted(set(PREDEFINED_SPLIT_KEYS) - set(present))
@@ -50,6 +63,7 @@ def _validate(config: dict[str, Any]) -> None:
 
 
 def source_dataset(config: dict[str, Any], source: str, stage: str) -> GenericSegmentationDataset:
+    """Dataset of one source; source keys override the shared config keys."""
     shared = {key: value for key, value in config.items() if key not in PREDEFINED_SPLIT_KEYS}
     return GenericSegmentationDataset(
         {**shared, **config[SOURCES_KEY][source], "dataset_name": f"{config['dataset_name']}/{source}"},
@@ -62,6 +76,7 @@ def _sample_ids(dataset: GenericSegmentationDataset) -> set[str]:
 
 
 def _indices_outside(dataset: GenericSegmentationDataset, held_out_ids: set[str]) -> list[int]:
+    """Indices of samples whose stem does not occur in a test source."""
     kept = [index for index, (_, _, sample_id) in enumerate(dataset.samples) if sample_id not in held_out_ids]
     excluded = len(dataset) - len(kept)
     if excluded:
@@ -74,6 +89,11 @@ def _indices_outside(dataset: GenericSegmentationDataset, held_out_ids: set[str]
 
 
 def carve_validation(indices: list[int], fraction: float, seed: int) -> tuple[list[int], list[int]]:
+    """Randomly move ``round(fraction * len(indices))`` indices to validation.
+
+    Returns:
+        Sorted ``(train, validation)`` index lists.
+    """
     order = torch.randperm(len(indices), generator=torch.Generator().manual_seed(seed)).tolist()
     validation_size = round(fraction * len(indices))
     shuffled = [indices[position] for position in order]
@@ -83,6 +103,12 @@ def carve_validation(indices: list[int], fraction: float, seed: int) -> tuple[li
 def predefined_split_datasets(
     config: dict[str, Any], seed: int
 ) -> tuple[Dataset, Dataset, dict[str, GenericSegmentationDataset]]:
+    """Build the training set, the validation set and the named test sets.
+
+    Training samples whose stem also appears in a test source are excluded with a
+    warning before validation is carved, so no test image reaches training or
+    model selection.
+    """
     _validate(config)
     test_sets = {source: source_dataset(config, source, EVAL_STAGE) for source in config[TEST_SOURCES_KEY]}
     held_out_ids = set().union(*(_sample_ids(dataset) for dataset in test_sets.values()))

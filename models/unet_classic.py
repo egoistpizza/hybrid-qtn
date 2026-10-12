@@ -1,7 +1,11 @@
+"""Baseline U-Net (Ronneberger et al., 2015) with bilinear upsampling and a 1024-channel bottleneck."""
+
 import torch
 import torch.nn as nn
 
 class DoubleConv(nn.Module):
+    """Two ``Conv3x3 -> BatchNorm -> ReLU`` blocks; padding keeps the spatial size."""
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.double_conv = nn.Sequential(
@@ -17,6 +21,10 @@ class DoubleConv(nn.Module):
         return self.double_conv(x)
 
 class UpBlock(nn.Module):
+    """Decoder stage: bilinear 2x upsampling and a 1x1 channel reduction, then concatenation
+    with the encoder skip features and a :class:`DoubleConv`.
+    """
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
         
@@ -27,11 +35,14 @@ class UpBlock(nn.Module):
         self.conv = DoubleConv(in_channels, out_channels)
 
     def forward(self, x1, x2):
+        """Upsample ``x1`` and fuse it with the skip connection ``x2``."""
         x1 = self.up(x1)
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
 class UNet(nn.Module):
+    """Four-level U-Net (64 to 1024 channels) returning per-pixel logits."""
+
     def __init__(self, in_channels=3, out_channels=1):
         super().__init__()
         

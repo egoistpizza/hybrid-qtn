@@ -1,7 +1,10 @@
+"""Process-level setup that must run before the training or evaluation entry points."""
+
 import logging.config
 import os
 
 def init():
+    """Configure logging, silence Albumentations version checks and enable the Inductor cache."""
     init_logger_basicconfig()
     disable_albumentations_update_checks()
     init_torch_cache()
@@ -11,6 +14,7 @@ def disable_albumentations_update_checks():
     os.environ['ALBUMENTATIONS_DISABLE_VERSION_CHECK'] = '1'
 
 def init_torch_cache():
+    """Persist compiled Inductor graphs under ``cache/torch_cache`` so later runs skip recompilation."""
     logger = logging.getLogger(__name__)
     
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
@@ -23,6 +27,7 @@ def init_torch_cache():
     logger.debug(f"\x1b[38;5;240mTorch cache will be saved to: {os.environ['TORCHINDUCTOR_CACHE_DIR']}\x1b[0m")
 
 def init_logger_basicconfig():
+    """Console logging; project loggers use ``LOG_LEVEL`` (default DEBUG), PIL, matplotlib and urllib3 WARNING."""
     log_level = os.environ.get("LOG_LEVEL", "DEBUG").upper()
     
     logging_config = {

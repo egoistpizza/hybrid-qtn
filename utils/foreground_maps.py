@@ -1,3 +1,13 @@
+"""Foreground-map metrics of the salient and camouflaged object detection benchmarks.
+
+S-measure (Fan et al., ICCV 2017), mean E-measure (Fan et al., IJCAI 2018), weighted
+F-measure (Margolin et al., CVPR 2014) and MAE are computed per image on the uint8
+probability map at the original ground-truth resolution, and averaged over images.
+The implementation reproduces the reference MATLAB toolbox conventions as implemented
+in PySODMetrics 1.6.2: the prediction is min-max normalized per image, the ground truth
+is thresholded at 128, and the E-measure curve uses 256 thresholds.
+"""
+
 from __future__ import annotations
 
 from typing import Iterator, Sequence
@@ -21,28 +31,33 @@ FOREGROUND_MAP_METRIC_NAMES = ("s_measure", "e_measure", "wf_measure", "map_mae"
 
 
 def probability_map(logits: torch.Tensor, size: tuple[int, int]) -> np.ndarray:
+    """Resize ``(1, h, w)`` logits bilinearly to ``size`` and return the sigmoid map as uint8."""
     resized = F.interpolate(logits.float()[None], size=size, mode="bilinear", align_corners=False)[0, 0]
     return np.rint(torch.sigmoid(resized).cpu().numpy() * INTENSITY_LEVELS).astype(np.uint8)
 
 
 def read_ground_truth(path: str) -> np.ndarray:
+    """Ground-truth mask as an uint8 grayscale array, at its original resolution."""
     with Image.open(path) as mask:
         return np.array(mask.convert("L"), dtype=np.uint8)
 
 
 def full_resolution_maps(logits: torch.Tensor, mask_paths: Sequence[str]) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield ``(prediction, ground_truth)`` uint8 pairs, each prediction resized to its mask."""
     for image_logits, mask_path in zip(logits, mask_paths, strict=True):
         ground_truth = read_ground_truth(mask_path)
         yield probability_map(image_logits, ground_truth.shape), ground_truth
 
 
 def normalize_prediction(prediction: np.ndarray) -> np.ndarray:
+    """Scale an uint8 map to [0, 1] and min-max normalize it; constant maps are only scaled."""
     scaled = prediction.astype(np.float64) / INTENSITY_LEVELS
     lowest, highest = scaled.min(), scaled.max()
     return (scaled - lowest) / (highest - lowest) if highest != lowest else scaled
 
 
 def binarize_ground_truth(ground_truth: np.ndarray) -> np.ndarray:
+    """Foreground mask of an uint8 ground truth, using the benchmark threshold."""
     return ground_truth > GROUND_TRUTH_THRESHOLD
 
 
@@ -84,6 +99,7 @@ def _region_score(prediction: np.ndarray, ground_truth: np.ndarray) -> float:
     height, width = ground_truth.shape
     area = height * width
     centroid_row, centroid_column = np.argwhere(ground_truth).mean(axis=0).round()
+    # One-based like the MATLAB reference, whose quadrant ranges 1:X include X.
     row, column = int(centroid_row) + 1, int(centroid_column) + 1
 
     quadrants = (
@@ -100,6 +116,11 @@ def _region_score(prediction: np.ndarray, ground_truth: np.ndarray) -> float:
 
 
 def structure_measure(prediction: np.ndarray, ground_truth: np.ndarray) -> float:
+    """S-measure: equal blend of object-aware and region-aware structural similarity.
+
+    Empty quadrants carry zero weight and contribute nothing, where the reference
+    implementation returns NaN.
+    """
     foreground_ratio = np.mean(ground_truth)
     if foreground_ratio == 0:
         return float(1.0 - np.mean(prediction))
@@ -116,6 +137,11 @@ def _enhanced_alignment(prediction_value: np.ndarray, target_value: float) -> np
 
 
 def enhanced_alignment_curve(prediction: np.ndarray, ground_truth: np.ndarray) -> np.ndarray:
+    """E-measure at each of the 256 thresholds, from the highest threshold to the lowest.
+
+    Pixel counts per threshold come from cumulative histograms, so all thresholds are
+    evaluated in one pass; the mean of the curve is the reported mean E-measure.
+    """
     levels = (prediction * INTENSITY_LEVELS).astype(np.uint8)
     bin_edges = np.linspace(0, ALIGNMENT_THRESHOLD_COUNT, ALIGNMENT_THRESHOLD_COUNT + 1)
     true_positives = np.cumsum(np.flip(np.histogram(levels[ground_truth], bins=bin_edges)[0]))
@@ -154,6 +180,11 @@ def _gaussian_kernel(size: int, sigma: float) -> np.ndarray:
 
 
 def weighted_f_measure(prediction: np.ndarray, ground_truth: np.ndarray) -> float:
+    """Weighted F-measure with distance-dependent error weights; 0 for an empty ground truth.
+
+    Background errors take the error of the nearest foreground pixel and are smoothed with
+    a Gaussian, and errors far from the object are weighted more heavily.
+    """
     if not ground_truth.any():
         return 0.0
     background = ~ground_truth
@@ -182,6 +213,8 @@ def weighted_f_measure(prediction: np.ndarray, ground_truth: np.ndarray) -> floa
 
 
 class ForegroundMapAccumulator:
+    """Accumulates S-measure, E-measure, weighted F-measure and MAE over uint8 map pairs."""
+
     def __init__(self) -> None:
         self._structure_scores: list[float] = []
         self._alignment_curves: list[np.ndarray] = []
