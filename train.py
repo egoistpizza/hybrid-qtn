@@ -74,6 +74,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     swa_start_pct: float = 0.75
     swa_lr: float = 5e-5
+    deterministic: bool = False
     checkpoint_dir: str = str(CHECKPOINT_ROOT)
 
     @property
@@ -285,6 +286,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--fp_weight", type=float, default=TVERSKY_FP_WEIGHT, help="Focal Tversky weight on false positives")
     parser.add_argument("--focal_gamma", type=float, default=FOCAL_TVERSKY_GAMMA, help="Focal Tversky gamma; the loss exponent is 1/gamma")
     parser.add_argument("--seed", type=int, default=42, help="Training seed; the data split seed stays fixed")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use deterministic GPU kernels for bit-identical reruns on the same GPU type (about 4x slower)",
+    )
     parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Comma-separated dataset configs. Available: {available}")
     parser.add_argument("--tag", type=str, default=None, help="Suffix to distinguish runs of the same config")
     return parser.parse_args()
@@ -336,7 +342,7 @@ def main() -> None:
     init()
     arguments = parse_arguments()
     dataset_names = parse_dataset_arg(arguments.dataset)
-    seed_everything(arguments.seed)
+    seed_everything(arguments.seed, deterministic_algorithms=arguments.deterministic)
     device = get_device()
     splits = build_splits(dataset_names)
     dataset_slug = slugify_dataset_arg(dataset_names)
@@ -354,6 +360,7 @@ def main() -> None:
         fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
         image_size=splits.image_size,
+        deterministic=arguments.deterministic,
         checkpoint_dir=str(CHECKPOINT_ROOT / run_name),
     )
 

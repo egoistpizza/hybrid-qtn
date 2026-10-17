@@ -158,6 +158,7 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 | `--epochs` | 100 |
 | `--batch_size` | 4 |
 | `--seed` | 42 |
+| `--deterministic` | off; deterministic GPU kernels for bit-identical reruns on the same GPU type, about 4× slower |
 | `--tag` | free-form run suffix |
 
 Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__tag]/`:
@@ -205,9 +206,10 @@ Run all commands from the repository root. Invoke the profiler as a module: `pyt
 
 ## 5. Reproducibility notes
 
-- `utils/seed.py` seeds Python, NumPy and PyTorch, enables `torch.use_deterministic_algorithms` (warn-only), disables cuDNN benchmarking and sets `CUBLAS_WORKSPACE_CONFIG`.
+- `utils/seed.py` seeds Python, NumPy and PyTorch, makes cuDNN deterministic and disables cuDNN benchmarking.
 - Albumentations keeps its own RNG, so augmentations are reseeded per DataLoader worker from the seeded loader generator.
-- Bit-exact GPU reproducibility is still not guaranteed: some CUDA kernels (e.g. the bilinear-upsampling backward pass) have no deterministic implementation, and `torch.compile` and mixed precision can change reduction order across GPU models. This residual variance is why every configuration is reported over multiple seeds.
+- By default, GPU kernels such as the bilinear-upsampling backward pass accumulate in a non-deterministic order, so two runs with the same seed differ slightly. `--deterministic` enables `torch.use_deterministic_algorithms` and sets `CUBLAS_WORKSPACE_CONFIG`; reruns on the same GPU type are then bit-identical, but a training step is about four times slower. Results never match bit for bit across GPU types.
+- This run-to-run variance is why every configuration is reported as mean ± standard deviation over multiple seeds, and why each vanilla/hybrid pair runs on the same GPU type with the same setting.
 
 ---
 

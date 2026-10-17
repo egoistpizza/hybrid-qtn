@@ -28,11 +28,18 @@ def test_seed_everything_reproduces_all_generators():
     assert torch.equal(first[2], second[2])
 
 
-def test_seed_everything_enables_deterministic_backends():
+def test_seed_everything_fixes_cudnn_and_leaves_deterministic_algorithms_off_by_default():
     seed_everything(0)
     assert torch.backends.cudnn.deterministic is True
     assert torch.backends.cudnn.benchmark is False
+    assert not torch.are_deterministic_algorithms_enabled()
+
+
+def test_seed_everything_enables_deterministic_algorithms_on_request():
+    seed_everything(0, deterministic_algorithms=True)
     assert torch.are_deterministic_algorithms_enabled()
+    seed_everything(0)
+    assert not torch.are_deterministic_algorithms_enabled()
 
 
 def test_different_seeds_produce_different_streams():
