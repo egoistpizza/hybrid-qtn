@@ -1,22 +1,14 @@
-import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from types import SimpleNamespace
-
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-import train
-from train import SegmentationTrainer, TrainingConfig
+from dataset import DatasetSplits, Denormalization, EvaluationSet
+from tests.synthetic import MaskFileSamples, small_model
+from train import SegmentationTrainer, TrainingConfig, compile_with_warmup
 from utils.loss import FocalTverskyLoss
 
 
@@ -33,31 +25,19 @@ class SquareDataset(Dataset):
         return {"image": mask.repeat(3, 1, 1) + 0.1 * torch.randn(3, 16, 16), "mask": mask}
 
 
-class MaskFileDataset(SquareDataset):
-    def __init__(self, size: int, directory: Path) -> None:
-        super().__init__(size)
-        self.mask_paths = []
-        for index in range(size):
-            path = directory / f"mask_{index}.png"
-            ground_truth = np.zeros((24 + index, 20), np.uint8)
-            ground_truth[6:18, 5:15] = 255
-            Image.fromarray(ground_truth).save(path)
-            self.mask_paths.append(str(path))
-
-    def __getitem__(self, index: int) -> dict:
-        return {**super().__getitem__(index), "metadata": {"mask_path": self.mask_paths[index]}}
-
-
-class RecordingWandb:
+class RecordingLogger:
     def __init__(self) -> None:
         self.logged: list[dict] = []
-        self.run = SimpleNamespace(summary={})
+        self.summary: dict[str, float] = {}
 
-    def init(self, **_: object) -> None:
-        pass
+    def start(self, name: str, config: dict) -> None:
+        self.config = dict(config)
 
-    def log(self, data: dict) -> None:
-        self.logged.append(dict(data))
+    def log(self, metrics: dict) -> None:
+        self.logged.append(dict(metrics))
+
+    def summarize(self, metrics: dict) -> None:
+        self.summary.update(metrics)
 
     def finish(self) -> None:
         pass
@@ -66,39 +46,47 @@ class RecordingWandb:
         return {key for entry in self.logged for key in entry}
 
 
-def build_trainer(checkpoint_dir: Path, test_loaders: dict[str, DataLoader], foreground_map_metrics: bool = False) -> SegmentationTrainer:
-    torch.manual_seed(0)
-    model = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.BatchNorm2d(4), nn.ReLU(), nn.Conv2d(4, 1, 1))
-    config = TrainingConfig(
+def training_config(checkpoint_dir: Path) -> TrainingConfig:
+    return TrainingConfig(
         model_type="vanilla", dataset="synthetic", loss="focal_tversky", seed=0, epochs=4, batch_size=2,
         bond_dim=4, fn_weight=0.3, fp_weight=0.7, focal_gamma=4.0 / 3.0, image_size=16,
-        foreground_map_metrics=foreground_map_metrics,
         accumulation_steps=1, swa_start_pct=0.5, checkpoint_dir=str(checkpoint_dir),
     )
+
+
+def evaluation_set(dataset: Dataset, foreground_maps: bool = False) -> EvaluationSet:
+    return EvaluationSet(dataset, foreground_maps, Denormalization(offset=(0.0,) * 3, scale=(1.0,) * 3))
+
+
+def build_trainer(checkpoint_dir: Path, test_sets: dict[str, EvaluationSet], run_logger: RecordingLogger) -> SegmentationTrainer:
+    torch.manual_seed(0)
+    model = small_model()
+    config = training_config(checkpoint_dir)
     optimizer = optim.AdamW(model.parameters(), lr=1e-2)
+    splits = DatasetSplits(
+        train=SquareDataset(6), val=evaluation_set(SquareDataset(3)), test_sets=test_sets, image_size=16
+    )
     return SegmentationTrainer(
         model=model,
-        train_loader=DataLoader(SquareDataset(6), batch_size=2, shuffle=True),
-        val_loader=DataLoader(SquareDataset(3), batch_size=2),
-        test_loaders=test_loaders,
+        splits=splits,
+        loader_factory=lambda dataset, shuffle: DataLoader(dataset, batch_size=2, shuffle=shuffle),
         criterion=FocalTverskyLoss(),
         optimizer=optimizer,
         scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs),
         device=torch.device("cpu"),
         config=config,
+        run_logger=run_logger,
     )
 
 
 @pytest.fixture
-def recorder(monkeypatch):
-    recording = RecordingWandb()
-    monkeypatch.setattr(train, "wandb", recording)
-    return recording
+def recorder():
+    return RecordingLogger()
 
 
 @pytest.fixture
 def trainer_and_recorder(recorder, tmp_path):
-    return build_trainer(tmp_path, {"test": DataLoader(SquareDataset(3), batch_size=2)}), recorder
+    return build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, recorder), recorder
 
 
 def test_every_epoch_validates_the_live_model(trainer_and_recorder, monkeypatch):
@@ -132,14 +120,14 @@ def test_fit_logs_peak_vram_and_test_only_paper_metrics(trainer_and_recorder):
     keys = recorder.keys()
     assert {"Peak_VRAM_MB", "val_dice", "swa_val_dice", "swa_val_hd95"} <= keys
     assert {"test_best_live_dice", "test_best_live_hd95", "test_swa_dice", "test_swa_hd95"} <= keys
-    assert set(recorder.run.summary) == {key for key in keys if key.startswith("test_")}
+    assert set(recorder.summary) == {key for key in keys if key.startswith("test_")}
     assert (Path(trainer.config.checkpoint_dir) / "best_model.pth").exists()
     assert (Path(trainer.config.checkpoint_dir) / "best_swa_model.pth").exists()
 
 
 def test_named_test_sets_log_qualified_metrics(recorder, tmp_path):
-    loaders = {name: DataLoader(SquareDataset(3), batch_size=2) for name in ("cod10k", "nc4k")}
-    build_trainer(tmp_path, loaders).fit(run_name="synthetic", total_params=0)
+    test_sets = {name: evaluation_set(SquareDataset(3)) for name in ("cod10k", "nc4k")}
+    build_trainer(tmp_path, test_sets, recorder).fit(run_name="synthetic", total_params=0)
     keys = recorder.keys()
     for model_prefix in ("test_best_live", "test_swa"):
         for test_set in ("cod10k", "nc4k"):
@@ -148,14 +136,29 @@ def test_named_test_sets_log_qualified_metrics(recorder, tmp_path):
 
 
 def test_foreground_map_metrics_are_reported_at_ground_truth_resolution(recorder, tmp_path):
-    loader = DataLoader(MaskFileDataset(3, tmp_path), batch_size=2)
-    build_trainer(tmp_path, {"chameleon": loader}, foreground_map_metrics=True).fit(run_name="synthetic", total_params=0)
+    chameleon = evaluation_set(MaskFileSamples(tmp_path), foreground_maps=True)
+    build_trainer(tmp_path, {"chameleon": chameleon}, recorder).fit(run_name="synthetic", total_params=0)
     expected = {f"test_swa_chameleon_{name}" for name in ("s_measure", "e_measure", "wf_measure", "map_mae")}
-    assert expected <= set(recorder.run.summary)
-    assert all(0.0 <= recorder.run.summary[key] <= 1.0 for key in expected)
+    assert expected <= set(recorder.summary)
+    assert all(0.0 <= recorder.summary[key] <= 1.0 for key in expected)
 
 
 def test_foreground_map_metrics_are_off_by_default(trainer_and_recorder):
     trainer, recorder = trainer_and_recorder
     trainer.fit(run_name="synthetic", total_params=0)
     assert not any(key.endswith("s_measure") for key in recorder.keys())
+
+
+def test_failed_compile_warmup_leaves_no_gradients(monkeypatch, tmp_path):
+    model = small_model()
+
+    def failing_compile(module: nn.Module):
+        def run(inputs: torch.Tensor) -> torch.Tensor:
+            module(inputs).sum().backward()
+            raise RuntimeError("backend unavailable")
+
+        return run
+
+    monkeypatch.setattr(torch, "compile", failing_compile)
+    assert compile_with_warmup(model, training_config(tmp_path), torch.device("cpu")) is model
+    assert all(parameter.grad is None for parameter in model.parameters())

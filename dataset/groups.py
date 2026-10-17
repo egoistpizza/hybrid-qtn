@@ -17,59 +17,46 @@ from __future__ import annotations
 
 import csv
 import random
-from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Iterable, Sequence
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from .config import GroupMap
 
 
-def load_group_map(spec: dict[str, Any], root: str | Path | None = None) -> dict[str, str]:
-    """Read the ``sample_id -> group_id`` mapping from the CSV named by a ``group_map`` spec."""
-    root = Path(root) if root is not None else REPO_ROOT
-    csv_path = Path(spec["csv"])
-    if not csv_path.is_absolute():
-        csv_path = root / csv_path
-
-    if not csv_path.is_file():
+def load_group_map(group_map: GroupMap) -> dict[str, str]:
+    """Read the ``sample_id -> group_id`` mapping from the group-map CSV."""
+    if not group_map.csv.is_file():
         raise FileNotFoundError(
-            f"group_map csv not found: {csv_path}. Sequence-aware splitting is "
+            f"group_map csv not found: {group_map.csv}. Sequence-aware splitting is "
             "mandatory for this dataset — falling back to a frame-level random "
             "split would leak the same polyp into both halves."
         )
 
-    sample_column = spec.get("sample_column", "sample_id")
-    group_column = spec.get("group_column", "group_id")
-
     mapping: dict[str, str] = {}
-    with csv_path.open(newline="") as csv_file:
+    with group_map.csv.open(newline="") as csv_file:
         reader = csv.DictReader(csv_file)
-        missing = {sample_column, group_column} - set(reader.fieldnames or ())
+        missing = {group_map.sample_column, group_map.group_column} - set(reader.fieldnames or ())
         if missing:
-            raise ValueError(f"{csv_path} is missing column(s) {sorted(missing)}; found {reader.fieldnames}")
+            raise ValueError(f"{group_map.csv} is missing column(s) {sorted(missing)}; found {reader.fieldnames}")
         for row in reader:
-            mapping[row[sample_column].strip()] = row[group_column].strip()
+            mapping[row[group_map.sample_column].strip()] = row[group_map.group_column].strip()
 
     if not mapping:
-        raise ValueError(f"{csv_path} contains no rows")
+        raise ValueError(f"{group_map.csv} contains no rows")
     return mapping
 
 
-def groups_for_samples(
-    sample_ids: Iterable[str],
-    spec: dict[str, Any],
-    root: str | Path | None = None,
-) -> list[str]:
+def groups_for_samples(sample_ids: Iterable[str], group_map: GroupMap) -> list[str]:
     """Group of every sample, in dataset order.
 
     Raises:
         KeyError: If a sample has no group; falling back to frame-level assignment would leak.
     """
-    mapping = load_group_map(spec, root)
+    mapping = load_group_map(group_map)
     sample_ids = list(sample_ids)
     unknown = [sample_id for sample_id in sample_ids if sample_id not in mapping]
     if unknown:
         raise KeyError(
-            f"{len(unknown)} sample(s) have no group in {spec['csv']} "
+            f"{len(unknown)} sample(s) have no group in {group_map.csv} "
             f"(first: {unknown[:5]}). Refusing to split — an ungrouped frame "
             "would silently revert to leaky frame-level assignment."
         )

@@ -7,15 +7,13 @@ live and the SWA model are evaluated once on each test set after training.
 
 import argparse
 import logging
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import wandb
 from torch.amp import GradScaler
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, Dataset
@@ -23,16 +21,17 @@ from tqdm import tqdm
 
 from dataset import (
     DEFAULT_TEST_SET,
+    DatasetSplits,
+    build_loader,
     build_splits,
     discover_dataset_configs,
     parse_dataset_arg,
-    seed_dataloader_worker,
     slugify_dataset_arg,
-    uses_foreground_map_metrics,
 )
 from models.factory import MODEL_TYPES, build_segmentation_model
 from utils import get_device
-from utils.foreground_maps import ForegroundMapAccumulator, full_resolution_maps
+from utils.checkpoints import BEST_LIVE_CHECKPOINT, INTERRUPTED_CHECKPOINT, SWA_CHECKPOINT, load_weights, save_weights
+from utils.evaluation import evaluate_model, metric_suites
 from utils.hardware import reset_peak_vram, vram_metrics
 from utils.init_first import init
 from utils.loss import (
@@ -42,19 +41,17 @@ from utils.loss import (
     BCEDiceLoss,
     FocalTverskyLoss,
 )
-from utils.metrics import MetricAccumulator
+from utils.run_logger import RunLogger, WandbLogger
 from utils.run_naming import build_run_name
-from utils.seed import seed_everything, seeded_generator
+from utils.seed import seed_everything
 
 logger = logging.getLogger(__name__)
 
 LOSS_CHOICES = ("focal_tversky", "bce_dice")
-IMAGE_SIZE = 512
-DATALOADER_WORKERS = 4
 GRADIENT_CLIP_NORM = 1.0
-BEST_LIVE_CHECKPOINT = "best_model.pth"
-SWA_CHECKPOINT = "best_swa_model.pth"
-INTERRUPTED_CHECKPOINT = "interrupted_model.pth"
+CHECKPOINT_ROOT = Path("checkpoints")
+
+LoaderFactory = Callable[[Dataset, bool], DataLoader]
 
 
 @dataclass
@@ -71,14 +68,13 @@ class TrainingConfig:
     fn_weight: float
     fp_weight: float
     focal_gamma: float
-    image_size: int = IMAGE_SIZE
-    foreground_map_metrics: bool = False
+    image_size: int
     accumulation_steps: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
     swa_start_pct: float = 0.75
     swa_lr: float = 5e-5
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = str(CHECKPOINT_ROOT)
 
     @property
     def swa_start_epoch(self) -> int:
@@ -96,29 +92,35 @@ def qualified_test_prefix(model_prefix: str, test_set: str) -> str:
 
 
 class SegmentationTrainer:
-    """Training loop with gradient accumulation, AMP, gradient clipping, SWA and W&B logging."""
+    """Training loop with gradient accumulation, AMP, gradient clipping, SWA and run logging.
+
+    ``loader_factory(dataset, shuffle)`` builds every loader, so all splits share one batch
+    size and seeding policy.
+    """
 
     def __init__(
         self,
         model: nn.Module,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        test_loaders: Mapping[str, DataLoader],
+        splits: DatasetSplits,
+        loader_factory: LoaderFactory,
         criterion: nn.Module,
         optimizer: optim.Optimizer,
         scheduler: optim.lr_scheduler.LRScheduler,
         device: torch.device,
         config: TrainingConfig,
+        run_logger: RunLogger,
     ):
         self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.test_loaders = test_loaders
+        self.splits = splits
+        self.loader_factory = loader_factory
+        self.train_loader = loader_factory(splits.train, True)
+        self.val_loader = loader_factory(splits.val.dataset, False)
         self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.config = config
+        self.run_logger = run_logger
 
         self.use_amp = device.type == "cuda"
         self.scaler = GradScaler(enabled=self.use_amp)
@@ -161,7 +163,6 @@ class SegmentationTrainer:
 
         return total_loss / len(self.train_loader)
 
-    @torch.inference_mode()
     def evaluate(
         self,
         model: nn.Module,
@@ -169,33 +170,14 @@ class SegmentationTrainer:
         description: str,
         compute_hd95: bool,
         foreground_maps: bool = False,
-    ) -> tuple[float, dict[str, float]]:
-        """Image-weighted loss and per-image metrics of ``model`` on ``loader``.
+    ) -> dict[str, float]:
+        """Image-weighted ``loss`` and per-image metrics of ``model`` on ``loader``.
 
         With ``foreground_maps``, the full-resolution foreground-map metrics are added;
         batches must then carry ``metadata.mask_path``.
         """
-        model.eval()
-        accumulator = MetricAccumulator(compute_hd95=compute_hd95)
-        map_accumulator = ForegroundMapAccumulator() if foreground_maps else None
-        weighted_loss, image_count = 0.0, 0
-
-        for batch in tqdm(loader, desc=description):
-            masks = self._masks(batch)
-            with torch.autocast(self.device.type, enabled=self.use_amp):
-                logits = model(self._images(batch))
-                loss = self.criterion(logits, masks)
-            accumulator.update(logits, masks)
-            if map_accumulator is not None:
-                for prediction, ground_truth in full_resolution_maps(logits, batch["metadata"]["mask_path"]):
-                    map_accumulator.update(prediction, ground_truth)
-            weighted_loss += loss.item() * masks.size(0)
-            image_count += masks.size(0)
-
-        metrics = accumulator.compute()
-        if map_accumulator is not None:
-            metrics.update(map_accumulator.compute())
-        return weighted_loss / image_count, metrics
+        suites = metric_suites(self.criterion, compute_hd95=compute_hd95, foreground_maps=foreground_maps)
+        return evaluate_model(model, loader, self.device, suites, description)
 
     @torch.no_grad()
     def _recompute_swa_batchnorm(self) -> None:
@@ -209,15 +191,10 @@ class SegmentationTrainer:
             with torch.autocast(self.device.type, enabled=self.use_amp):
                 self.swa_model(self._images(batch))
 
-    def _save(self, module: nn.Module, filename: str) -> Path:
-        path = self.checkpoint_dir / filename
-        torch.save(module.state_dict(), path)
-        return path
-
     def _save_if_best(self, val_dice: float) -> None:
         if val_dice > self.best_val_dice:
             self.best_val_dice = val_dice
-            self._save(self.model, BEST_LIVE_CHECKPOINT)
+            save_weights(self.model, self.checkpoint_dir / BEST_LIVE_CHECKPOINT)
             logger.info(f"New best live model saved. Val Dice: {val_dice:.4f}")
 
     def _advance_schedule(self, in_swa_phase: bool) -> float:
@@ -233,13 +210,12 @@ class SegmentationTrainer:
         train_loss = self.train_epoch(epoch)
         in_swa_phase = epoch >= self.config.swa_start_epoch
         learning_rate = self._advance_schedule(in_swa_phase)
-        val_loss, val_metrics = self.evaluate(self.model, self.val_loader, f"Epoch {epoch} [Val]", compute_hd95=False)
+        val_metrics = self.evaluate(self.model, self.val_loader, f"Epoch {epoch} [Val]", compute_hd95=False)
 
-        wandb.log(
+        self.run_logger.log(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
-                "val_loss": val_loss,
                 **prefixed("val", val_metrics),
                 "learning_rate": learning_rate,
                 "is_swa_active": float(in_swa_phase),
@@ -254,36 +230,35 @@ class SegmentationTrainer:
             return None
         logger.info("Recomputing SWA BatchNorm statistics...")
         self._recompute_swa_batchnorm()
-        self._save(self.swa_model, SWA_CHECKPOINT)
-        swa_val_loss, swa_val_metrics = self.evaluate(self.swa_model, self.val_loader, "SWA [Val]", compute_hd95=True)
-        wandb.log({"swa_val_loss": swa_val_loss, **prefixed("swa_val", swa_val_metrics)})
+        save_weights(self.swa_model, self.checkpoint_dir / SWA_CHECKPOINT)
+        self.run_logger.log(prefixed("swa_val", self.evaluate(self.swa_model, self.val_loader, "SWA [Val]", compute_hd95=True)))
         return self.swa_model
 
     def _report_test_metrics(self, swa_model: Optional[nn.Module]) -> None:
         """Evaluate the best live and the SWA model once on every test set and store the results in the run summary."""
-        self.model.load_state_dict(torch.load(self.checkpoint_dir / BEST_LIVE_CHECKPOINT, map_location=self.device))
+        load_weights(self.model, self.checkpoint_dir / BEST_LIVE_CHECKPOINT, self.device)
         candidates = {"test_best_live": self.model}
         if swa_model is not None:
             candidates["test_swa"] = swa_model
 
         for model_prefix, model in candidates.items():
-            for test_set, loader in self.test_loaders.items():
-                prefix = qualified_test_prefix(model_prefix, test_set)
-                test_loss, test_metrics = self.evaluate(
+            for set_name, test_set in self.splits.test_sets.items():
+                prefix = qualified_test_prefix(model_prefix, set_name)
+                test_metrics = self.evaluate(
                     model,
-                    loader,
+                    self.loader_factory(test_set.dataset, False),
                     f"{prefix} [Test]",
                     compute_hd95=True,
-                    foreground_maps=self.config.foreground_map_metrics,
+                    foreground_maps=test_set.foreground_maps,
                 )
-                results = {f"{prefix}_loss": test_loss, **prefixed(prefix, test_metrics)}
-                wandb.log(results)
-                wandb.run.summary.update(results)
+                results = prefixed(prefix, test_metrics)
+                self.run_logger.log(results)
+                self.run_logger.summarize(results)
                 logger.info(" | ".join(f"{name}: {value:.4f}" for name, value in results.items()))
 
     def fit(self, run_name: str, total_params: int) -> None:
         """Run training, SWA finalization and test reporting; an interrupt saves the current weights."""
-        wandb.init(project="hybrid-qtn", config={**asdict(self.config), "total_params": total_params}, name=run_name)
+        self.run_logger.start(run_name, {**asdict(self.config), "total_params": total_params})
         logger.info("Starting training...")
         try:
             for epoch in range(1, self.config.epochs + 1):
@@ -292,9 +267,9 @@ class SegmentationTrainer:
             self._report_test_metrics(swa_model)
         except KeyboardInterrupt:
             logger.warning("Training interrupted. Saving current state...")
-            self._save(self.model, INTERRUPTED_CHECKPOINT)
+            save_weights(self.model, self.checkpoint_dir / INTERRUPTED_CHECKPOINT)
         finally:
-            wandb.finish()
+            self.run_logger.finish()
             logger.info("Training finished.")
 
 
@@ -321,19 +296,6 @@ def build_criterion(config: TrainingConfig) -> nn.Module:
     return FocalTverskyLoss(fn_weight=config.fn_weight, fp_weight=config.fp_weight, gamma=config.focal_gamma)
 
 
-def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
-    """Loader whose shuffling order and worker seeds both derive from ``seed``."""
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=DATALOADER_WORKERS,
-        pin_memory=True,
-        worker_init_fn=seed_dataloader_worker,
-        generator=seeded_generator(seed),
-    )
-
-
 def log_parameter_breakdown(model: nn.Module) -> int:
     """Log the parameter count of every top-level module and return the total."""
     total_params = sum(parameter.numel() for parameter in model.parameters())
@@ -344,24 +306,30 @@ def log_parameter_breakdown(model: nn.Module) -> int:
 
 
 def compile_with_warmup(model: nn.Module, config: TrainingConfig, device: torch.device) -> nn.Module:
-    """Compile the model and trigger compilation with one forward/backward pass; falls back to eager mode."""
+    """Compile the model and trigger compilation with one forward/backward pass; falls back to eager mode.
+
+    The warm-up gradients are cleared on success and on failure, so they never reach the first step.
+    """
     try:
         compiled_model = torch.compile(model)
         # Warm up at the training shape, memory format and precision so the graph used for
-        # training is compiled. The output is not bound: holding it would keep the whole
-        # activation graph alive for the rest of the run.
-        warmup_input = torch.randn(config.batch_size, 3, config.image_size, config.image_size, device=device)
+        # training is compiled. Neither input nor output is bound: holding the output would
+        # keep the whole activation graph alive for the rest of the run.
         with torch.autocast(device.type, enabled=device.type == "cuda"):
-            compiled_model(warmup_input.to(memory_format=torch.channels_last)).float().mean().backward()
-        model.zero_grad(set_to_none=True)
-        del warmup_input
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            compiled_model(
+                torch.randn(config.batch_size, 3, config.image_size, config.image_size, device=device).to(
+                    memory_format=torch.channels_last
+                )
+            ).float().mean().backward()
         logger.info("Compiled the model successfully")
         return compiled_model
     except Exception as error:
         logger.warning(f"torch.compile failed, continuing in eager mode: {error}")
         return model
+    finally:
+        model.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 def main() -> None:
@@ -370,10 +338,13 @@ def main() -> None:
     dataset_names = parse_dataset_arg(arguments.dataset)
     seed_everything(arguments.seed)
     device = get_device()
+    splits = build_splits(dataset_names)
+    dataset_slug = slugify_dataset_arg(dataset_names)
+    run_name = build_run_name(dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag)
 
     config = TrainingConfig(
         model_type=arguments.model,
-        dataset=slugify_dataset_arg(dataset_names),
+        dataset=dataset_slug,
         loss=arguments.loss,
         seed=arguments.seed,
         epochs=arguments.epochs,
@@ -382,14 +353,12 @@ def main() -> None:
         fn_weight=arguments.fn_weight,
         fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
-        foreground_map_metrics=uses_foreground_map_metrics(dataset_names),
+        image_size=splits.image_size,
+        checkpoint_dir=str(CHECKPOINT_ROOT / run_name),
     )
-    run_name = build_run_name(config.dataset, config.model_type, config.bond_dim, config.loss, config.seed, arguments.tag)
-    config.checkpoint_dir = os.path.join("checkpoints", run_name)
 
-    splits = build_splits(dataset_names)
-    test_sizes = ", ".join(f"{len(dataset)} {name}" for name, dataset in splits.test_sets.items())
-    logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val)} val / test: {test_sizes}")
+    test_sizes = ", ".join(f"{len(test_set.dataset)} {name}" for name, test_set in splits.test_sets.items())
+    logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val.dataset)} val / test: {test_sizes}")
 
     model = build_segmentation_model(config.model_type, config.bond_dim, config.image_size)
     total_params = log_parameter_breakdown(model)
@@ -399,17 +368,14 @@ def main() -> None:
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     trainer = SegmentationTrainer(
         model=model,
-        train_loader=build_loader(splits.train, config.batch_size, shuffle=True, seed=config.seed),
-        val_loader=build_loader(splits.val, config.batch_size, shuffle=False, seed=config.seed),
-        test_loaders={
-            name: build_loader(dataset, config.batch_size, shuffle=False, seed=config.seed)
-            for name, dataset in splits.test_sets.items()
-        },
+        splits=splits,
+        loader_factory=lambda dataset, shuffle: build_loader(dataset, config.batch_size, shuffle, config.seed),
         criterion=build_criterion(config),
         optimizer=optimizer,
         scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs),
         device=device,
         config=config,
+        run_logger=WandbLogger(),
     )
     trainer.fit(run_name=run_name, total_params=total_params)
 

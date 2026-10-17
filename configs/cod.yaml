@@ -1,6 +1,6 @@
 # Camouflaged object detection benchmark config
 #
-# Layout expected after running `python scripts/download_cod.py`:
+# Layout expected after running `python -m scripts.download_cod`:
 #   data/cod/train/{cod10k,camo}/{images,masks}
 #   data/cod/test/{cod10k,camo,chameleon,nc4k}/{images,masks}
 #

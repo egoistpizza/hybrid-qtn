@@ -14,19 +14,14 @@ are reused, and the final layout is checked against the official image counts.
 from __future__ import annotations
 
 import argparse
-import shutil
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Mapping, Optional
 
-import requests
-from tqdm import tqdm
+from scripts.fetch import extract_zip, fetch, pairing_problems, require_no_problems
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "cod"
 DRIVE_DOWNLOAD_URL = "https://drive.usercontent.google.com/download"
-DOWNLOAD_CHUNK_BYTES = 1 << 20
-REQUEST_TIMEOUT_SECONDS = 60
 IMAGE_SUFFIX = ".jpg"
 MASK_SUFFIX = ".png"
 KIND_FOLDERS = {"Imgs": ("images", IMAGE_SUFFIX), "GT": ("masks", MASK_SUFFIX)}
@@ -57,29 +52,8 @@ TEST_ARCHIVE = Archive("COD-TestDataset.zip", "1V0iSEdYJrT0Y_DHZfVGMg6TySFRNTy4o
 
 def download_archive(archive: Archive, directory: Path) -> Path:
     """Download ``archive`` from Google Drive into ``directory`` unless a complete copy exists."""
-    destination = directory / archive.filename
-    if destination.is_file() and destination.stat().st_size == archive.size_bytes:
-        print(f"Using existing {destination}")
-        return destination
-
-    directory.mkdir(parents=True, exist_ok=True)
-    partial = destination.with_suffix(destination.suffix + ".part")
     parameters = {"id": archive.drive_id, "export": "download", "confirm": "t"}
-    with requests.get(DRIVE_DOWNLOAD_URL, params=parameters, stream=True, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-        response.raise_for_status()
-        with partial.open("wb") as output, tqdm(
-            total=archive.size_bytes, unit="B", unit_scale=True, desc=archive.filename
-        ) as progress:
-            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
-                output.write(chunk)
-                progress.update(len(chunk))
-
-    received = partial.stat().st_size
-    if received != archive.size_bytes:
-        partial.unlink()
-        raise RuntimeError(f"{archive.filename}: expected {archive.size_bytes} bytes, received {received}")
-    partial.replace(destination)
-    return destination
+    return fetch(DRIVE_DOWNLOAD_URL, directory / archive.filename, archive.size_bytes, params=parameters)
 
 
 def _train_source(filename: str) -> str:
@@ -116,34 +90,20 @@ def destination_for(member: str) -> Optional[PurePosixPath]:
     return PurePosixPath(split, source, folder, filename)
 
 
-def extract_archive(archive_path: Path, data_root: Path) -> None:
-    """Extract the kept members of an archive into the normalized layout under ``data_root``."""
-    with zipfile.ZipFile(archive_path) as archive:
-        members = [(member, destination_for(member)) for member in archive.namelist()]
-        selected = [(member, destination) for member, destination in members if destination is not None]
-        for member, destination in tqdm(selected, desc=f"Extracting {archive_path.name}", unit="file"):
-            target = data_root / destination
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as source, target.open("wb") as output:
-                shutil.copyfileobj(source, output)
-
-
-def verify_layout(data_root: Path) -> None:
+def verify_layout(data_root: Path, expected_counts: Mapping[str, int] = EXPECTED_COUNTS) -> None:
     """Check pairing and image counts of every set.
 
     Raises:
         RuntimeError: Listing every set with unpaired files or an unexpected count.
     """
-    problems = []
-    for relative, expected in EXPECTED_COUNTS.items():
-        images = {path.stem for path in (data_root / relative / "images").glob(f"*{IMAGE_SUFFIX}")}
-        masks = {path.stem for path in (data_root / relative / "masks").glob(f"*{MASK_SUFFIX}")}
-        if images != masks:
-            problems.append(f"{relative}: {len(images ^ masks)} unpaired file(s)")
-        if len(images) != expected:
-            problems.append(f"{relative}: expected {expected} images, found {len(images)}")
-    if problems:
-        raise RuntimeError("COD layout verification failed:\n  " + "\n  ".join(problems))
+    problems = [
+        problem
+        for relative, expected in expected_counts.items()
+        for problem in pairing_problems(
+            relative, data_root / relative / "images", data_root / relative / "masks", IMAGE_SUFFIX, MASK_SUFFIX, expected
+        )
+    ]
+    require_no_problems("COD", problems)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -157,7 +117,7 @@ def main() -> None:
     print(USAGE_NOTICE)
     archive_directory = arguments.data_root / "archives"
     for archive in (TRAIN_ARCHIVE, TEST_ARCHIVE):
-        extract_archive(download_archive(archive, archive_directory), arguments.data_root)
+        extract_zip(download_archive(archive, archive_directory), arguments.data_root, destination_for)
     verify_layout(arguments.data_root)
     for relative, expected in EXPECTED_COUNTS.items():
         print(f"{relative:16s} {expected:5d} image/mask pairs")

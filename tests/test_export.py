@@ -1,20 +1,8 @@
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-import numpy as np
 import onnxruntime as ort
 import pytest
 import torch
 
-from export import (
-    export_model_to_onnx,
-    benchmark_pytorch_throughput,
-    benchmark_onnx_throughput
-)
+from export import benchmark_onnx_throughput, benchmark_pytorch_throughput, export_model_to_onnx, measure_throughput
 
 
 @pytest.fixture
@@ -68,3 +56,11 @@ def test_benchmark_onnx_throughput_returns_valid_fps(minimal_pytorch_model, dumm
     
     assert isinstance(fps, float)
     assert fps > 0.0
+
+
+def test_measure_throughput_times_only_the_measured_calls():
+    calls, synchronized = [], []
+    rate = measure_throughput(lambda: calls.append(1), iterations=4, warmup=2, synchronize=lambda: synchronized.append(len(calls)))
+    assert len(calls) == 6
+    assert synchronized == [2, 6]
+    assert rate > 0.0

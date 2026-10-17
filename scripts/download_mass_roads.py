@@ -1,73 +1,52 @@
 """Download the Massachusetts Roads dataset from Kaggle into data/mass_roads/{images,masks}.
 
-Requires the KAGGLE_USERNAME and KAGGLE_KEY environment variables.
+The Kaggle archive stores aerial tiles as ``.tiff`` and road masks as ``.tif`` across its
+train / val / test folders; both are flattened into one directory each, every other file
+is skipped, and the result must hold all 1,171 pairs. Requires Kaggle credentials
+(``KAGGLE_USERNAME`` / ``KAGGLE_KEY`` or ``~/.kaggle/kaggle.json``).
 """
 
-import os
-import shutil
-import sys
-import zipfile
-from pathlib import Path
+from __future__ import annotations
 
-try:
-    from kaggle.api.kaggle_api_extended import KaggleApi
-    from tqdm import tqdm
-except ImportError:
-    sys.exit("Error: 'kaggle' and 'tqdm' packages are required.")
+import argparse
+from pathlib import Path, PurePosixPath
+from typing import Optional
 
-def main():
-    if not os.environ.get("KAGGLE_USERNAME") or not os.environ.get("KAGGLE_KEY"):
-        sys.exit("Error: KAGGLE_USERNAME and KAGGLE_KEY environment variables must be set.")
+from scripts.fetch import extract_zip, fetch_kaggle_dataset, pairing_problems, require_no_problems
 
-    root = Path(__file__).resolve().parent.parent
-    data_dir = root / "data" / "mass_roads"
-    images_dir = data_dir / "images"
-    masks_dir = data_dir / "masks"
-    tmp_dir = data_dir / "tmp"
+KAGGLE_DATASET = "balraj98/massachusetts-roads-dataset"
+DEFAULT_DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "mass_roads"
+IMAGE_SUFFIX = ".tiff"
+MASK_SUFFIX = ".tif"
+EXPECTED_PAIRS = 1171
 
-    for directory in [images_dir, masks_dir, tmp_dir]:
-        directory.mkdir(parents=True, exist_ok=True)
 
-    api = KaggleApi()
-    api.authenticate()
+def destination_for(member: str) -> Optional[PurePosixPath]:
+    """``images/<name>`` for tiles, ``masks/<name>`` for road masks, ``None`` for anything else."""
+    path = PurePosixPath(member)
+    suffix = path.suffix.lower()
+    if suffix == IMAGE_SUFFIX:
+        return PurePosixPath("images", path.name)
+    if suffix == MASK_SUFFIX:
+        return PurePosixPath("masks", path.name)
+    return None
 
-    api.dataset_download_files(
-        "balraj98/massachusetts-roads-dataset",
-        path=tmp_dir,
-        unzip=False,
-        quiet=False
+
+def download_mass_roads(data_root: Path) -> None:
+    archive = fetch_kaggle_dataset(KAGGLE_DATASET, data_root / "archives")
+    extract_zip(archive, data_root, destination_for)
+    problems = pairing_problems(
+        "Massachusetts Roads", data_root / "images", data_root / "masks", IMAGE_SUFFIX, MASK_SUFFIX, EXPECTED_PAIRS
     )
+    require_no_problems("Massachusetts Roads", problems)
+    print(f"Massachusetts Roads: {EXPECTED_PAIRS} image/mask pairs at {data_root}")
 
-    zip_path = tmp_dir / "massachusetts-roads-dataset.zip"
-    
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        members = zip_ref.infolist()
-        for member in tqdm(members, desc="Extracting", unit="file"):
-            zip_ref.extract(member, tmp_dir)
 
-    zip_path.unlink()
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Download the Massachusetts Roads dataset from Kaggle")
+    parser.add_argument("--data_root", type=Path, default=DEFAULT_DATA_ROOT)
+    return parser.parse_args()
 
-    files_to_move = [f for f in tmp_dir.rglob("*.*") if f.is_file()]
-    
-    for file_path in tqdm(files_to_move, desc="Organizing", unit="file"):
-        ext = file_path.suffix.lower()
-        name = file_path.name
-        dest = None
-        
-        if ext == ".tiff":
-            dest = images_dir / name
-        elif ext == ".tif":
-            dest = masks_dir / name
-        elif ext == ".png":
-            if "mask" in [p.lower() for p in file_path.parts] or "map" in name.lower():
-                dest = masks_dir / name
-            else:
-                dest = images_dir / name
-
-        if dest and not dest.exists():
-            shutil.move(str(file_path), str(dest))
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 if __name__ == "__main__":
-    main()
+    download_mass_roads(parse_arguments().data_root)

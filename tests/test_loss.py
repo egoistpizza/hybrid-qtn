@@ -1,10 +1,5 @@
-import os
-import sys
-
 import pytest
 import torch
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.loss import BCEDiceLoss, FocalTverskyLoss
 
@@ -93,5 +88,14 @@ def test_bce_dice_loss(setup_tensors):
     assert not torch.isnan(logits.grad).any()
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+
+def test_bce_dice_matches_the_per_image_dice_formula():
+    logits = torch.randn(3, 1, 8, 8)
+    targets = (torch.rand(3, 1, 8, 8) > 0.5).float()
+    probabilities = torch.sigmoid(logits)
+    intersection = (probabilities * targets).sum(dim=(2, 3))
+    union = probabilities.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
+    dice_loss = (1.0 - (2.0 * intersection + 1e-5) / (union + 1e-5)).mean()
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
+    assert BCEDiceLoss(bce_weight=0.5)(logits, targets) == pytest.approx((0.5 * bce + 0.5 * dice_loss).item(), rel=1e-5)
+

@@ -3,8 +3,7 @@
 import torch.nn as nn
 
 from models.mps_layer import MPSBottleneck
-from models.unet_classic import UNet
-from models.unet_hybrid import UNetDeepHybrid
+from models.unet import UNet
 
 MODEL_TYPES = ("vanilla", "hybrid", "deep_hybrid")
 BOTTLENECK_DOWNSAMPLING_FACTOR = 16
@@ -40,7 +39,7 @@ def build_segmentation_model(model_type: str, bond_dim: int, image_size: int = 5
         raise ValueError(f"Unknown model_type {model_type!r}. Expected one of {MODEL_TYPES}.")
 
     if model_type == "vanilla":
-        return UNet(in_channels=3, out_channels=1)
+        return UNet()
 
     bottleneck_transform = build_mps_bottleneck(
         BOTTLENECK_CHANNELS, bond_dim, spatial_size_at(image_size, BOTTLENECK_DOWNSAMPLING_FACTOR)
@@ -52,9 +51,4 @@ def build_segmentation_model(model_type: str, bond_dim: int, image_size: int = 5
         if model_type == "deep_hybrid"
         else None
     )
-    return UNetDeepHybrid(
-        in_channels=3,
-        out_channels=1,
-        transform_512=pre_bottleneck_transform,
-        transform_1024=bottleneck_transform,
-    )
+    return UNet(transform_512=pre_bottleneck_transform, transform_1024=bottleneck_transform)

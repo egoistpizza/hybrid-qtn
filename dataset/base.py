@@ -17,54 +17,38 @@ import copy
 from typing import Any
 
 import numpy as np
-import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .config import Pipelines, SourceConfig
 from .pairing import pair_by_stem
-from .transforms import (
-    DEFAULT_AUGMENTATION_SEED,
-    EVAL_STAGE,
-    TRAIN_STAGE,
-    assert_deterministic_pipeline,
-    build_transforms_from_config,
-    stage_transform_specs,
-)
+from .transforms import DEFAULT_AUGMENTATION_SEED, TRAIN_STAGE, build_transforms_from_config
 
 
 class GenericSegmentationDataset(Dataset):
-    """Image/mask pairs matched by filename stem, transformed by the pipeline of one stage.
-
-    Config keys: ``dataset_name``, ``images_dir``, ``masks_dir``, ``image_ext``, ``mask_ext``,
-    ``strict_pairing`` (default ``True``), ``mask_threshold`` (default 127; raw mask values
-    above it are foreground), ``align_mask_to_image`` (default ``False``) and the
-    ``train_transforms`` / ``eval_transforms`` / ``transforms`` pipelines.
+    """Image/mask pairs of one source matched by filename stem, transformed by the pipeline of one stage.
 
     Args:
-        config: Parsed dataset YAML.
-        stage: ``train`` or ``eval``; the ``eval`` pipeline must be deterministic.
+        source: Directories, extensions and mask handling of the source.
+        pipelines: Train and eval pipelines; both end with ``ToTensorV2``.
+        stage: ``train`` or ``eval``.
     """
 
-    def __init__(self, config: dict[str, Any], stage: str = TRAIN_STAGE) -> None:
-        self.config = config
-        self.dataset_name: str = config["dataset_name"]
-        self.mask_threshold: int = int(config.get("mask_threshold", 127))
-        self.align_mask_to_image: bool = bool(config.get("align_mask_to_image", False))
+    def __init__(self, source: SourceConfig, pipelines: Pipelines, stage: str = TRAIN_STAGE) -> None:
+        self.source = source
+        self.pipelines = pipelines
         self.samples: list[tuple[str, str, str]] = pair_by_stem(
-            images_dir=config["images_dir"],
-            masks_dir=config["masks_dir"],
-            image_ext=config["image_ext"],
-            mask_ext=config["mask_ext"],
-            strict_pairing=bool(config.get("strict_pairing", True)),
+            images_dir=source.images_dir,
+            masks_dir=source.masks_dir,
+            image_ext=source.image_ext,
+            mask_ext=source.mask_ext,
+            strict_pairing=source.strict_pairing,
         )
         self._apply_stage(stage)
 
     def _apply_stage(self, stage: str) -> None:
-        specs = stage_transform_specs(self.config, stage)
-        if stage == EVAL_STAGE:
-            assert_deterministic_pipeline(specs)
+        self.transform = build_transforms_from_config(self.pipelines.for_stage(stage), seed=DEFAULT_AUGMENTATION_SEED)
         self.stage = stage
-        self.transform = build_transforms_from_config(specs, seed=DEFAULT_AUGMENTATION_SEED)
 
     def with_stage(self, stage: str) -> GenericSegmentationDataset:
         """Shallow copy sharing the sample list but using the pipeline of ``stage``."""
@@ -86,36 +70,19 @@ class GenericSegmentationDataset(Dataset):
     def _load_mask(self, path: str) -> np.ndarray:
         with Image.open(path) as mask:
             raw = np.array(mask.convert("L"), dtype=np.uint8)
-        return (raw > self.mask_threshold).astype(np.uint8)
+        return (raw > self.source.mask_threshold).astype(np.uint8)
 
     def _match_image_frame(self, mask: np.ndarray, image: np.ndarray, sample_id: str) -> np.ndarray:
-        """Return the mask in the image frame; resize it (nearest) only if the config allows it."""
+        """Return the mask in the image frame; resize it (nearest) only if the source allows it."""
         height, width = image.shape[:2]
         if mask.shape == (height, width):
             return mask
-        if not self.align_mask_to_image:
+        if not self.source.align_mask_to_image:
             raise ValueError(
-                f"{self.dataset_name}/{sample_id}: mask {mask.shape} and image {(height, width)} differ in size; "
+                f"{self.source.name}/{sample_id}: mask {mask.shape} and image {(height, width)} differ in size; "
                 "set align_mask_to_image to resize such masks to the image frame"
             )
         return np.array(Image.fromarray(mask).resize((width, height), Image.Resampling.NEAREST))
-
-    @staticmethod
-    def _as_image_tensor(image: Any) -> torch.Tensor:
-        if isinstance(image, torch.Tensor):
-            return image.float()
-        tensor = torch.from_numpy(np.ascontiguousarray(image))
-        if tensor.ndim == 3 and tensor.shape[-1] in (1, 3):
-            tensor = tensor.permute(2, 0, 1).contiguous()
-        return tensor.float()
-
-    @staticmethod
-    def _as_mask_tensor(mask: Any) -> torch.Tensor:
-        tensor = mask if isinstance(mask, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(mask))
-        tensor = tensor.float()
-        if tensor.ndim == 2 or (tensor.ndim == 3 and tensor.shape[0] != 1):
-            tensor = tensor.unsqueeze(0)
-        return tensor
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         image_path, mask_path, sample_id = self.samples[index]
@@ -124,14 +91,14 @@ class GenericSegmentationDataset(Dataset):
         transformed = self.transform(image=image, mask=mask)
 
         return {
-            "image": self._as_image_tensor(transformed["image"]),
-            "mask": self._as_mask_tensor(transformed["mask"]),
+            "image": transformed["image"].float(),
+            "mask": transformed["mask"].unsqueeze(0).float(),
             "metadata": {
                 "image_path": image_path,
                 "mask_path": mask_path,
                 "sample_id": sample_id,
                 "original_size": (int(image.shape[0]), int(image.shape[1])),
-                "dataset_name": self.dataset_name,
+                "dataset_name": self.source.name,
                 "index": index,
             },
         }

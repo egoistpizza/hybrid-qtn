@@ -1,6 +1,6 @@
 # Kvasir-SEG dataset config
 #
-# Layout expected after running `python scripts/download_kvasir_seg.py`:
+# Layout expected after running `python -m scripts.download_kvasir_seg`:
 #   data/kvasir-seg/Kvasir-SEG/images/*.jpg
 #   data/kvasir-seg/Kvasir-SEG/masks/*.jpg
 

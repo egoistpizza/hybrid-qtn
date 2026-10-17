@@ -1,9 +1,4 @@
-import sys
 from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
 
 import numpy as np
 import pytest
@@ -16,11 +11,12 @@ from dataset import (
     TRAIN_STAGE,
     build_splits,
     carve_validation,
-    declares_predefined_splits,
     discover_dataset_configs,
+    load_config,
     make_splits,
-    uses_foreground_map_metrics,
+    parse_config,
 )
+from tests.real_data import CONFIG_DIR, REPO_ROOT
 
 EVAL_PIPELINE = [
     {"name": "Resize", "height": 16, "width": 16},
@@ -81,46 +77,41 @@ def config_dir(tmp_path: Path) -> Path:
 
 def build(config_dir: Path, seed: int = 42):
     with pytest.warns(UserWarning, match="Excluding 1 training sample"):
-        return make_splits("synthetic", seed=seed, config_dir=config_dir)
+        return make_splits(load_config("synthetic", config_dir), seed=seed)
 
 
 def test_validation_is_carved_per_training_source(config_dir):
     splits = build(config_dir)
-    assert (len(splits.train), len(splits.val)) == (12, 3)
-    validation = sample_ids(splits.val)
+    assert (len(splits.train), len(splits.val.dataset)) == (12, 3)
+    validation = sample_ids(splits.val.dataset)
     assert sum(sample.startswith("a_") for sample in validation) == 2
     assert sum(sample.startswith("b_") for sample in validation) == 1
 
 
 def test_test_sources_stay_whole_and_named(config_dir):
     splits = build(config_dir)
-    assert {name: len(dataset) for name, dataset in splits.test_sets.items()} == {"test_x": 4, "test_y": 3}
-    assert all(dataset.stage == EVAL_STAGE for dataset in splits.test_sets.values())
+    assert {name: len(test_set.dataset) for name, test_set in splits.test_sets.items()} == {"test_x": 4, "test_y": 3}
+    assert all(test_set.dataset.stage == EVAL_STAGE for test_set in splits.test_sets.values())
 
 
 def test_training_samples_shared_with_a_test_source_are_excluded(config_dir):
     splits = build(config_dir)
-    held_out = {sample for dataset in splits.test_sets.values() for _, _, sample in dataset.samples}
+    held_out = {sample for test_set in splits.test_sets.values() for _, _, sample in test_set.dataset.samples}
     assert not set(sample_ids(splits.train)) & held_out
-    assert not set(sample_ids(splits.val)) & held_out
-    assert not set(sample_ids(splits.train)) & set(sample_ids(splits.val))
+    assert not set(sample_ids(splits.val.dataset)) & held_out
+    assert not set(sample_ids(splits.train)) & set(sample_ids(splits.val.dataset))
 
 
 def test_partitions_use_the_stage_pipelines(config_dir):
     splits = build(config_dir)
     assert all(part.dataset.stage == TRAIN_STAGE for part in splits.train.datasets)
-    assert all(part.dataset.stage == EVAL_STAGE for part in splits.val.datasets)
+    assert all(part.dataset.stage == EVAL_STAGE for part in splits.val.dataset.datasets)
 
 
 def test_carve_is_deterministic_and_seed_dependent(config_dir):
     first, again, other = build(config_dir), build(config_dir), build(config_dir, seed=7)
-    assert sample_ids(first.val) == sample_ids(again.val)
-    assert sample_ids(first.val) != sample_ids(other.val)
-
-
-def test_single_test_set_accessor_rejects_several_sets(config_dir):
-    with pytest.raises(ValueError, match="single test set"):
-        build(config_dir).test
+    assert sample_ids(first.val.dataset) == sample_ids(again.val.dataset)
+    assert sample_ids(first.val.dataset) != sample_ids(other.val.dataset)
 
 
 def test_carve_validation_covers_every_index_once():
@@ -136,7 +127,7 @@ def test_joint_training_merges_test_sets_by_name(tmp_path):
     write_config(configs, "second", predefined_config(tmp_path / "second"))
     with pytest.warns(UserWarning):
         splits = build_splits(["first", "second"], config_dir=configs)
-    assert {name: len(dataset) for name, dataset in splits.test_sets.items()} == {"test_x": 8, "test_y": 6}
+    assert {name: len(test_set.dataset) for name, test_set in splits.test_sets.items()} == {"test_x": 8, "test_y": 6}
 
 
 def test_predefined_configs_are_discovered(config_dir):
@@ -147,14 +138,16 @@ def test_foreground_map_metrics_follow_the_config_flag(tmp_path):
     configs = tmp_path / "configs"
     write_config(configs, "flagged", predefined_config(tmp_path / "flagged", foreground_map_metrics=True))
     write_config(configs, "plain", predefined_config(tmp_path / "plain"))
-    assert uses_foreground_map_metrics(["flagged"], configs)
-    assert not uses_foreground_map_metrics(["plain"], configs)
-    assert uses_foreground_map_metrics(["plain", "flagged"], configs)
+    with pytest.warns(UserWarning):
+        flagged, plain, joint = (build_splits(names, config_dir=configs) for names in (["flagged"], ["plain"], ["plain", "flagged"]))
+    assert all(test_set.foreground_maps for test_set in flagged.test_sets.values()) and flagged.val.foreground_maps
+    assert not any(test_set.foreground_maps for test_set in plain.test_sets.values()) and not plain.val.foreground_maps
+    assert all(test_set.foreground_maps for test_set in joint.test_sets.values())
 
 
 def test_partial_predefined_declaration_is_rejected():
     with pytest.raises(ValueError, match="predefined splits also need"):
-        declares_predefined_splits({"dataset_name": "partial", "sources": {}, "train_sources": ["a"]})
+        parse_config({"dataset_name": "partial", "sources": {}, "train_sources": ["a"]})
 
 
 @pytest.mark.parametrize(
@@ -171,7 +164,7 @@ def test_partial_predefined_declaration_is_rejected():
 def test_invalid_predefined_configs_are_rejected(tmp_path, overrides, message):
     config_dir = write_config(tmp_path / "configs", "synthetic", predefined_config(tmp_path, **overrides))
     with pytest.raises(ValueError, match=message):
-        make_splits("synthetic", config_dir=config_dir)
+        load_config("synthetic", config_dir)
 
 
 def test_source_without_directories_is_rejected(tmp_path):
@@ -179,34 +172,43 @@ def test_source_without_directories_is_rejected(tmp_path):
     config["sources"]["test_y"] = {"images_dir": config["sources"]["test_y"]["images_dir"]}
     config_dir = write_config(tmp_path / "configs", "synthetic", config)
     with pytest.raises(ValueError, match="need both"):
-        make_splits("synthetic", config_dir=config_dir)
+        load_config("synthetic", config_dir)
 
 
 COD_EXPECTED_TEST_SIZES = {"cod10k": 2026, "camo": 250, "chameleon": 76, "nc4k": 4121}
 
 
 def test_cod_benchmark_protocol():
-    if not (_ROOT / "data/cod/test/nc4k/images").is_dir():
+    if not (REPO_ROOT / "data/cod/test/nc4k/images").is_dir():
         pytest.skip("cod not on disk")
     with pytest.warns(UserWarning, match="Excluding 2 training sample"):
-        splits = make_splits("cod", config_dir=_ROOT / "configs")
-    assert (len(splits.train), len(splits.val)) == (3634, 404)
-    assert {name: len(dataset) for name, dataset in splits.test_sets.items()} == COD_EXPECTED_TEST_SIZES
-    held_out = {sample for dataset in splits.test_sets.values() for _, _, sample in dataset.samples}
-    assert not (set(sample_ids(splits.train)) | set(sample_ids(splits.val))) & held_out
+        splits = make_splits(load_config("cod", CONFIG_DIR))
+    assert (len(splits.train), len(splits.val.dataset)) == (3634, 404)
+    assert {name: len(test_set.dataset) for name, test_set in splits.test_sets.items()} == COD_EXPECTED_TEST_SIZES
+    held_out = {sample for test_set in splits.test_sets.values() for _, _, sample in test_set.dataset.samples}
+    assert not (set(sample_ids(splits.train)) | set(sample_ids(splits.val.dataset))) & held_out
 
 
 def test_cod_config_declares_the_benchmark_protocol():
-    config = yaml.safe_load((_ROOT / "configs" / "cod.yaml").read_text())
-    assert config["train_sources"] == ["cod10k_train", "camo_train"]
-    assert config["test_sources"] == list(COD_EXPECTED_TEST_SIZES)
-    assert config["foreground_map_metrics"] is True
+    config = load_config("cod", CONFIG_DIR)
+    assert [source.name for source in config.split.train_sources] == ["cod/cod10k_train", "cod/camo_train"]
+    assert list(config.split.test_sources) == list(COD_EXPECTED_TEST_SIZES)
+    assert config.foreground_map_metrics is True
 
 
 def test_every_cod_test_pair_loads():
-    if not (_ROOT / "data/cod/test/chameleon/images").is_dir():
+    if not (REPO_ROOT / "data/cod/test/chameleon/images").is_dir():
         pytest.skip("cod not on disk")
     with pytest.warns(UserWarning):
-        chameleon = make_splits("cod", config_dir=_ROOT / "configs").test_sets["chameleon"]
+        chameleon = make_splits(load_config("cod", CONFIG_DIR)).test_sets["chameleon"].dataset
     shapes = {tuple(chameleon[index]["mask"].shape) for index in range(len(chameleon))}
     assert shapes == {(1, 512, 512)}
+
+
+def test_joint_test_sets_must_share_their_normalization(tmp_path):
+    configs = tmp_path / "configs"
+    write_config(configs, "first", predefined_config(tmp_path / "first"))
+    rescaled = [{**spec, "mean": [0.0, 0.0, 0.0]} if spec["name"] == "Normalize" else spec for spec in EVAL_PIPELINE]
+    write_config(configs, "second", predefined_config(tmp_path / "second", eval_transforms=rescaled))
+    with pytest.warns(UserWarning), pytest.raises(ValueError, match="share their normalization"):
+        build_splits(["first", "second"], config_dir=configs)

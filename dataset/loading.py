@@ -1,4 +1,4 @@
-"""Per-worker seeding of DataLoader workers, including the Albumentations RNG."""
+"""DataLoader construction: shuffling and every worker's RNGs, including Albumentations', derive from one seed."""
 
 from __future__ import annotations
 
@@ -6,11 +6,13 @@ import random
 from typing import Iterator
 
 import numpy as np
-from torch.utils.data import ConcatDataset, Dataset, Subset, get_worker_info
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset, get_worker_info
 
-from utils.seed import derived_worker_seed
+from utils.seed import derived_worker_seed, seeded_generator
 
 from .base import GenericSegmentationDataset
+
+DATALOADER_WORKERS = 4
 
 
 def iter_segmentation_datasets(dataset: Dataset) -> Iterator[GenericSegmentationDataset]:
@@ -38,3 +40,16 @@ def seed_dataloader_worker(worker_id: int) -> None:
         return
     for segmentation_dataset in iter_segmentation_datasets(worker_info.dataset):
         segmentation_dataset.reseed_augmentations(worker_seed)
+
+
+def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
+    """Loader whose shuffling order and worker seeds both derive from ``seed``."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=DATALOADER_WORKERS,
+        pin_memory=True,
+        worker_init_fn=seed_dataloader_worker,
+        generator=seeded_generator(seed),
+    )

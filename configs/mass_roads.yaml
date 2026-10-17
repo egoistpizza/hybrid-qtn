@@ -1,6 +1,6 @@
 # Massachusetts Roads dataset config
 #
-# Layout expected after running `python scripts/download_mass_roads.py`:
+# Layout expected after running `python -m scripts.download_mass_roads`:
 #   data/mass_roads/images/*.tiff
 #   data/mass_roads/masks/*.tif
 #

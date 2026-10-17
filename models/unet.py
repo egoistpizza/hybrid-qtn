@@ -1,4 +1,8 @@
-"""U-Net whose deepest encoder stages can host tensorized bottleneck transforms."""
+"""U-Net (Ronneberger et al., 2015) with bilinear upsampling and optional bottleneck transforms.
+
+Without transforms this is the baseline U-Net. The hybrid variants place a transform after
+the 512- and/or 1024-channel encoder stages; such a stage uses a tensorized entry convolution.
+"""
 
 from typing import Optional
 
@@ -7,9 +11,44 @@ import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
 from models.tensor_train import TTConv2d
-from models.unet_classic import DoubleConv, UpBlock
 
 ENTRY_TT_RANK = 128
+
+
+class DoubleConv(nn.Module):
+    """Two ``Conv3x3 -> BatchNorm -> ReLU`` blocks; padding keeps the spatial size."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.double_conv(x)
+
+
+class UpBlock(nn.Module):
+    """Decoder stage: bilinear 2x upsampling and a 1x1 channel reduction, then concatenation
+    with the encoder skip features and a :class:`DoubleConv`.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(in_channels, in_channels // 2, kernel_size=1),
+        )
+        self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """Upsample ``x1`` and fuse it with the skip connection ``x2``."""
+        return self.conv(torch.cat([x2, self.up(x1)], dim=1))
 
 
 def encoder_stage(in_channels: int, out_channels: int, tensorized: bool, entry_rank: int) -> nn.Sequential:
@@ -28,11 +67,11 @@ def encoder_stage(in_channels: int, out_channels: int, tensorized: bool, entry_r
     )
 
 
-class UNetDeepHybrid(nn.Module):
-    """U-Net with optional transforms after the 512- and 1024-channel encoder stages.
+class UNet(nn.Module):
+    """Four-level U-Net (64 to 1024 channels) returning per-pixel logits.
 
-    ``hybrid`` models set only ``transform_1024`` (the bottleneck); ``deep_hybrid`` models
-    set both. A stage that receives a transform uses a tensorized entry convolution.
+    ``vanilla`` models set no transform, ``hybrid`` models set only ``transform_1024`` (the
+    bottleneck), and ``deep_hybrid`` models set both.
 
     Args:
         in_channels: Input image channels.
@@ -40,6 +79,8 @@ class UNetDeepHybrid(nn.Module):
         transform_512: Module applied to the 512-channel features, or ``None``.
         transform_1024: Module applied to the 1024-channel bottleneck features, or ``None``.
         entry_rank: Maximum bond rank of the tensorized entry convolutions.
+        checkpoint_transforms: Recompute the transforms in the backward pass during
+            training, trading compute for activation memory.
     """
 
     def __init__(
@@ -49,9 +90,10 @@ class UNetDeepHybrid(nn.Module):
         transform_512: Optional[nn.Module] = None,
         transform_1024: Optional[nn.Module] = None,
         entry_rank: int = ENTRY_TT_RANK,
+        checkpoint_transforms: bool = True,
     ):
         super().__init__()
-        self.use_checkpointing = True
+        self.checkpoint_transforms = checkpoint_transforms
         self.transform_512 = transform_512
         self.transform_1024 = transform_1024
 
@@ -70,8 +112,7 @@ class UNetDeepHybrid(nn.Module):
     def _apply_transform(self, transform: Optional[nn.Module], features: torch.Tensor) -> torch.Tensor:
         if transform is None:
             return features
-        # Recomputing the transform in the backward pass trades compute for activation memory.
-        if self.use_checkpointing and self.training:
+        if self.checkpoint_transforms and self.training:
             return checkpoint.checkpoint(transform, features, use_reentrant=False)
         return transform(features)
 

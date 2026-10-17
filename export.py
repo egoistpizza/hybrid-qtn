@@ -3,6 +3,7 @@
 import argparse
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import onnxruntime as ort
@@ -12,57 +13,42 @@ from models.factory import MODEL_TYPES, build_segmentation_model
 from utils import get_device
 
 
+def measure_throughput(
+    run_once: Callable[[], object], iterations: int, warmup: int = 10, synchronize: Callable[[], None] = lambda: None
+) -> float:
+    """Calls of ``run_once`` per second over ``iterations`` timed calls, after ``warmup`` untimed ones.
+
+    ``synchronize`` waits for queued asynchronous work, so the timer brackets completed calls.
+    """
+    for _ in range(warmup):
+        run_once()
+    synchronize()
+    start = time.perf_counter()
+    for _ in range(iterations):
+        run_once()
+    synchronize()
+    return iterations / (time.perf_counter() - start)
+
+
 def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tensor, total_iterations: int = 100) -> float:
-    """Forward passes per second in PyTorch after 10 warm-up passes."""
+    """Forward passes per second in PyTorch."""
     model.eval()
-    compute_device = dummy_input.device
-    
+    device = dummy_input.device
+    synchronize = (lambda: torch.cuda.synchronize(device)) if device.type == "cuda" else (lambda: None)
     with torch.inference_mode():
-        for _ in range(10):
-            _ = model(dummy_input)
-            
-        if compute_device.type == "cuda":
-            torch.cuda.synchronize(compute_device)
-            
-        start_timestamp = time.perf_counter()
-        
-        for _ in range(total_iterations):
-            _ = model(dummy_input)
-            
-        if compute_device.type == "cuda":
-            torch.cuda.synchronize(compute_device)
-            
-        end_timestamp = time.perf_counter()
-        
-    total_execution_time = end_timestamp - start_timestamp
-    frames_per_second = total_iterations / total_execution_time
-    
-    return frames_per_second
+        return measure_throughput(lambda: model(dummy_input), total_iterations, synchronize=synchronize)
+
 
 def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarray, total_iterations: int = 100) -> float:
-    """Forward passes per second in ONNX Runtime (CUDA if available) after 10 warm-up passes."""
+    """Forward passes per second in ONNX Runtime, on CUDA if available."""
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    execution_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    inference_session = ort.InferenceSession(str(onnx_file_path), sess_options=session_options, providers=execution_providers)
-    
-    input_tensor_name = inference_session.get_inputs()[0].name
-    
-    for _ in range(10):
-        _ = inference_session.run(None, {input_tensor_name: numpy_dummy_input})
-        
-    start_timestamp = time.perf_counter()
-    
-    for _ in range(total_iterations):
-        _ = inference_session.run(None, {input_tensor_name: numpy_dummy_input})
-        
-    end_timestamp = time.perf_counter()
-    
-    total_execution_time = end_timestamp - start_timestamp
-    frames_per_second = total_iterations / total_execution_time
-    
-    return frames_per_second
+    session = ort.InferenceSession(
+        str(onnx_file_path), sess_options=session_options, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    feed = {session.get_inputs()[0].name: numpy_dummy_input}
+    return measure_throughput(lambda: session.run(None, feed), total_iterations)
+
 
 def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, output_file_path: Path) -> None:
     """Export with opset 18 and a dynamic batch dimension; the spatial size stays fixed."""

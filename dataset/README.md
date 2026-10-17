@@ -1,8 +1,9 @@
 # `dataset/` — YAML-driven segmentation dataloader
 
 Single generic dataset class (`GenericSegmentationDataset`) driven by a YAML config.
-No per-dataset subclasses and no per-dataset loaders: `load_dataset` reads any
-config, and datasets are addressed by the stem of their YAML under `configs/`.
+No per-dataset subclasses and no per-dataset loaders. `load_config` parses and validates
+a config once into a typed `DatasetConfig` (`dataset/config.py`); datasets are addressed
+by the stem of their YAML under `configs/`.
 
 ## Output contract
 
@@ -32,7 +33,7 @@ A default `torch.utils.data.DataLoader` will collate:
 
 ```yaml
 dataset_name:   str            # free-form label, echoed in metadata
-images_dir:     str            # directory with images
+images_dir:     str            # directory with images; relative paths resolve against the repository root
 masks_dir:      str            # directory with masks
 image_ext:      str            # e.g. ".jpg"
 mask_ext:       str            # e.g. ".jpg" or ".png"
@@ -44,24 +45,28 @@ eval_transforms:               # deterministic specs for validation and test (va
 transforms:                    # optional shared fallback when a stage-specific key is absent
   - name: <ClassName>
     <kwargs>: ...
+group_map:                     # optional: split by group so no group crosses partitions
+  csv: str                     # sample-to-group CSV, resolved like images_dir
+  sample_column: str = sample_id
+  group_column: str = group_id
 ```
 
 ### Transforms
 
 Each list entry is `{name: <AlbumentationsClass>, ...kwargs}`. Names resolve
 against `albumentations.*` plus `ToTensorV2` from `albumentations.pytorch`.
-Order matters. `ToTensorV2` must be last if present.
-
-To match the standard output contract, include a `Normalize` step followed by
-`ToTensorV2` (see any config under `configs/`).
+Order matters. Both pipelines must end with `ToTensorV2`, and the last `Resize`,
+`RandomCrop` or `CenterCrop` step of each fixes the input size; train and eval must
+agree on it, and it must be square. The model is built at this size.
 
 ## Usage
 
 ```python
-from dataset import load_dataset, resolve_config
+from dataset import GenericSegmentationDataset, load_config
 from torch.utils.data import DataLoader
 
-ds = load_dataset(resolve_config("kvasir_seg"))   # or a direct path
+config = load_config("kvasir_seg")              # DatasetConfig; config.image_size == 512
+ds = GenericSegmentationDataset(config.split.source, config.pipelines)
 loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=2)
 
 batch = next(iter(loader))
@@ -79,13 +84,19 @@ from dataset import build_splits, discover_dataset_configs
 print(sorted(discover_dataset_configs()))       # ['cod', 'cvc_clinicdb', 'kvasir_seg', 'mass_roads']
 
 splits = build_splits(["kvasir_seg"])           # 70 / 15 / 15, fixed split seed 42
-splits.train, splits.val, splits.test           # val and test use eval_transforms
-splits.test_sets                                # {"test": ...}; one entry per named test set
+splits.train                                    # a Dataset using train_transforms
+splits.val, splits.test_sets                    # EvaluationSet(dataset, foreground_maps, denormalization); eval_transforms
+splits.test_sets["test"]                        # holdout splits name their single test set "test"
+splits.image_size                               # 512
 splits = build_splits(["kvasir_seg", "cvc_clinicdb"])  # joint; test sets with the same name are concatenated
 ```
 
-`splits.test` is a shortcut for datasets with a single test set and raises when a
-config declares several.
+The split policy follows the config: `RandomSplit` (70 / 15 / 15), `GroupedSplit` when a
+`group_map` is declared, `PredefinedSplit` for official sources.
+
+`build_loader(dataset, batch_size, shuffle, seed)` is the one loader factory for training
+and evaluation: shuffling and every worker's RNGs, including Albumentations', derive from
+`seed`.
 
 ## Predefined splits (official benchmarks)
 
@@ -113,12 +124,12 @@ foreground_map_metrics: bool = false  # also report S-measure, E-measure, weight
 `configs/cod.yaml` uses this schema for the camouflaged object detection benchmark
 (COD10K-train + CAMO-train for training; COD10K, CAMO, CHAMELEON and NC4K for testing).
 
-Or, with an arbitrary config dict:
+Or, from a config mapping:
 
 ```python
-from dataset import GenericSegmentationDataset
+from dataset import parse_config
 
-ds = GenericSegmentationDataset({
+config = parse_config({
     "dataset_name": "kvasir-seg",
     "images_dir":   "data/kvasir-seg/Kvasir-SEG/images",
     "masks_dir":    "data/kvasir-seg/Kvasir-SEG/masks",
@@ -145,7 +156,7 @@ with matching stems. No new Python needed — just a new YAML:
    configs, or cross-dataset comparisons are confounded. `TestDatasetConsistency`
    enforces this. `eval_transforms` may only contain deterministic transforms
    (Resize, LongestMaxSize, SmallestMaxSize, PadIfNeeded, CenterCrop, Normalize,
-   ToTensorV2); anything else raises at load time.
+   ToTensorV2); anything else raises when the config is parsed, as do unknown keys.
 
 That is the whole procedure. `discover_dataset_configs()` picks the file up
 automatically, so `--dataset <name>` works in `train.py` and `evaluate.py`
@@ -165,8 +176,6 @@ valid; kwargs are passed through verbatim. Common tweaks:
 - **Augmentation**: add `HorizontalFlip`, `VerticalFlip`, `Rotate`,
   `RandomBrightnessContrast`, etc.
 - **Normalization**: `Normalize` with `mean` / `std` lists.
-- **Tensor conversion**: keep `ToTensorV2` at the end.
+- **Tensor conversion**: keep `ToTensorV2` at the end; a pipeline without it is rejected.
 
-Removing `Normalize` gives raw 0–255 float tensors; removing `ToTensorV2`
-returns NumPy arrays with `HWC` layout — the loader will fall back to a
-manual conversion but you lose Albumentations' guarantee.
+Removing `Normalize` gives raw 0–255 float tensors.

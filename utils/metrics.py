@@ -63,11 +63,6 @@ def hd95_per_image(preds: torch.Tensor, targets: torch.Tensor) -> list[float]:
     return scores
 
 
-def calculate_hd95(preds: torch.Tensor, targets: torch.Tensor) -> float:
-    scores = hd95_per_image(preds, targets)
-    return float(np.mean(scores)) if scores else 0.0
-
-
 def per_image_overlap_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> dict[str, torch.Tensor]:
     preds = binarize(logits)
     intersection = (preds * targets).sum(dim=(1, 2, 3))
@@ -80,15 +75,12 @@ def per_image_overlap_metrics(logits: torch.Tensor, targets: torch.Tensor, smoot
     }
 
 
-def calculate_all_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5, compute_hd95: bool = False) -> dict:
-    per_image = per_image_overlap_metrics(logits, targets, smooth)
-    metrics = {name: values.mean().item() for name, values in per_image.items()}
-    metrics["hd95"] = calculate_hd95(binarize(logits), targets) if compute_hd95 else 0.0
-    return metrics
-
-
 class MetricAccumulator:
-    """Running per-image averages of Dice, IoU, MAE, F2 and, optionally, HD95 over batches."""
+    """Running per-image averages of Dice, IoU, MAE, F2 and, optionally, HD95 over batches.
+
+    ``hd95`` is reported only with ``compute_hd95``; it is 0.0 when every image has both
+    masks empty.
+    """
 
     def __init__(self, compute_hd95: bool = False) -> None:
         self.compute_hd95 = compute_hd95
@@ -107,5 +99,6 @@ class MetricAccumulator:
         if self._image_count == 0:
             raise ValueError("MetricAccumulator.compute() called before any update()")
         metrics = {name: total / self._image_count for name, total in self._overlap_totals.items()}
-        metrics["hd95"] = float(np.mean(self._hd95_scores)) if self._hd95_scores else 0.0
+        if self.compute_hd95:
+            metrics["hd95"] = float(np.mean(self._hd95_scores)) if self._hd95_scores else 0.0
         return metrics

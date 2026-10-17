@@ -1,6 +1,6 @@
 # CVC-ClinicDB dataset config
 #
-# Layout expected after running `python scripts/download_cvc_clinicdb.py`:
+# Layout expected after running `python -m scripts.download_cvc_clinicdb`:
 #   data/cvc-clinicdb/CVC-ClinicDB/Original/*.png
 #   data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/*.png
 #

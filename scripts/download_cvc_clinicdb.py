@@ -4,8 +4,9 @@ CVC-ClinicDB holds 612 frames from 29 colonoscopy sequences (Bernal et al., 2015
 official page only offers a Google Drive link to a .rar archive, which cannot be
 scripted, so three sources are supported:
 
-    --source kaggle   (default) the Kaggle mirror balraj98/cvcclinicdb, via the kaggle CLI
-    --source url      any direct HTTP(S) archive link given with --url
+    --source kaggle   (default) the Kaggle mirror balraj98/cvcclinicdb, via the Kaggle API
+    --source url      any direct HTTP(S) archive link given with --url (``--insecure`` skips
+                      certificate verification for that download)
     --source local    an archive downloaded manually, given with --archive
 
 The archive is extracted, its folders are moved to the layout expected by
@@ -15,22 +16,20 @@ configs/cvc_clinicdb.yaml, and the result is verified:
     data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/
 
 Mirrors differ in file format (.tif in the official release, .png in several mirrors);
-the verification prints the extensions found so the YAML can be set accordingly.
+the verification requires all 612 pairs and prints the extensions found so the YAML can
+be set accordingly.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import shutil
-import ssl
 import subprocess
-import sys
 import urllib.parse
-import urllib.request
-import zipfile
 from collections import Counter
 from pathlib import Path
+
+from scripts.fetch import extract_zip, fetch, fetch_kaggle_dataset, pairing_problems, require_no_problems
 
 KAGGLE_DATASET = "balraj98/cvcclinicdb"
 EXTRACTED_MARKER = "CVC-ClinicDB"
@@ -49,107 +48,6 @@ MASK_DIR_ALIASES = {
     "annotations",
 }
 IMAGE_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
-
-
-def _ssl_context() -> ssl.SSLContext:
-    try:
-        import certifi
-
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        return ssl.create_default_context()
-
-
-def _download_with_curl(url: str, dest: Path) -> bool:
-    """Download with curl; ``False`` if curl is unavailable or the download failed."""
-    curl = shutil.which("curl")
-    if curl is None:
-        return False
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    print(f"Downloading via curl {url}\n           -> {dest}")
-    try:
-        subprocess.run(
-            [curl, "-fL", "--retry", "3", "-o", str(tmp), url],
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        tmp.unlink(missing_ok=True)
-        print(f"  curl failed (exit {exc.returncode}); will try urllib fallback")
-        return False
-    tmp.replace(dest)
-    return True
-
-
-def _download(url: str, dest: Path, chunk: int = 1 << 20) -> None:
-    """Download ``url`` to ``dest``, trying curl first and urllib second."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    if _download_with_curl(url, dest):
-        return
-
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    print(f"Downloading via urllib {url}\n           -> {dest}")
-
-    with urllib.request.urlopen(url, context=_ssl_context()) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        digest = hashlib.sha256()
-        read = 0
-        with tmp.open("wb") as f:
-            while True:
-                block = resp.read(chunk)
-                if not block:
-                    break
-                f.write(block)
-                digest.update(block)
-                read += len(block)
-                if total:
-                    pct = 100.0 * read / total
-                    sys.stdout.write(
-                        f"\r  {read / 1e6:8.2f} / {total / 1e6:.2f} MB "
-                        f"({pct:5.1f}%)"
-                    )
-                else:
-                    sys.stdout.write(f"\r  {read / 1e6:8.2f} MB")
-                sys.stdout.flush()
-    sys.stdout.write("\n")
-    tmp.replace(dest)
-    print(f"  sha256: {digest.hexdigest()}")
-
-
-def _download_from_kaggle(dest: Path) -> Path:
-    """Fetch the Kaggle mirror with the ``kaggle`` CLI and return the downloaded archive."""
-    kaggle = shutil.which("kaggle")
-    if kaggle is None:
-        raise RuntimeError(
-            "The `kaggle` CLI was not found on PATH.\n"
-            "  Install it:      pip install kaggle\n"
-            "  Add a token:     https://www.kaggle.com/settings -> API -> "
-            "Create New Token, save kaggle.json to ~/.kaggle/kaggle.json\n"
-            "Alternatively download the archive by hand and re-run with:\n"
-            "  python scripts/download_cvc_clinicdb.py --source local "
-            "--archive <path-to-archive>"
-        )
-
-    dest.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading via kaggle {KAGGLE_DATASET}\n           -> {dest}")
-    try:
-        subprocess.run(
-            [kaggle, "datasets", "download", "-d", KAGGLE_DATASET, "-p", str(dest)],
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"`kaggle datasets download` failed (exit {exc.returncode}). "
-            "Most often this means the API token is missing or the dataset "
-            "licence has not been accepted — open "
-            f"https://www.kaggle.com/datasets/{KAGGLE_DATASET} once in a "
-            "browser, then retry."
-        ) from exc
-
-    archives = sorted(dest.glob("*.zip"), key=lambda p: p.stat().st_mtime)
-    if not archives:
-        raise RuntimeError(f"kaggle reported success but no .zip appeared in {dest}")
-    return archives[-1]
 
 
 def _extract_rar(archive: Path, dest: Path) -> None:
@@ -189,8 +87,7 @@ def _extract(archive: Path, dest: Path) -> None:
     print(f"Extracting {archive.name} -> {dest}")
     suffix = archive.suffix.lower()
     if suffix == ".zip":
-        with zipfile.ZipFile(archive) as zf:
-            zf.extractall(dest)
+        extract_zip(archive, dest)
     elif suffix == ".rar":
         _extract_rar(archive, dest)
     else:
@@ -271,56 +168,34 @@ def _normalize_layout(dest: Path) -> Path:
     return extracted
 
 
+def _dominant_extension(directory: Path) -> str:
+    suffixes = (path.suffix.lower() for path in directory.iterdir() if path.is_file())
+    counts = Counter(suffix for suffix in suffixes if suffix in IMAGE_EXTS)
+    if not counts:
+        raise RuntimeError(f"No image files in {directory}")
+    return counts.most_common(1)[0][0]
+
+
 def _verify(extracted: Path) -> None:
-    """Report pair counts, unpaired files and the dominant extensions to set in the YAML."""
+    """Require all 612 image/mask pairs and print the extensions to set in the YAML.
+
+    Mirrors differ in file format (.tif or .png), so the dominant extension of each
+    directory is used for pairing.
+
+    Raises:
+        RuntimeError: If a directory is missing, files are unpaired or the count differs.
+    """
     images_dir = extracted / IMAGES_SUBDIR
     masks_dir = extracted / MASKS_SUBDIR
-
     for directory in (images_dir, masks_dir):
         if not directory.is_dir():
             raise RuntimeError(f"Expected directory is missing: {directory}")
 
-    def _index(directory: Path) -> dict[str, Path]:
-        return {
-            p.stem: p
-            for p in directory.iterdir()
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-        }
+    image_ext, mask_ext = _dominant_extension(images_dir), _dominant_extension(masks_dir)
+    problems = pairing_problems("CVC-ClinicDB", images_dir, masks_dir, image_ext, mask_ext, EXPECTED_COUNT)
+    require_no_problems("CVC-ClinicDB", problems)
 
-    images = _index(images_dir)
-    masks = _index(masks_dir)
-    paired = set(images) & set(masks)
-
-    def _dominant_ext(index: dict[str, Path]) -> str:
-        counts = Counter(p.suffix.lower() for p in index.values())
-        return counts.most_common(1)[0][0] if counts else "?"
-
-    image_ext = _dominant_ext(images)
-    mask_ext = _dominant_ext(masks)
-
-    print("-" * 60)
-    print(f"images:  {len(images):4d}  ({image_ext})  {images_dir}")
-    print(f"masks:   {len(masks):4d}  ({mask_ext})  {masks_dir}")
-    print(f"paired:  {len(paired):4d}")
-
-    unpaired_images = sorted(set(images) - set(masks))
-    unpaired_masks = sorted(set(masks) - set(images))
-    if unpaired_images:
-        print(f"  WARNING {len(unpaired_images)} image(s) without mask "
-              f"(first: {unpaired_images[:5]})")
-    if unpaired_masks:
-        print(f"  WARNING {len(unpaired_masks)} mask(s) without image "
-              f"(first: {unpaired_masks[:5]})")
-
-    if len(paired) != EXPECTED_COUNT:
-        print(
-            f"  WARNING expected {EXPECTED_COUNT} pairs, found {len(paired)}. "
-            "This mirror may be a subset or a pre-split variant — check before "
-            "reporting numbers."
-        )
-
-    print("-" * 60)
-    print("Set these in configs/cvc_clinicdb.yaml:")
+    print(f"CVC-ClinicDB: {EXPECTED_COUNT} image/mask pairs. Set these in configs/cvc_clinicdb.yaml:")
     print(f'  images_dir: "{images_dir.as_posix()}"')
     print(f'  masks_dir:  "{masks_dir.as_posix()}"')
     print(f"  image_ext:  {image_ext}")
@@ -332,6 +207,7 @@ def download_cvc_clinicdb(
     source: str = "kaggle",
     url: str | None = None,
     archive: Path | None = None,
+    insecure: bool = False,
     force: bool = False,
 ) -> Path:
     dest = dest.expanduser().resolve()
@@ -344,16 +220,15 @@ def download_cvc_clinicdb(
         return extracted
 
     if source == "kaggle":
-        archive_path = _download_from_kaggle(dest)
+        archive_path = fetch_kaggle_dataset(KAGGLE_DATASET, dest)
     elif source == "url":
         if not url:
             raise ValueError("--source url requires --url")
         name = Path(urllib.parse.urlparse(url).path).name or "cvc-clinicdb.zip"
         archive_path = dest / name
-        if not archive_path.exists() or force:
-            _download(url, archive_path)
-        else:
-            print(f"Reusing existing archive: {archive_path}")
+        if force:
+            archive_path.unlink(missing_ok=True)
+        fetch(url, archive_path, insecure=insecure)
     elif source == "local":
         if not archive:
             raise ValueError("--source local requires --archive")
@@ -400,6 +275,11 @@ def _parse_args() -> argparse.Namespace:
         help="Path to an already-downloaded .zip/.rar. Required for --source local.",
     )
     parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification for --source url.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Re-download and re-extract even if the dataset is present.",
@@ -414,5 +294,6 @@ if __name__ == "__main__":
         source=args.source,
         url=args.url,
         archive=args.archive,
+        insecure=args.insecure,
         force=args.force,
     )

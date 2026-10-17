@@ -20,7 +20,7 @@ from models.factory import (
 )
 from models.mps_layer import AXIAL_OPERATOR_RANK, BYPASS_TT_RANK
 from models.tensor_train import binary_digits, capped_ranks, quantize_dimension, tensor_train_parameter_count
-from models.unet_hybrid import ENTRY_TT_RANK
+from models.unet import ENTRY_TT_RANK
 
 CONV_KERNEL_AREA = 9
 BATCHNORM_PARAMETERS_PER_CHANNEL = 2

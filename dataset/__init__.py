@@ -1,58 +1,73 @@
-"""YAML-driven segmentation datasets, deterministic splits and DataLoader worker seeding."""
+"""YAML-driven segmentation datasets, deterministic splits and seeded DataLoaders."""
 
 from .base import GenericSegmentationDataset
-from .groups import grouped_partition_indices, groups_for_samples, load_group_map
-from .loader import load_dataset, read_config
-from .pairing import pair_by_stem
-from .predefined import carve_validation, declares_predefined_splits
-from .splits import (
+from .config import (
     DEFAULT_SPLIT_FRACTIONS,
+    DatasetConfig,
+    GroupedSplit,
+    GroupMap,
+    Pipelines,
+    PredefinedSplit,
+    RandomSplit,
+    SourceConfig,
+    SplitFractions,
+    discover_dataset_configs,
+    load_config,
+    parse_config,
+)
+from .groups import grouped_partition_indices, groups_for_samples, load_group_map
+from .pairing import pair_by_stem
+from .predefined import carve_validation
+from .splits import (
     DEFAULT_TEST_SET,
     DatasetSplits,
-    SplitFractions,
+    EvaluationSet,
     build_splits,
-    discover_dataset_configs,
     make_splits,
     parse_dataset_arg,
-    resolve_config,
     slugify_dataset_arg,
-    uses_foreground_map_metrics,
 )
+from .loading import build_loader, iter_segmentation_datasets, seed_dataloader_worker
 from .transforms import (
     EVAL_STAGE,
     TRAIN_STAGE,
+    Denormalization,
     assert_deterministic_pipeline,
     build_transforms_from_config,
-    stage_transform_specs,
 )
-from .workers import iter_segmentation_datasets, seed_dataloader_worker
 
 __all__ = [
     "GenericSegmentationDataset",
-    "load_dataset",
-    "read_config",
-    "pair_by_stem",
-    "build_transforms_from_config",
-    "stage_transform_specs",
-    "assert_deterministic_pipeline",
-    "TRAIN_STAGE",
-    "EVAL_STAGE",
+    "DatasetConfig",
+    "SourceConfig",
+    "Pipelines",
+    "RandomSplit",
+    "GroupedSplit",
+    "GroupMap",
+    "PredefinedSplit",
     "SplitFractions",
     "DEFAULT_SPLIT_FRACTIONS",
+    "discover_dataset_configs",
+    "load_config",
+    "parse_config",
+    "pair_by_stem",
+    "build_transforms_from_config",
+    "assert_deterministic_pipeline",
+    "Denormalization",
+    "TRAIN_STAGE",
+    "EVAL_STAGE",
     "DEFAULT_TEST_SET",
     "DatasetSplits",
+    "EvaluationSet",
     "build_splits",
-    "discover_dataset_configs",
     "make_splits",
     "parse_dataset_arg",
-    "resolve_config",
     "slugify_dataset_arg",
-    "uses_foreground_map_metrics",
     "carve_validation",
-    "declares_predefined_splits",
     "grouped_partition_indices",
     "groups_for_samples",
     "load_group_map",
+    "build_loader",
     "iter_segmentation_datasets",
     "seed_dataloader_worker",
 ]

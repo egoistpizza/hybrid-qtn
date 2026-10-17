@@ -1,15 +1,14 @@
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
 import numpy as np
 import pytest
 import torch
 
-from utils.metrics import MetricAccumulator, calculate_all_metrics, calculate_f2_score, calculate_hd95
+from utils.metrics import MetricAccumulator, calculate_f2_score
+
+
+def calculate_hd95(preds: torch.Tensor, targets: torch.Tensor) -> float:
+    accumulator = MetricAccumulator(compute_hd95=True)
+    accumulator.update(torch.where(preds > 0, 10.0, -10.0), targets)
+    return accumulator.compute()["hd95"]
 
 def test_f2_score_perfect_match():
     preds = torch.ones((2, 1, 64, 64))
@@ -70,15 +69,37 @@ def test_accumulator_averages_per_image_not_per_batch():
     assert accumulator.compute()["dice"] == pytest.approx(0.75, abs=1e-4)
 
 
-def test_accumulator_matches_single_batch_metrics():
+def test_accumulator_is_independent_of_batching():
     logits = torch.randn(4, 1, 16, 16)
     targets = (torch.rand(4, 1, 16, 16) > 0.5).float()
-    accumulator = MetricAccumulator(compute_hd95=True)
-    accumulator.update(logits, targets)
-    expected = calculate_all_metrics(logits, targets, compute_hd95=True)
-    assert accumulator.compute() == pytest.approx(expected, rel=1e-5)
+    whole, split = MetricAccumulator(compute_hd95=True), MetricAccumulator(compute_hd95=True)
+    whole.update(logits, targets)
+    split.update(logits[:1], targets[:1])
+    split.update(logits[1:], targets[1:])
+    assert split.compute() == pytest.approx(whole.compute(), rel=1e-5)
+
+
+def test_hd95_is_omitted_unless_computed():
+    accumulator = MetricAccumulator()
+    accumulator.update(torch.randn(2, 1, 8, 8), torch.ones(2, 1, 8, 8))
+    assert set(accumulator.compute()) == {"dice", "iou", "mae", "f2"}
 
 
 def test_accumulator_requires_updates():
     with pytest.raises(ValueError, match="before any update"):
         MetricAccumulator().compute()
+
+
+def test_perfect_prediction_scores_one():
+    accumulator = MetricAccumulator()
+    accumulator.update(torch.full((1, 1, 2, 2), 10.0), torch.ones(1, 1, 2, 2))
+    scores = accumulator.compute()
+    assert scores["dice"] == pytest.approx(1.0, abs=1e-3)
+    assert scores["iou"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_partial_overlap_ranks_dice_above_iou():
+    accumulator = MetricAccumulator()
+    accumulator.update(torch.tensor([[[[10.0, -10.0], [10.0, -10.0]]]]), torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]]))
+    scores = accumulator.compute()
+    assert 0.0 < scores["iou"] < scores["dice"] < 1.0

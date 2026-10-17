@@ -1,10 +1,3 @@
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
 import pytest
 import torch
 
@@ -21,8 +14,9 @@ def test_models_return_one_logit_map_at_input_resolution(model_type):
 
 def test_vanilla_model_has_no_transforms():
     model = build_segmentation_model("vanilla", bond_dim=32)
-    assert model.__class__.__name__ == "UNet"
-    assert not hasattr(model, "transform_1024")
+    assert model.transform_512 is None
+    assert model.transform_1024 is None
+    assert all("transform" not in key for key in model.state_dict())
 
 
 def test_hybrid_model_attaches_only_the_bottleneck_transform():

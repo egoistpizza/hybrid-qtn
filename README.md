@@ -113,10 +113,10 @@ Experiment tracking uses Weights & Biases:
 ### 3.4 Download the datasets
 
 ```bash
-hqtn hybrid-qtn:latest scripts/download_kvasir_seg.py
-hqtn hybrid-qtn:latest scripts/download_cvc_clinicdb.py
-hqtn hybrid-qtn:latest scripts/download_mass_roads.py
-hqtn hybrid-qtn:latest scripts/download_cod.py
+hqtn hybrid-qtn:latest -m scripts.download_kvasir_seg --insecure
+hqtn hybrid-qtn:latest -m scripts.download_cvc_clinicdb
+hqtn hybrid-qtn:latest -m scripts.download_mass_roads
+hqtn hybrid-qtn:latest -m scripts.download_cod
 ```
 
 | Dataset | Source | Credentials |
@@ -127,6 +127,10 @@ hqtn hybrid-qtn:latest scripts/download_cod.py
 | Camouflaged objects: COD10K, CAMO, CHAMELEON, NC4K (4,040 train / 6,473 test images) | Official SINet-V2 training and testing archives (Google Drive); non-commercial research use only | none |
 
 For Kaggle, export `KAGGLE_USERNAME` and `KAGGLE_KEY` before running the helper.
+
+Simula's server omits an intermediate TLS certificate, so the Kvasir-SEG download needs
+`--insecure`; the archive's size and SHA-256 are pinned and checked either way. Every
+downloader verifies the final image/mask pair counts and raises on any mismatch.
 
 ### 3.5 Verify the installation
 
@@ -211,14 +215,13 @@ Run all commands from the repository root. Invoke the profiler as a module: `pyt
 
 ```text
 ├── configs/              Dataset YAMLs (paths or predefined sources, train_transforms, eval_transforms, optional group_map)
-├── dataset/              Generic YAML-driven dataset, deterministic 70/15/15 or predefined benchmark splits, worker seeding
+├── dataset/              Typed config parsing (config.py), generic dataset, random / grouped / predefined splits, worker seeding
 ├── models/
-│   ├── unet_classic.py   Vanilla U-Net
-│   ├── unet_hybrid.py    U-Net with pluggable bottleneck transforms
+│   ├── unet.py           U-Net with optional bottleneck transforms
 │   ├── mps_layer.py      Axial MPS block
 │   └── factory.py        Model construction shared by train, evaluate and export
-├── scripts/              Dataset downloaders, bottleneck profiler, multi-seed runner
-├── utils/                Loss functions, metrics (incl. full-resolution foreground-map metrics), seeding, VRAM profiling, run naming
+├── scripts/              Dataset downloaders over a shared fetch module, bottleneck profiler, multi-seed runner
+├── utils/                Losses, metrics, evaluation loop and suites, checkpoint I/O, run logging, seeding, run naming
 ├── tests/                Pytest suite
 ├── train.py              Training with live validation, SWA and test-set reporting
 ├── evaluate.py           Held-out evaluation and visualisation
