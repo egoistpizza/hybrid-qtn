@@ -68,23 +68,11 @@ def test_run_name_encodes_seed_and_tag():
     assert build_run_name("kvasir_seg", "vanilla", 32, "bce_dice", 42) == "kvasir_seg__vanilla_unet__bce_dice__seed42"
 
 
-def test_run_name_marks_the_cross_validation_fold():
-    assert build_run_name("cvc_clinicdb", "vanilla", 32, "focal_tversky", 42, "kaggle", fold=3) == (
-        "cvc_clinicdb__vanilla_unet__focal_tversky__seed42__fold3__kaggle"
-    )
-    assert build_run_name("cvc_clinicdb", "hybrid", 32, "focal_tversky", 42, fold=0) == (
-        "cvc_clinicdb__hybrid_unet_b32_rel_nope__focal_tversky__seed42__fold0"
-    )
-
-
 def test_run_name_describes_the_mps_variant():
     common = ("kvasir_seg", "hybrid", 32, "focal_tversky", 43, "kaggle")
     assert build_run_name(*common) == "kvasir_seg__hybrid_unet_b32_rel_nope__focal_tversky__seed43__kaggle"
     assert build_run_name(*common, MPSVariant("absolute", positional_encoding=True)) == (
         "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__kaggle"
-    )
-    assert build_run_name(*common, MPSVariant("circular")) == (
-        "kvasir_seg__hybrid_unet_b32_circ_nope__focal_tversky__seed43__kaggle"
     )
     assert build_run_name(*common, MPSVariant("absolute")) == (
         "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"

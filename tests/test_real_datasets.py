@@ -45,18 +45,10 @@ class TestDatasetConsistency:
         medical = [load_config(name, CONFIG_DIR).pipelines for name in ("kvasir_seg", "cvc_clinicdb")]
         assert medical[0] == medical[1]
 
-    def test_affine_cvc_config_differs_only_by_its_training_affine_step(self):
-        plain, affine = load_config("cvc_clinicdb", CONFIG_DIR), load_config("cvc_clinicdb_affine", CONFIG_DIR)
-        assert affine.split == plain.split
-        assert affine.pipelines.eval == plain.pipelines.eval
-        assert [spec for spec in affine.pipelines.train if spec["name"] != "Affine"] == list(plain.pipelines.train)
-        assert [spec["name"] for spec in affine.pipelines.train].index("Affine") == 1
-
     def test_every_config_in_the_repository_parses(self):
         assert {name: load_config(name, CONFIG_DIR).image_size for name in discover_dataset_configs(CONFIG_DIR)} == {
             "cod": 512,
             "cvc_clinicdb": 512,
-            "cvc_clinicdb_affine": 512,
             "kvasir_seg": 512,
             "mass_roads": 512,
         }

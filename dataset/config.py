@@ -41,18 +41,9 @@ PIPELINE_KEYS = ("train_transforms", "eval_transforms", "transforms")
 PREDEFINED_SPLIT_KEYS = ("sources", "train_sources", "test_sources", "validation_fraction")
 GROUP_MAP_KEY = "group_map"
 GROUP_MAP_KEYS = ("csv", "sample_column", "group_column")
-CROSS_VALIDATION_KEY = "cross_validation_folds"
 FOREGROUND_MAP_METRICS_KEY = "foreground_map_metrics"
 KNOWN_KEYS = frozenset(
-    {
-        "dataset_name",
-        FOREGROUND_MAP_METRICS_KEY,
-        GROUP_MAP_KEY,
-        CROSS_VALIDATION_KEY,
-        *SOURCE_KEYS,
-        *PIPELINE_KEYS,
-        *PREDEFINED_SPLIT_KEYS,
-    }
+    {"dataset_name", FOREGROUND_MAP_METRICS_KEY, GROUP_MAP_KEY, *SOURCE_KEYS, *PIPELINE_KEYS, *PREDEFINED_SPLIT_KEYS}
 )
 
 
@@ -135,15 +126,11 @@ class GroupMap:
 
 @dataclass(frozen=True)
 class GroupedSplit:
-    """Holdout split in which every group of ``group_map`` lands in one partition; see ``dataset/groups.py``.
-
-    With ``folds``, a run can instead select one fold of a grouped K-fold cross-validation.
-    """
+    """Holdout split in which every group of ``group_map`` lands in one partition; see ``dataset/groups.py``."""
 
     source: SourceConfig
     group_map: GroupMap
     fractions: SplitFractions = DEFAULT_SPLIT_FRACTIONS
-    folds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -214,7 +201,7 @@ def _predefined_split(name: str, raw: Mapping[str, Any]) -> PredefinedSplit:
     missing = [key for key in PREDEFINED_SPLIT_KEYS if key not in raw]
     if missing:
         raise ValueError(f"{name}: predefined splits also need {missing}")
-    conflicting = [key for key in (GROUP_MAP_KEY, CROSS_VALIDATION_KEY, *SOURCE_DIRECTORY_KEYS) if key in raw]
+    conflicting = [key for key in (GROUP_MAP_KEY, *SOURCE_DIRECTORY_KEYS) if key in raw]
     if conflicting:
         raise ValueError(f"{name}: {conflicting} cannot be combined with predefined splits")
 
@@ -254,20 +241,15 @@ def _predefined_split(name: str, raw: Mapping[str, Any]) -> PredefinedSplit:
 def _holdout_split(name: str, raw: Mapping[str, Any]) -> RandomSplit | GroupedSplit:
     source = _source(name, raw)
     group_map = raw.get(GROUP_MAP_KEY)
-    folds = raw.get(CROSS_VALIDATION_KEY)
     if group_map is None:
-        if folds is not None:
-            raise ValueError(f"{name}: {CROSS_VALIDATION_KEY} needs a {GROUP_MAP_KEY}")
         return RandomSplit(source)
-    if folds is not None and (isinstance(folds, bool) or not isinstance(folds, int) or folds < 2):
-        raise ValueError(f"{name}: {CROSS_VALIDATION_KEY} must be an integer of at least 2, got {folds!r}")
     if not isinstance(group_map, Mapping) or "csv" not in group_map:
         raise ValueError(f"{name}: {GROUP_MAP_KEY} must be a mapping with a csv entry")
     unknown = sorted(set(group_map) - set(GROUP_MAP_KEYS))
     if unknown:
         raise ValueError(f"{name}: {GROUP_MAP_KEY} has unknown keys {unknown}")
     columns = {key: str(group_map[key]) for key in ("sample_column", "group_column") if key in group_map}
-    return GroupedSplit(source, GroupMap(csv=_resolve(group_map["csv"]), **columns), folds=folds)
+    return GroupedSplit(source, GroupMap(csv=_resolve(group_map["csv"]), **columns))
 
 
 def parse_config(raw: Mapping[str, Any]) -> DatasetConfig:

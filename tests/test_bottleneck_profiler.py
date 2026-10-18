@@ -25,7 +25,6 @@ def test_axial_bottleneck_formula_matches_the_hybrid_unet(bond_dim):
     [
         (MPSVariant(), 1_161_409, 91.798),
         (MPSVariant("relative", positional_encoding=True), 1_226_945, 91.335),
-        (MPSVariant("circular"), 1_146_585, 91.903),
         (MPSVariant("absolute"), 1_226_737, 91.336),
         (MPSVariant("absolute", positional_encoding=True), 1_292_273, 90.874),
     ],
@@ -37,7 +36,7 @@ def test_bottleneck_budget_at_bond_dimension_thirty_two(variant, parameters, red
     assert reduction_percentage(standard, axial) == pytest.approx(reduction, abs=1e-3)
 
 
-@pytest.mark.parametrize("axial_operator", ["absolute", "relative", "circular"])
+@pytest.mark.parametrize("axial_operator", ["absolute", "relative"])
 @pytest.mark.parametrize("positional_encoding", [True, False])
 @pytest.mark.parametrize("bond_dim", [16, 32])
 def test_every_mps_variant_formula_matches_the_hybrid_unet(axial_operator, positional_encoding, bond_dim):

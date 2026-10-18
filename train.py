@@ -71,7 +71,6 @@ class TrainingConfig:
     focal_gamma: float
     image_size: int
     mps_variant: MPSVariant = field(default_factory=MPSVariant)
-    fold: Optional[int] = None
     accumulation_steps: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
@@ -296,7 +295,6 @@ def parse_arguments() -> argparse.Namespace:
         help="Use deterministic GPU kernels for bit-identical reruns on the same GPU type (about 4x slower)",
     )
     parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Comma-separated dataset configs. Available: {available}")
-    parser.add_argument("--fold", type=int, default=None, help="Cross-validation fold; needs cross_validation_folds in the config")
     parser.add_argument("--tag", type=str, default=None, help="Suffix to distinguish runs of the same config")
     return parser.parse_args()
 
@@ -349,12 +347,11 @@ def main() -> None:
     dataset_names = parse_dataset_arg(arguments.dataset)
     seed_everything(arguments.seed, deterministic_algorithms=arguments.deterministic)
     device = get_device()
-    splits = build_splits(dataset_names, fold=arguments.fold)
+    splits = build_splits(dataset_names)
     dataset_slug = slugify_dataset_arg(dataset_names)
     variant = mps_variant(arguments)
     run_name = build_run_name(
-        dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag, variant,
-        arguments.fold,
+        dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag, variant
     )
 
     config = TrainingConfig(
@@ -370,7 +367,6 @@ def main() -> None:
         focal_gamma=arguments.focal_gamma,
         image_size=splits.image_size,
         mps_variant=variant,
-        fold=arguments.fold,
         deterministic=arguments.deterministic,
         checkpoint_dir=str(CHECKPOINT_ROOT / run_name),
     )

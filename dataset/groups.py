@@ -10,9 +10,7 @@ same-sequence sibling in training. A dataset opts in with a ``group_map`` block:
       sample_column: sample_id
       group_column: sequence_id
 
-Datasets without the block keep the plain random split. A top-level
-``cross_validation_folds: K`` additionally enables grouped K-fold cross-validation
-(:func:`grouped_kfold_indices`), selected per run with ``--fold``.
+Datasets without the block keep the plain random split.
 """
 
 from __future__ import annotations
@@ -123,53 +121,3 @@ def grouped_partition_indices(
 
     assert sum(len(partition) for partition in index_partitions) == len(groups)
     return index_partitions
-
-
-def _assign_groups_to_folds(members: dict[str, list[int]], folds: int, seed: int) -> list[list[str]]:
-    order = sorted(members)
-    random.Random(seed).shuffle(order)
-    order.sort(key=lambda group: len(members[group]), reverse=True)
-    assignment: list[list[str]] = [[] for _ in range(folds)]
-    loads = [0] * folds
-    for group in order:
-        lightest = min(range(folds), key=lambda fold: (loads[fold], fold))
-        assignment[lightest].append(group)
-        loads[lightest] += len(members[group])
-    return assignment
-
-
-def grouped_kfold_indices(
-    groups: Sequence[str],
-    folds: int,
-    fold: int,
-    val_fraction: float,
-    seed: int,
-) -> tuple[list[int], list[int], list[int]]:
-    """Train, validation and test indices of one fold of a grouped K-fold split.
-
-    Groups are shuffled from sorted order (deterministic across platforms), then assigned
-    largest first to the fold with the fewest samples, so folds are balanced by sample
-    count and every group is tested in exactly one fold. Validation takes whole groups
-    from the remaining ones, about ``val_fraction`` of all samples (see
-    :func:`grouped_partition_indices`); the rest is training.
-
-    Raises:
-        ValueError: If ``folds`` < 2, ``fold`` is out of range, or there are too few groups.
-    """
-    if folds < 2:
-        raise ValueError(f"cross-validation needs at least 2 folds, got {folds}")
-    if not 0 <= fold < folds:
-        raise ValueError(f"fold must lie in [0, {folds - 1}], got {fold}")
-    members: dict[str, list[int]] = {}
-    for index, group in enumerate(groups):
-        members.setdefault(group, []).append(index)
-    if len(members) < folds + 2:
-        raise ValueError(f"{folds}-fold cross-validation needs at least {folds + 2} groups, got {len(members)}")
-
-    test_groups = set(_assign_groups_to_folds(members, folds, seed)[fold])
-    pool = [index for index, group in enumerate(groups) if group not in test_groups]
-    pool_train, pool_val = grouped_partition_indices(
-        [groups[index] for index in pool], (val_fraction * len(groups) / len(pool),), seed
-    )
-    test = sorted(index for group in test_groups for index in members[group])
-    return sorted(pool[i] for i in pool_train), sorted(pool[i] for i in pool_val), test

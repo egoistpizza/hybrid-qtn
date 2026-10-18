@@ -6,14 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.tensor_train import AbsoluteAxialOperator, CircularAxialOperator, RelativeAxialOperator, TTConv2d
+from models.tensor_train import AbsoluteAxialOperator, RelativeAxialOperator, TTConv2d
 
-AXIAL_OPERATORS = {
-    "absolute": AbsoluteAxialOperator,
-    "relative": RelativeAxialOperator,
-    "circular": CircularAxialOperator,
-}
-OPERATOR_NAME_SUFFIXES = {"absolute": "", "relative": "_rel", "circular": "_circ"}
+AXIAL_OPERATORS = {"absolute": AbsoluteAxialOperator, "relative": RelativeAxialOperator}
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
@@ -25,8 +20,7 @@ class MPSVariant:
 
     Attributes:
         axial_operator: ``relative`` (:class:`RelativeAxialOperator`, weights depend only on the
-            offset, so the block is shift-equivariant), ``circular`` (:class:`CircularAxialOperator`,
-            the offset wraps around the axis) or ``absolute`` (:class:`AbsoluteAxialOperator`,
+            offset, so the block is shift-equivariant) or ``absolute`` (:class:`AbsoluteAxialOperator`,
             separate weights per position pair).
         positional_encoding: Whether a learned positional encoding is added to the block input.
     """
@@ -42,11 +36,11 @@ class MPSVariant:
 
     @property
     def name_suffix(self) -> str:
-        """``_rel`` or ``_circ`` for relative or circular operators and ``_nope`` without positional encoding.
+        """``_rel`` for relative operators and ``_nope`` without positional encoding.
 
         The suffix describes the settings, not the defaults, so names stay comparable across versions.
         """
-        return OPERATOR_NAME_SUFFIXES[self.axial_operator] + ("" if self.positional_encoding else "_nope")
+        return ("_rel" if self.axial_operator == "relative" else "") + ("" if self.positional_encoding else "_nope")
 
 
 class SeparablePositionalEncoding2D(nn.Module):

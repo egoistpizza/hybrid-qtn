@@ -6,7 +6,7 @@ from tests.real_data import require_on_disk, whole_dataset
 PREVIEW_SAMPLES = 3
 
 
-@pytest.mark.parametrize("dataset_name", ["cvc_clinicdb", "cvc_clinicdb_affine", "kvasir_seg"])
+@pytest.mark.parametrize("dataset_name", ["cvc_clinicdb", "kvasir_seg"])
 def test_training_augmentations_render_preview(dataset_name, tmp_path):
     config = require_on_disk(dataset_name)
     dataset = whole_dataset(config)

@@ -15,7 +15,7 @@ from .config import (
     load_config,
     parse_config,
 )
-from .groups import grouped_kfold_indices, grouped_partition_indices, groups_for_samples, load_group_map
+from .groups import grouped_partition_indices, groups_for_samples, load_group_map
 from .pairing import pair_by_stem
 from .predefined import carve_validation
 from .splits import (
@@ -64,7 +64,6 @@ __all__ = [
     "parse_dataset_arg",
     "slugify_dataset_arg",
     "carve_validation",
-    "grouped_kfold_indices",
     "grouped_partition_indices",
     "groups_for_samples",
     "load_group_map",

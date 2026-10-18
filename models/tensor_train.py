@@ -271,8 +271,7 @@ class RelativeAxialOperator(nn.Module):
         super().__init__()
         self.bond_dim = bond_dim
         self.spatial_size = spatial_size
-        self.offset_slots = self.offset_slot_count(spatial_size)
-        self.site_roles = interleaved_site_roles(binary_digits(self.offset_slots), binary_digits(bond_dim))
+        self.site_roles = interleaved_site_roles(binary_digits(2 * spatial_size), binary_digits(bond_dim))
         self.chain = TensorTrain(
             input_modes=(2,) * len(self.site_roles),
             output_modes=tuple(2 if role == "channel" else 1 for role in self.site_roles),
@@ -283,47 +282,22 @@ class RelativeAxialOperator(nn.Module):
         offset_sites = [site for site, role in enumerate(self.site_roles) if role == "spatial"]
         output_digits = [len(self.site_roles) + digit for digit in range(len(channel_sites))]
         self.axis_order = (*channel_sites, *offset_sites, *output_digits)
-        self.register_buffer("offset_index", self.offset_table(spatial_size), persistent=False)
-
-    @staticmethod
-    def offset_slot_count(spatial_size: int) -> int:
-        return 2 * spatial_size
-
-    @staticmethod
-    def offset_table(spatial_size: int) -> torch.Tensor:
-        """Kernel slot of every ``(in_position, out_position)`` pair: slot ``k`` holds offset
-        ``k - spatial_size``; slot 0 (offset ``-spatial_size``) is never used."""
         positions = torch.arange(spatial_size)
-        return positions[None, :] - positions[:, None] + spatial_size
+        self.register_buffer("offset_index", positions[None, :] - positions[:, None] + spatial_size, persistent=False)
 
     def kernel(self) -> torch.Tensor:
-        """Kernel of shape ``(in_channel, offset_slots, out_channel)``, indexed by :meth:`offset_table`."""
+        """Kernel of shape ``(in_channel, 2 * spatial_size, out_channel)``.
+
+        Slot ``k`` holds offset ``k - spatial_size``; slot 0 (offset ``-spatial_size``) is never used.
+        """
         digit_count = len(self.site_roles) + self.site_roles.count("channel")
         return (
             self.chain.materialize()
             .reshape((2,) * digit_count)
             .permute(self.axis_order)
-            .reshape(self.bond_dim, self.offset_slots, self.bond_dim)
+            .reshape(self.bond_dim, 2 * self.spatial_size, self.bond_dim)
         )
 
     def materialize(self) -> torch.Tensor:
-        """Dense operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
+        """Dense Toeplitz operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
         return self.kernel()[:, self.offset_index, :]
-
-
-class CircularAxialOperator(RelativeAxialOperator):
-    """Circulant variant of :class:`RelativeAxialOperator`: ``W[c, h, j, d] = K[c, d, (j - h) mod N]``.
-
-    Offsets wrap around the axis, so the operator has no edges from which absolute position
-    could be inferred and commutes exactly with circular shifts. The kernel has ``N`` offset
-    slots instead of ``2N``.
-    """
-
-    @staticmethod
-    def offset_slot_count(spatial_size: int) -> int:
-        return spatial_size
-
-    @staticmethod
-    def offset_table(spatial_size: int) -> torch.Tensor:
-        positions = torch.arange(spatial_size)
-        return (positions[None, :] - positions[:, None]) % spatial_size

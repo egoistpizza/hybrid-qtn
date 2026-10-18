@@ -15,7 +15,7 @@ from torch.utils.data import ConcatDataset, Dataset, Subset
 
 from .base import GenericSegmentationDataset
 from .config import DatasetConfig, GroupedSplit, PredefinedSplit, SplitFractions, load_config
-from .groups import grouped_kfold_indices, grouped_partition_indices, groups_for_samples
+from .groups import grouped_partition_indices, groups_for_samples
 from .predefined import predefined_split_datasets
 from .transforms import EVAL_STAGE, TRAIN_STAGE, Denormalization
 
@@ -71,24 +71,15 @@ def _random_partition_indices(total: int, fractions: SplitFractions, seed: int) 
     )
 
 
-def _holdout_split_datasets(
-    config: DatasetConfig, seed: int, fold: int | None
-) -> tuple[Dataset, Dataset, dict[str, Dataset]]:
+def _holdout_split_datasets(config: DatasetConfig, seed: int) -> tuple[Dataset, Dataset, dict[str, Dataset]]:
     split = config.split
-    if fold is not None and not (isinstance(split, GroupedSplit) and split.folds):
-        raise ValueError(f"{config.name}: --fold needs a grouped config with cross_validation_folds")
     train_dataset = GenericSegmentationDataset(split.source, config.pipelines, stage=TRAIN_STAGE)
     eval_dataset = train_dataset.with_stage(EVAL_STAGE)
     if isinstance(split, GroupedSplit):
         groups = groups_for_samples((sample_id for _, _, sample_id in train_dataset.samples), split.group_map)
-        if fold is None:
-            train_indices, val_indices, test_indices = grouped_partition_indices(
-                groups, (split.fractions.val, split.fractions.test), seed
-            )
-        else:
-            train_indices, val_indices, test_indices = grouped_kfold_indices(
-                groups, split.folds, fold, split.fractions.val, seed
-            )
+        train_indices, val_indices, test_indices = grouped_partition_indices(
+            groups, (split.fractions.val, split.fractions.test), seed
+        )
     else:
         train_indices, val_indices, test_indices = _random_partition_indices(len(train_dataset), split.fractions, seed)
     return (
@@ -98,21 +89,16 @@ def _holdout_split_datasets(
     )
 
 
-def make_splits(config: DatasetConfig, seed: int = DEFAULT_SPLIT_SEED, fold: int | None = None) -> DatasetSplits:
-    """Split one dataset by its split policy, or by one cross-validation ``fold``.
+def make_splits(config: DatasetConfig, seed: int = DEFAULT_SPLIT_SEED) -> DatasetSplits:
+    """Split one dataset by its split policy.
 
     Training uses the ``train`` pipeline; validation and test use the deterministic
     ``eval`` pipeline.
-
-    Raises:
-        ValueError: If ``fold`` is given for a config without ``cross_validation_folds``.
     """
     if isinstance(config.split, PredefinedSplit):
-        if fold is not None:
-            raise ValueError(f"{config.name}: --fold needs a grouped config with cross_validation_folds")
         train, val, test_sets = predefined_split_datasets(config, seed)
     else:
-        train, val, test_sets = _holdout_split_datasets(config, seed, fold)
+        train, val, test_sets = _holdout_split_datasets(config, seed)
     def evaluation_set(dataset: Dataset) -> EvaluationSet:
         return EvaluationSet(dataset, config.foreground_map_metrics, config.pipelines.denormalization)
 
@@ -141,17 +127,15 @@ def build_splits(
     names: list[str],
     seed: int = DEFAULT_SPLIT_SEED,
     config_dir: str | Path | None = None,
-    fold: int | None = None,
 ) -> DatasetSplits:
     """Split each named dataset and concatenate the partitions for joint training.
 
     Test sets that share a name are concatenated; differently named sets stay separate.
-    ``fold`` selects one cross-validation fold of every dataset (see :func:`make_splits`).
 
     Raises:
         ValueError: If the datasets produce different input sizes.
     """
-    splits = [make_splits(load_config(name, config_dir), seed, fold) for name in names]
+    splits = [make_splits(load_config(name, config_dir), seed) for name in names]
     if len(splits) == 1:
         return splits[0]
     sizes = {name: split.image_size for name, split in zip(names, splits)}

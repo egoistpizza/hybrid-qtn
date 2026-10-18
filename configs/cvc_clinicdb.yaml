@@ -15,10 +15,6 @@ group_map:
   sample_column: sample_id
   group_column: sequence_id
 
-# Grouped K-fold cross-validation: `--fold k` (0 <= k < 5) tests on the sequences of fold k
-# and carves validation from the rest; without --fold the holdout split above is used.
-cross_validation_folds: 5
-
 dataset_name: cvc-clinicdb
 
 # Quoted: "Ground Truth" contains a space.
