@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from utils.hardware import reset_peak_vram, vram_metrics
+from models.mps_layer import MPSVariant
 from utils.run_naming import build_run_name
 from utils.seed import seed_everything, seeded_generator
 
@@ -62,17 +63,20 @@ def test_vram_metrics_on_cpu_are_zero_and_complete():
 
 def test_run_name_encodes_seed_and_tag():
     assert build_run_name("kvasir_seg", "hybrid", 32, "focal_tversky", 43, "ablation") == (
-        "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__ablation"
+        "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__ablation"
     )
     assert build_run_name("kvasir_seg", "vanilla", 32, "bce_dice", 42) == "kvasir_seg__vanilla_unet__bce_dice__seed42"
 
 
-def test_run_name_marks_the_mps_variant_and_keeps_default_names():
+def test_run_name_describes_the_mps_variant():
     common = ("kvasir_seg", "hybrid", 32, "focal_tversky", 43, "kaggle")
-    assert build_run_name(*common) == "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__kaggle"
-    assert build_run_name(*common, axial_operator="relative", positional_encoding=False) == (
+    assert build_run_name(*common) == "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"
+    assert build_run_name(*common, MPSVariant(positional_encoding=True)) == (
+        "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__kaggle"
+    )
+    assert build_run_name(*common, MPSVariant("relative")) == (
         "kvasir_seg__hybrid_unet_b32_rel_nope__focal_tversky__seed43__kaggle"
     )
-    assert build_run_name(*common, positional_encoding=False) == (
-        "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"
+    assert build_run_name("kvasir_seg", "vanilla", 32, "focal_tversky", 43) == (
+        "kvasir_seg__vanilla_unet__focal_tversky__seed43"
     )

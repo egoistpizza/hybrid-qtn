@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from models.tensor_train import (
-    QuantizedAxialOperator,
+    AbsoluteAxialOperator,
     RelativeAxialOperator,
     TensorTrain,
     TTConv2d,
@@ -112,14 +112,14 @@ def test_interleaved_roles_alternate_spatial_and_channel_bits():
 
 
 def test_identity_cores_materialize_the_identity_operator():
-    operator = QuantizedAxialOperator(bond_dim=4, spatial_size=8, max_rank=4)
+    operator = AbsoluteAxialOperator(bond_dim=4, spatial_size=8, max_rank=4)
     set_cores(operator.chain, [IDENTITY] * len(operator.site_roles))
     expected = torch.einsum("cd,hj->chjd", torch.eye(4), torch.eye(8))
     assert torch.equal(operator.materialize(), expected)
 
 
 def test_channel_bit_flip_maps_to_the_channel_axis_only():
-    operator = QuantizedAxialOperator(bond_dim=4, spatial_size=2, max_rank=4)
+    operator = AbsoluteAxialOperator(bond_dim=4, spatial_size=2, max_rank=4)
     most_significant_channel_site = operator.site_roles.index("channel")
     cores = [BIT_FLIP if site == most_significant_channel_site else IDENTITY for site in range(len(operator.site_roles))]
     set_cores(operator.chain, cores)
@@ -129,7 +129,7 @@ def test_channel_bit_flip_maps_to_the_channel_axis_only():
 
 
 def test_spatial_bit_flip_maps_to_the_spatial_axis_only():
-    operator = QuantizedAxialOperator(bond_dim=2, spatial_size=4, max_rank=4)
+    operator = AbsoluteAxialOperator(bond_dim=2, spatial_size=4, max_rank=4)
     least_significant_spatial_site = len(operator.site_roles) - 1 - operator.site_roles[::-1].index("spatial")
     cores = [BIT_FLIP if site == least_significant_spatial_site else IDENTITY for site in range(len(operator.site_roles))]
     set_cores(operator.chain, cores)
@@ -139,7 +139,7 @@ def test_spatial_bit_flip_maps_to_the_spatial_axis_only():
 
 
 def test_materialization_runs_in_float32_under_autocast():
-    operator = QuantizedAxialOperator(bond_dim=4, spatial_size=4, max_rank=4)
+    operator = AbsoluteAxialOperator(bond_dim=4, spatial_size=4, max_rank=4)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         assert operator.materialize().dtype == torch.float32
 
@@ -179,7 +179,7 @@ def test_relative_operator_parameter_count_follows_the_offset_and_channel_sites(
     output_modes = tuple(2 if role == "channel" else 1 for role in operator.site_roles)
     expected = tensor_train_parameter_count((2,) * len(operator.site_roles), output_modes, 64)
     assert sum(parameter.numel() for parameter in operator.parameters()) == expected == 41_608
-    assert expected < sum(parameter.numel() for parameter in QuantizedAxialOperator(32, 32, 64).parameters())
+    assert expected < sum(parameter.numel() for parameter in AbsoluteAxialOperator(32, 32, 64).parameters())
 
 
 def test_relative_materialization_runs_in_float32_under_autocast():

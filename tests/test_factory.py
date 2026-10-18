@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from models.factory import build_segmentation_model, spatial_size_at
+from models.mps_layer import MPSVariant
 
 
 @pytest.mark.parametrize("model_type", ["vanilla", "hybrid", "deep_hybrid"])
@@ -61,8 +62,14 @@ def test_tensorized_bottleneck_is_below_ten_percent_of_the_standard_bottleneck()
     assert count(hybrid.down4) + count(hybrid.transform_1024) < 0.1 * count(vanilla.down4)
 
 
-def test_relative_hybrid_without_positional_encoding_keeps_the_output_shape():
-    model = build_segmentation_model("deep_hybrid", 4, 64, axial_operator="relative", positional_encoding=False).eval()
+def test_hybrid_models_have_no_positional_encoding_by_default():
+    model = build_segmentation_model("deep_hybrid", bond_dim=4, image_size=64)
+    assert model.transform_512.axial_mps.positional_encoding is None
+    assert model.transform_1024.axial_mps.positional_encoding is None
+
+
+def test_relative_hybrid_keeps_the_output_shape():
+    model = build_segmentation_model("deep_hybrid", 4, 64, MPSVariant("relative")).eval()
     assert model.transform_1024.axial_mps.positional_encoding is None
     assert model.transform_512.axial_mps.row_operator.materialize().shape == (4, 8, 8, 4)
     with torch.no_grad():
@@ -71,4 +78,4 @@ def test_relative_hybrid_without_positional_encoding_keeps_the_output_shape():
 
 def test_mps_settings_are_rejected_for_the_vanilla_model():
     with pytest.raises(ValueError, match="only apply to models with MPS blocks"):
-        build_segmentation_model("vanilla", 32, axial_operator="relative")
+        build_segmentation_model("vanilla", 32, variant=MPSVariant("relative"))

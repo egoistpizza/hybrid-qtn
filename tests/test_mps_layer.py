@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from models.mps_layer import AxialMPSLayer, MPSBottleneck, SeparablePositionalEncoding2D
+from models.mps_layer import AxialMPSLayer, MPSBottleneck, MPSVariant, SeparablePositionalEncoding2D
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ def test_mps_bottleneck_gradient_flow(sample_tensor: torch.Tensor):
 
 def shift_response(axial_operator: str, shift: int) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
-    layer = AxialMPSLayer(8, 4, 16, 16, axial_operator=axial_operator, positional_encoding=False).eval()
+    layer = AxialMPSLayer(8, 4, 16, 16, variant=MPSVariant(axial_operator)).eval()
     with torch.no_grad():
         layer.in_proj.bias.zero_()
         layer.out_proj.bias.zero_()
@@ -92,23 +92,23 @@ def test_absolute_layer_output_does_not_follow_a_shifted_input():
     assert not torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-3)
 
 
-def test_disabling_the_positional_encoding_removes_its_parameters():
+def test_positional_encoding_is_opt_in_and_adds_its_parameters():
     def count(layer):
         return sum(parameter.numel() for parameter in layer.parameters())
 
-    with_encoding = AxialMPSLayer(64, 16, 32, 32)
-    without_encoding = AxialMPSLayer(64, 16, 32, 32, positional_encoding=False)
+    with_encoding = AxialMPSLayer(64, 16, 32, 32, variant=MPSVariant(positional_encoding=True))
+    without_encoding = AxialMPSLayer(64, 16, 32, 32)
     assert without_encoding.positional_encoding is None
     assert count(with_encoding) - count(without_encoding) == 64 * (32 + 32)
 
 
 def test_unknown_axial_operator_raises():
     with pytest.raises(ValueError, match="Unknown axial_operator"):
-        AxialMPSLayer(64, 16, 32, 32, axial_operator="circular")
+        MPSVariant("circular")
 
 
 def test_relative_bottleneck_gradient_reaches_every_core(sample_tensor: torch.Tensor):
-    bottleneck = MPSBottleneck(64, 16, 32, 32, axial_operator="relative", positional_encoding=False)
+    bottleneck = MPSBottleneck(64, 16, 32, 32, variant=MPSVariant("relative"))
     bottleneck(sample_tensor).mean().backward()
     cores = [*bottleneck.axial_mps.row_operator.chain.cores, *bottleneck.axial_mps.column_operator.chain.cores]
     assert all(core.grad is not None and torch.any(core.grad != 0) for core in cores)

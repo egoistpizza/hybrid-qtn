@@ -7,7 +7,7 @@ live and the SWA model are evaluated once on each test set after training.
 
 import argparse
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -28,7 +28,8 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
-from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model
+from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model, mps_variant
+from models.mps_layer import MPSVariant
 from utils import get_device
 from utils.checkpoints import BEST_LIVE_CHECKPOINT, INTERRUPTED_CHECKPOINT, SWA_CHECKPOINT, load_weights, save_weights
 from utils.evaluation import evaluate_model, metric_suites
@@ -69,8 +70,7 @@ class TrainingConfig:
     fp_weight: float
     focal_gamma: float
     image_size: int
-    axial_operator: str = "absolute"
-    positional_encoding: bool = True
+    mps_variant: MPSVariant = field(default_factory=MPSVariant)
     accumulation_steps: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
@@ -349,15 +349,9 @@ def main() -> None:
     device = get_device()
     splits = build_splits(dataset_names)
     dataset_slug = slugify_dataset_arg(dataset_names)
+    variant = mps_variant(arguments)
     run_name = build_run_name(
-        dataset_slug,
-        arguments.model,
-        arguments.bond_dim,
-        arguments.loss,
-        arguments.seed,
-        arguments.tag,
-        axial_operator=arguments.axial_operator,
-        positional_encoding=arguments.positional_encoding,
+        dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag, variant
     )
 
     config = TrainingConfig(
@@ -372,8 +366,7 @@ def main() -> None:
         fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
         image_size=splits.image_size,
-        axial_operator=arguments.axial_operator,
-        positional_encoding=arguments.positional_encoding,
+        mps_variant=variant,
         deterministic=arguments.deterministic,
         checkpoint_dir=str(CHECKPOINT_ROOT / run_name),
     )
@@ -381,9 +374,7 @@ def main() -> None:
     test_sizes = ", ".join(f"{len(test_set.dataset)} {name}" for name, test_set in splits.test_sets.items())
     logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val.dataset)} val / test: {test_sizes}")
 
-    model = build_segmentation_model(
-        config.model_type, config.bond_dim, config.image_size, config.axial_operator, config.positional_encoding
-    )
+    model = build_segmentation_model(config.model_type, config.bond_dim, config.image_size, config.mps_variant)
     total_params = log_parameter_breakdown(model)
     model = model.to(device).to(memory_format=torch.channels_last)
     model = compile_with_warmup(model, config, device)

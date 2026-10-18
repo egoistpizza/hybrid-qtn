@@ -202,7 +202,7 @@ def interleaved_site_roles(spatial_bits: int, channel_bits: int) -> tuple[str, .
     return tuple(roles)
 
 
-class QuantizedAxialOperator(nn.Module):
+class AbsoluteAxialOperator(nn.Module):
     """Absolute-position linear operator along one image axis on the joint (channel, position) index.
 
     Every pair of input and output positions has its own weights, so the operator is not

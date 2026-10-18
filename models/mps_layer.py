@@ -1,15 +1,46 @@
 """Axial matrix product state (MPS) bottleneck for the hybrid U-Net."""
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.tensor_train import QuantizedAxialOperator, RelativeAxialOperator, TTConv2d
+from models.tensor_train import AbsoluteAxialOperator, RelativeAxialOperator, TTConv2d
 
-AXIAL_OPERATORS = {"absolute": QuantizedAxialOperator, "relative": RelativeAxialOperator}
+AXIAL_OPERATORS = {"absolute": AbsoluteAxialOperator, "relative": RelativeAxialOperator}
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
+
+
+@dataclass(frozen=True)
+class MPSVariant:
+    """Design choices of the MPS block.
+
+    Attributes:
+        axial_operator: ``absolute`` (:class:`AbsoluteAxialOperator`, separate weights per
+            position pair) or ``relative`` (:class:`RelativeAxialOperator`, weights depend only
+            on the offset, so the block is shift-equivariant).
+        positional_encoding: Whether a learned positional encoding is added to the block input.
+    """
+
+    axial_operator: str = "absolute"
+    positional_encoding: bool = False
+
+    def __post_init__(self) -> None:
+        if self.axial_operator not in AXIAL_OPERATORS:
+            raise ValueError(
+                f"Unknown axial_operator {self.axial_operator!r}. Expected one of {tuple(AXIAL_OPERATORS)}."
+            )
+
+    @property
+    def name_suffix(self) -> str:
+        """``_rel`` for relative operators and ``_nope`` without positional encoding.
+
+        The suffix describes the settings, not the defaults, so names stay comparable across versions.
+        """
+        return ("_rel" if self.axial_operator == "relative" else "") + ("" if self.positional_encoding else "_nope")
 
 
 class SeparablePositionalEncoding2D(nn.Module):
@@ -41,10 +72,7 @@ class AxialMPSLayer(nn.Module):
         height: Feature-map height; fixes the size of the row operator.
         width: Feature-map width; fixes the size of the column operator.
         operator_rank: Bond dimension (chi) of the axial operators.
-        axial_operator: ``absolute`` (:class:`QuantizedAxialOperator`, separate weights per
-            position pair) or ``relative`` (:class:`RelativeAxialOperator`, weights depend only
-            on the offset, so the layer is shift-equivariant).
-        positional_encoding: Whether a learned positional encoding is added to the input.
+        variant: Axial operator type and positional encoding.
     """
 
     def __init__(
@@ -54,15 +82,12 @@ class AxialMPSLayer(nn.Module):
         height: int,
         width: int,
         operator_rank: int = AXIAL_OPERATOR_RANK,
-        axial_operator: str = "absolute",
-        positional_encoding: bool = True,
+        variant: MPSVariant = MPSVariant(),
     ):
         super().__init__()
-        if axial_operator not in AXIAL_OPERATORS:
-            raise ValueError(f"Unknown axial_operator {axial_operator!r}. Expected one of {tuple(AXIAL_OPERATORS)}.")
-        operator = AXIAL_OPERATORS[axial_operator]
+        operator = AXIAL_OPERATORS[variant.axial_operator]
         self.positional_encoding = (
-            SeparablePositionalEncoding2D(in_channels, height, width) if positional_encoding else None
+            SeparablePositionalEncoding2D(in_channels, height, width) if variant.positional_encoding else None
         )
         self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
         self.row_operator = operator(bond_dim, height, operator_rank)
@@ -83,8 +108,8 @@ class MPSBottleneck(nn.Module):
     """Residual bottleneck block combining the axial MPS layer with a local TT-Conv1x1 bypass.
 
     Computes ``x + GELU(BN(axial_mps(BN(x)) + bypass(BN(x))))``; input and output shapes
-    are identical, so the block can follow any encoder stage. ``axial_operator`` and
-    ``positional_encoding`` are passed to :class:`AxialMPSLayer`.
+    are identical, so the block can follow any encoder stage. ``variant`` is passed to
+    :class:`AxialMPSLayer`.
     """
 
     def __init__(
@@ -95,14 +120,11 @@ class MPSBottleneck(nn.Module):
         width: int,
         operator_rank: int = AXIAL_OPERATOR_RANK,
         bypass_rank: int = BYPASS_TT_RANK,
-        axial_operator: str = "absolute",
-        positional_encoding: bool = True,
+        variant: MPSVariant = MPSVariant(),
     ):
         super().__init__()
         self.norm_pre = nn.BatchNorm2d(in_channels)
-        self.axial_mps = AxialMPSLayer(
-            in_channels, bond_dim, height, width, operator_rank, axial_operator, positional_encoding
-        )
+        self.axial_mps = AxialMPSLayer(in_channels, bond_dim, height, width, operator_rank, variant)
         self.local_bypass = TTConv2d(in_channels, in_channels, kernel_size=1, max_rank=bypass_rank, gain=1.0)
         self.norm_post = nn.BatchNorm2d(in_channels)
         self.activation = nn.GELU()

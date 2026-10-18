@@ -22,7 +22,7 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
-from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model
+from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model, mps_variant
 from utils import get_device
 from utils.checkpoints import evaluation_checkpoint, load_weights
 from utils.evaluation import Batch, evaluate_model, metric_suites
@@ -142,19 +142,12 @@ def main() -> None:
 
     splits = build_splits(dataset_names)
 
+    variant = mps_variant(args)
     run_name = args.run or build_run_name(
-        dataset_slug,
-        args.model,
-        args.bond_dim,
-        args.loss,
-        args.seed,
-        args.tag,
-        axial_operator=args.axial_operator,
-        positional_encoding=args.positional_encoding,
+        dataset_slug, args.model, args.bond_dim, args.loss, args.seed, args.tag, variant
     )
-    model = build_segmentation_model(
-        args.model, args.bond_dim, splits.image_size, args.axial_operator, args.positional_encoding
-    ).to(device).to(memory_format=torch.channels_last)
+    model = build_segmentation_model(args.model, args.bond_dim, splits.image_size, variant)
+    model = model.to(device).to(memory_format=torch.channels_last)
     checkpoint = evaluation_checkpoint(Path("checkpoints") / run_name)
     print(f"Loading weights from: {checkpoint}")
     load_weights(model, checkpoint, device)
