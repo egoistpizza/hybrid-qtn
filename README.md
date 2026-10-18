@@ -59,7 +59,7 @@ With absolute operators each axial operator has 74,272 instead of 41,608 paramet
 
 | Aspect | Setting |
 |---|---|
-| Data split | 70 % train / 15 % validation / 15 % test with a **fixed split seed (42)**, independent of the training seed. CVC-ClinicDB is split by **colonoscopy sequence**, so no sequence appears in more than one partition. Camouflaged object detection follows the **official benchmark protocol**: COD10K-train + CAMO-train for training, with 10 % of each carved out for validation; COD10K, CAMO, CHAMELEON and NC4K are separate test sets. The two COD10K images that appear in both the official training and test folders are excluded from training. |
+| Data split | 70 % train / 15 % validation / 15 % test with a **fixed split seed (42)**, independent of the training seed. CVC-ClinicDB is split by **colonoscopy sequence**, so no sequence appears in more than one partition; it also supports **grouped 5-fold cross-validation** (`--fold 0`…`4`): the 29 sequences are assigned to five folds balanced by frame count, fold k is the test set, validation (about 15 % of the frames) is carved from the remaining sequences, and every frame is tested exactly once across the folds. Camouflaged object detection follows the **official benchmark protocol**: COD10K-train + CAMO-train for training, with 10 % of each carved out for validation; COD10K, CAMO, CHAMELEON and NC4K are separate test sets. The two COD10K images that appear in both the official training and test folders are excluded from training. |
 | Transforms | Training: Resize → random H/V flips → Normalize (horizontal flips only for the natural images of the camouflage benchmark). Validation and test: **deterministic** Resize → Normalize. Stochastic transforms in an evaluation pipeline raise an error. |
 | Loss | Focal Tversky (Abraham & Khan, 2019): TI = (TP + s) / (TP + w_FN·FN + w_FP·FP + s), L = (1 − TI)^{1/γ}, computed per image and averaged over the batch, with w_FN = 0.3, w_FP = 0.7, γ = 4/3, s = 1e-5. BCE + Dice is available via `--loss bce_dice`. |
 | Optimisation | AdamW (lr 2·10⁻⁴, weight decay 10⁻⁴), batch 4 × 8 gradient accumulation, cosine schedule, AMP, gradient clipping at 1.0 |
@@ -167,9 +167,10 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 | `--deterministic` | off; deterministic GPU kernels for bit-identical reruns on the same GPU type, about 4× slower |
 | `--axial_operator` | `relative` (default), `absolute`; hybrid models only |
 | `--positional_encoding` / `--no-positional_encoding` | off; hybrid models only |
+| `--fold` | cross-validation fold (configs with `cross_validation_folds`, e.g. CVC-ClinicDB); default: the holdout split |
 | `--tag` | free-form run suffix |
 
-Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__tag]/`; the model part of a hybrid run ends in `_rel` for relative operators and `_nope` without positional encoding (default hybrid runs end in `_rel_nope`; runs with absolute operators and the encoding, the configuration of all runs before these options existed, have no suffix):
+Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__fold<k>][__tag]/`; the model part of a hybrid run ends in `_rel` for relative operators and `_nope` without positional encoding (default hybrid runs end in `_rel_nope`; runs with absolute operators and the encoding, the configuration of all runs before these options existed, have no suffix):
 - `best_model.pth`: best live checkpoint by validation Dice
 - `best_swa_model.pth`: SWA model
 
@@ -224,7 +225,7 @@ Run all commands from the repository root. Invoke the profiler as a module: `pyt
 ## 6. Repository structure
 
 ```text
-├── configs/              Dataset YAMLs (paths or predefined sources, train_transforms, eval_transforms, optional group_map)
+├── configs/              Dataset YAMLs (paths or predefined sources, train_transforms, eval_transforms, optional group_map and cross_validation_folds)
 ├── dataset/              Typed config parsing (config.py), generic dataset, random / grouped / predefined splits, worker seeding
 ├── models/
 │   ├── unet.py           U-Net with optional bottleneck transforms

@@ -29,6 +29,14 @@ def test_group_map_selects_a_grouped_split(base_config, standard_transforms):
     assert isinstance(parse_config(base_config).split, GroupedSplit)
 
 
+def test_cross_validation_folds_are_read_from_a_grouped_config(base_config, standard_transforms):
+    base_config["transforms"] = standard_transforms
+    base_config["group_map"] = {"csv": "groups.csv"}
+    assert parse_config(base_config).split.folds is None
+    base_config["cross_validation_folds"] = 5
+    assert parse_config(base_config).split.folds == 5
+
+
 def test_source_defaults_follow_the_schema(base_config, standard_transforms):
     for key in ("strict_pairing", "mask_threshold"):
         del base_config[key]
@@ -53,6 +61,9 @@ def test_image_size_follows_the_last_sizing_transform(base_config):
         ({"transforms": [resize(32, 16), TO_TENSOR]}, "square"),
         ({"group_map": "groups.csv"}, "must be a mapping"),
         ({"group_map": {"csv": "groups.csv", "sample": "id"}}, "unknown keys"),
+        ({"cross_validation_folds": 5}, "needs a group_map"),
+        ({"group_map": {"csv": "groups.csv"}, "cross_validation_folds": 1}, "at least 2"),
+        ({"group_map": {"csv": "groups.csv"}, "cross_validation_folds": "5"}, "at least 2"),
         ({"transforms": [resize(32, 32), {"name": "Normalize", "normalization": "min_max"}, TO_TENSOR]}, "can be inverted"),
     ],
 )

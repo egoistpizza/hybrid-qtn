@@ -13,8 +13,9 @@ def build_run_name(
     seed: int,
     tag: Optional[str] = None,
     variant: MPSVariant = MPSVariant(),
+    fold: Optional[int] = None,
 ) -> str:
-    """Name of the form ``<dataset>__<architecture>__<loss>__seed<seed>[__<tag>]``.
+    """Name of the form ``<dataset>__<architecture>__<loss>__seed<seed>[__fold<fold>][__<tag>]``.
 
     Hybrid architectures end in the :attr:`MPSVariant.name_suffix` of their MPS blocks.
     """
@@ -23,4 +24,6 @@ def build_run_name(
     else:
         architecture = f"{model_type}_unet_b{bond_dim}{variant.name_suffix}"
     run_name = f"{dataset}__{architecture}__{loss}__seed{seed}"
+    if fold is not None:
+        run_name += f"__fold{fold}"
     return f"{run_name}__{tag}" if tag else run_name

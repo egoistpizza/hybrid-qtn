@@ -121,6 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Available: {available_datasets}")
+    parser.add_argument("--fold", type=int, default=None, help="Cross-validation fold of the run")
     parser.add_argument("--split", type=str, default="test", choices=EVALUATION_SPLITS)
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11))
     parser.add_argument("--output_dir", type=str, default=None)
@@ -140,11 +141,11 @@ def main() -> None:
     dataset_names = parse_dataset_arg(args.dataset)
     dataset_slug = slugify_dataset_arg(dataset_names)
 
-    splits = build_splits(dataset_names)
+    splits = build_splits(dataset_names, fold=args.fold)
 
     variant = mps_variant(args)
     run_name = args.run or build_run_name(
-        dataset_slug, args.model, args.bond_dim, args.loss, args.seed, args.tag, variant
+        dataset_slug, args.model, args.bond_dim, args.loss, args.seed, args.tag, variant, args.fold
     )
     model = build_segmentation_model(args.model, args.bond_dim, splits.image_size, variant)
     model = model.to(device).to(memory_format=torch.channels_last)

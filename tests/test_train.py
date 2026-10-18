@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from dataset import DatasetSplits, Denormalization, EvaluationSet
 from tests.synthetic import MaskFileSamples, small_model
-from train import SegmentationTrainer, TrainingConfig, compile_with_warmup
+from train import SegmentationTrainer, TrainingConfig, compile_with_warmup, parse_arguments
 from utils.loss import FocalTverskyLoss
 
 
@@ -162,3 +162,10 @@ def test_failed_compile_warmup_leaves_no_gradients(monkeypatch, tmp_path):
     monkeypatch.setattr(torch, "compile", failing_compile)
     assert compile_with_warmup(model, training_config(tmp_path), torch.device("cpu")) is model
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_fold_option_defaults_to_the_holdout_split(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["train.py", "--dataset", "cvc_clinicdb"])
+    assert parse_arguments().fold is None
+    monkeypatch.setattr("sys.argv", ["train.py", "--dataset", "cvc_clinicdb", "--fold", "3"])
+    assert parse_arguments().fold == 3
