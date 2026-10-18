@@ -36,6 +36,8 @@ Here D is the latent width (`--bond_dim`). Every operator's input and output sha
 
 Mixing stays global along each axis, but a shifted input gives a shifted output; positions beyond the image edge contribute zero.
 
+**Circular axial operators** (`--axial_operator circular`): `W[c, h, j, d] = K[c, d, (j − h) mod H]`, a circulant operator whose offset wraps around the axis. It has no edges from which absolute position could be inferred and commutes exactly with circular shifts; K has H = 32 offset slots (5 binary digits), so each operator has 34,196 parameters (bottleneck 1,146,585 at D = 32, −91.90 %).
+
 **Absolute axial operators** (`--axial_operator absolute`): the earlier operators hold separate weights for every pair of positions, a matrix product operator over the 10 interleaved binary digits of the joint (channel, position) index, χ = 64. They let the block respond differently to the same structure at different places; on Kvasir-SEG this made the hybrid position-dependent, which the relative operators remove.
 
 ### Exact bottleneck parameter counts (512 × 512 input)
@@ -165,11 +167,11 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 | `--batch_size` | 4 |
 | `--seed` | 42 |
 | `--deterministic` | off; deterministic GPU kernels for bit-identical reruns on the same GPU type, about 4× slower |
-| `--axial_operator` | `relative` (default), `absolute`; hybrid models only |
+| `--axial_operator` | `relative` (default), `circular`, `absolute`; hybrid models only |
 | `--positional_encoding` / `--no-positional_encoding` | off; hybrid models only |
 | `--tag` | free-form run suffix |
 
-Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__tag]/`; the model part of a hybrid run ends in `_rel` for relative operators and `_nope` without positional encoding (default hybrid runs end in `_rel_nope`; runs with absolute operators and the encoding, the configuration of all runs before these options existed, have no suffix):
+Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__tag]/`; the model part of a hybrid run ends in `_rel` for relative operators, `_circ` for circular operators and `_nope` without positional encoding (default hybrid runs end in `_rel_nope`; runs with absolute operators and the encoding, the configuration of all runs before these options existed, have no suffix):
 - `best_model.pth`: best live checkpoint by validation Dice
 - `best_swa_model.pth`: SWA model
 

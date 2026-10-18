@@ -74,6 +74,9 @@ def test_run_name_describes_the_mps_variant():
     assert build_run_name(*common, MPSVariant("absolute", positional_encoding=True)) == (
         "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__kaggle"
     )
+    assert build_run_name(*common, MPSVariant("circular")) == (
+        "kvasir_seg__hybrid_unet_b32_circ_nope__focal_tversky__seed43__kaggle"
+    )
     assert build_run_name(*common, MPSVariant("absolute")) == (
         "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"
     )

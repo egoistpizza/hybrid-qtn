@@ -30,7 +30,8 @@ def add_mps_arguments(parser: argparse.ArgumentParser) -> None:
         "--axial_operator",
         choices=tuple(AXIAL_OPERATORS),
         default=default.axial_operator,
-        help="relative: weights depend only on the offset (shift-equivariant); absolute: weights per position pair",
+        help="relative: weights depend only on the offset (shift-equivariant); circular: the offset wraps around "
+        "the axis; absolute: weights per position pair",
     )
     parser.add_argument(
         "--positional_encoding",

@@ -87,6 +87,11 @@ def test_relative_layer_output_follows_a_shifted_input():
     assert torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-5)
 
 
+def test_circular_layer_output_follows_a_shifted_input():
+    original, shifted = shift_response("circular", shift=4)
+    assert torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-5)
+
+
 def test_absolute_layer_output_does_not_follow_a_shifted_input():
     original, shifted = shift_response("absolute", shift=4)
     assert not torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-3)
@@ -104,11 +109,12 @@ def test_positional_encoding_is_opt_in_and_adds_its_parameters():
 
 def test_unknown_axial_operator_raises():
     with pytest.raises(ValueError, match="Unknown axial_operator"):
-        MPSVariant("circular")
+        MPSVariant("dilated")
 
 
-def test_relative_bottleneck_gradient_reaches_every_core(sample_tensor: torch.Tensor):
-    bottleneck = MPSBottleneck(64, 16, 32, 32, variant=MPSVariant("relative"))
+@pytest.mark.parametrize("axial_operator", ["relative", "circular"])
+def test_offset_operator_gradient_reaches_every_core(sample_tensor: torch.Tensor, axial_operator: str):
+    bottleneck = MPSBottleneck(64, 16, 32, 32, variant=MPSVariant(axial_operator))
     bottleneck(sample_tensor).mean().backward()
     cores = [*bottleneck.axial_mps.row_operator.chain.cores, *bottleneck.axial_mps.column_operator.chain.cores]
     assert all(core.grad is not None and torch.any(core.grad != 0) for core in cores)
