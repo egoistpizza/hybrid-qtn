@@ -28,7 +28,7 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
-from models.factory import MODEL_TYPES, build_segmentation_model
+from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model
 from utils import get_device
 from utils.checkpoints import BEST_LIVE_CHECKPOINT, INTERRUPTED_CHECKPOINT, SWA_CHECKPOINT, load_weights, save_weights
 from utils.evaluation import evaluate_model, metric_suites
@@ -69,6 +69,8 @@ class TrainingConfig:
     fp_weight: float
     focal_gamma: float
     image_size: int
+    axial_operator: str = "absolute"
+    positional_encoding: bool = True
     accumulation_steps: int = 8
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
@@ -281,6 +283,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--bond_dim", type=int, default=32)
+    add_mps_arguments(parser)
     parser.add_argument("--loss", type=str, default="focal_tversky", choices=LOSS_CHOICES)
     parser.add_argument("--fn_weight", type=float, default=TVERSKY_FN_WEIGHT, help="Focal Tversky weight on false negatives")
     parser.add_argument("--fp_weight", type=float, default=TVERSKY_FP_WEIGHT, help="Focal Tversky weight on false positives")
@@ -346,7 +349,16 @@ def main() -> None:
     device = get_device()
     splits = build_splits(dataset_names)
     dataset_slug = slugify_dataset_arg(dataset_names)
-    run_name = build_run_name(dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag)
+    run_name = build_run_name(
+        dataset_slug,
+        arguments.model,
+        arguments.bond_dim,
+        arguments.loss,
+        arguments.seed,
+        arguments.tag,
+        axial_operator=arguments.axial_operator,
+        positional_encoding=arguments.positional_encoding,
+    )
 
     config = TrainingConfig(
         model_type=arguments.model,
@@ -360,6 +372,8 @@ def main() -> None:
         fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
         image_size=splits.image_size,
+        axial_operator=arguments.axial_operator,
+        positional_encoding=arguments.positional_encoding,
         deterministic=arguments.deterministic,
         checkpoint_dir=str(CHECKPOINT_ROOT / run_name),
     )
@@ -367,7 +381,9 @@ def main() -> None:
     test_sizes = ", ".join(f"{len(test_set.dataset)} {name}" for name, test_set in splits.test_sets.items())
     logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val.dataset)} val / test: {test_sizes}")
 
-    model = build_segmentation_model(config.model_type, config.bond_dim, config.image_size)
+    model = build_segmentation_model(
+        config.model_type, config.bond_dim, config.image_size, config.axial_operator, config.positional_encoding
+    )
     total_params = log_parameter_breakdown(model)
     model = model.to(device).to(memory_format=torch.channels_last)
     model = compile_with_warmup(model, config, device)

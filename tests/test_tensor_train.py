@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from models.tensor_train import (
     QuantizedAxialOperator,
+    RelativeAxialOperator,
     TensorTrain,
     TTConv2d,
     capped_ranks,
@@ -139,5 +140,49 @@ def test_spatial_bit_flip_maps_to_the_spatial_axis_only():
 
 def test_materialization_runs_in_float32_under_autocast():
     operator = QuantizedAxialOperator(bond_dim=4, spatial_size=4, max_rank=4)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        assert operator.materialize().dtype == torch.float32
+
+
+def relative_kernel_reference(operator: RelativeAxialOperator) -> torch.Tensor:
+    full = reference_materialize(operator.chain)
+    bond_dim, offsets = operator.bond_dim, 2 * operator.spatial_size
+    kernel = torch.zeros(bond_dim, offsets, bond_dim)
+    channel_bits = operator.site_roles.count("channel")
+    offset_bits = operator.site_roles.count("spatial")
+    for c_in, offset, c_out in itertools.product(range(bond_dim), range(offsets), range(bond_dim)):
+        channel_digits = iter(format(c_in, f"0{channel_bits}b"))
+        offset_digits = iter(format(offset, f"0{offset_bits}b"))
+        row_digits = [
+            next(channel_digits) if role == "channel" else next(offset_digits) for role in operator.site_roles
+        ]
+        kernel[c_in, offset, c_out] = full[int("".join(row_digits), 2), c_out]
+    return kernel
+
+
+def test_relative_kernel_matches_brute_force_contraction():
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=4, max_rank=8)
+    assert torch.allclose(operator.kernel(), relative_kernel_reference(operator), atol=1e-6)
+
+
+def test_relative_operator_depends_only_on_the_offset():
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
+    weights, kernel = operator.materialize(), operator.kernel()
+    assert weights.shape == (4, 8, 8, 4)
+    assert torch.equal(weights[:, :-1, :-1, :], weights[:, 1:, 1:, :])
+    for h, j in itertools.product(range(8), repeat=2):
+        assert torch.equal(weights[:, h, j, :], kernel[:, j - h + 8, :])
+
+
+def test_relative_operator_parameter_count_follows_the_offset_and_channel_sites():
+    operator = RelativeAxialOperator(bond_dim=32, spatial_size=32, max_rank=64)
+    output_modes = tuple(2 if role == "channel" else 1 for role in operator.site_roles)
+    expected = tensor_train_parameter_count((2,) * len(operator.site_roles), output_modes, 64)
+    assert sum(parameter.numel() for parameter in operator.parameters()) == expected == 41_608
+    assert expected < sum(parameter.numel() for parameter in QuantizedAxialOperator(32, 32, 64).parameters())
+
+
+def test_relative_materialization_runs_in_float32_under_autocast():
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=4, max_rank=4)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         assert operator.materialize().dtype == torch.float32

@@ -9,8 +9,9 @@ import numpy as np
 import onnxruntime as ort
 import torch
 
-from models.factory import MODEL_TYPES, build_segmentation_model
+from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model
 from utils import get_device
+from utils.run_naming import mps_variant_suffix
 
 
 def measure_throughput(
@@ -74,6 +75,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
     parser.add_argument("--bond_dim", type=int, default=32)
+    add_mps_arguments(parser)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--iterations", type=int, default=100)
@@ -87,10 +89,13 @@ def main() -> None:
     output_directory = Path(args.output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     
-    onnx_filename = f"{args.model}_b{args.bond_dim}_s{args.image_size}.onnx"
+    variant = mps_variant_suffix(args.axial_operator, args.positional_encoding)
+    onnx_filename = f"{args.model}_b{args.bond_dim}{variant}_s{args.image_size}.onnx"
     onnx_file_path = output_directory / onnx_filename
     
-    model = build_segmentation_model(args.model, args.bond_dim, args.image_size).to(compute_device)
+    model = build_segmentation_model(
+        args.model, args.bond_dim, args.image_size, args.axial_operator, args.positional_encoding
+    ).to(compute_device)
     model = model.to(memory_format=torch.channels_last)
     
     dummy_input_tensor = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=compute_device)

@@ -59,3 +59,16 @@ def test_tensorized_bottleneck_is_below_ten_percent_of_the_standard_bottleneck()
     vanilla = build_segmentation_model("vanilla", bond_dim=32)
     hybrid = build_segmentation_model("hybrid", bond_dim=32)
     assert count(hybrid.down4) + count(hybrid.transform_1024) < 0.1 * count(vanilla.down4)
+
+
+def test_relative_hybrid_without_positional_encoding_keeps_the_output_shape():
+    model = build_segmentation_model("deep_hybrid", 4, 64, axial_operator="relative", positional_encoding=False).eval()
+    assert model.transform_1024.axial_mps.positional_encoding is None
+    assert model.transform_512.axial_mps.row_operator.materialize().shape == (4, 8, 8, 4)
+    with torch.no_grad():
+        assert model(torch.randn(1, 3, 64, 64)).shape == (1, 1, 64, 64)
+
+
+def test_mps_settings_are_rejected_for_the_vanilla_model():
+    with pytest.raises(ValueError, match="only apply to models with MPS blocks"):
+        build_segmentation_model("vanilla", 32, axial_operator="relative")

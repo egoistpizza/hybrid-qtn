@@ -25,7 +25,7 @@ This README is written for external researchers and reviewers. Following the Doc
 
 **Axial MPS block** (`models/mps_layer.py`):
 1. `BN`
-2. Separable positional encoding: row + column embeddings, C·(H + W) parameters
+2. Separable positional encoding: row + column embeddings, C·(H + W) parameters (`--no-positional_encoding` removes it)
 3. `Conv3×3 (C → D)`
 4. **Row MPO**: a chain over the 10 binary digits of the joint (channel, row) index (D = 32 = 2⁵, H = 32 = 2⁵). The spatial and channel digits are interleaved, and the bond dimension χ is 64. Followed by `GELU`.
 5. **Column MPO**: the same construction over (channel, column).
@@ -33,6 +33,8 @@ This README is written for external researchers and reviewers. Following the Doc
 7. Summed with a **TT-Conv1×1** local bypass (5 sites of 4×4, rank 32), followed by `BN → GELU`, plus a residual connection
 
 Here D is the latent width (`--bond_dim`). Every operator's input and output shapes match the dense layers they replace, so the encoder and decoder are unchanged.
+
+**Relative axial operators** (`--axial_operator relative`): the default operators above hold separate weights for every pair of positions, so the block can respond differently to the same structure at different places. The relative variant makes each weight depend only on the offset between input and output position, `W[c, h, j, d] = K[c, d, j − h]`, a Toeplitz operator whose kernel spans the whole axis. Mixing stays global along each axis, but a shifted input gives a shifted output; positions beyond the image edge contribute zero. The kernel K is a tensor train over the binary digits of the offset (2H slots) interleaved with the input and output channel digits, χ = 64.
 
 ### Exact bottleneck parameter counts (512 × 512 input)
 
@@ -46,6 +48,8 @@ Produced by `python -m scripts.bottleneck_profiler`, which derives each count an
 | Tensorized Axial MPS | 64 | 1,914,897 | −86.48 % |
 
 At D = 32 the whole network has 16,081,074 parameters, against 28,948,673 for the vanilla U-Net (−44.4 %). The remaining parameters sit in the unmodified encoder and decoder stages.
+
+With relative operators and no positional encoding (`--axial_operator relative --no-positional_encoding`), each axial operator has 41,608 instead of 74,272 parameters and the bottleneck has 1,161,409 (−91.80 %) at D = 32; the whole network has 15,950,210. The profiler accepts the same two flags.
 
 ---
 
@@ -159,9 +163,11 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 | `--batch_size` | 4 |
 | `--seed` | 42 |
 | `--deterministic` | off; deterministic GPU kernels for bit-identical reruns on the same GPU type, about 4× slower |
+| `--axial_operator` | `absolute` (default), `relative`; hybrid models only |
+| `--positional_encoding` / `--no-positional_encoding` | on; hybrid models only |
 | `--tag` | free-form run suffix |
 
-Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__tag]/`:
+Checkpoints are written to `checkpoints/<dataset>__<model>__<loss>__seed<seed>[__tag]/`; the model part ends in `_rel` for relative operators and `_nope` without positional encoding:
 - `best_model.pth`: best live checkpoint by validation Dice
 - `best_swa_model.pth`: SWA model
 

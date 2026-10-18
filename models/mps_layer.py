@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.tensor_train import QuantizedAxialOperator, TTConv2d
+from models.tensor_train import QuantizedAxialOperator, RelativeAxialOperator, TTConv2d
 
+AXIAL_OPERATORS = {"absolute": QuantizedAxialOperator, "relative": RelativeAxialOperator}
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
@@ -32,8 +33,7 @@ class AxialMPSLayer(nn.Module):
     """Global context mixing along the height axis, then along the width axis.
 
     The input is projected from ``in_channels`` to ``bond_dim`` latent channels, mixed by a
-    row operator and a column operator (each a :class:`QuantizedAxialOperator` on the joint
-    channel-position index) with a GELU in between, and projected back.
+    row operator and a column operator with a GELU in between, and projected back.
 
     Args:
         in_channels: Channels of the incoming feature map.
@@ -41,6 +41,10 @@ class AxialMPSLayer(nn.Module):
         height: Feature-map height; fixes the size of the row operator.
         width: Feature-map width; fixes the size of the column operator.
         operator_rank: Bond dimension (chi) of the axial operators.
+        axial_operator: ``absolute`` (:class:`QuantizedAxialOperator`, separate weights per
+            position pair) or ``relative`` (:class:`RelativeAxialOperator`, weights depend only
+            on the offset, so the layer is shift-equivariant).
+        positional_encoding: Whether a learned positional encoding is added to the input.
     """
 
     def __init__(
@@ -50,17 +54,26 @@ class AxialMPSLayer(nn.Module):
         height: int,
         width: int,
         operator_rank: int = AXIAL_OPERATOR_RANK,
+        axial_operator: str = "absolute",
+        positional_encoding: bool = True,
     ):
         super().__init__()
-        self.positional_encoding = SeparablePositionalEncoding2D(in_channels, height, width)
+        if axial_operator not in AXIAL_OPERATORS:
+            raise ValueError(f"Unknown axial_operator {axial_operator!r}. Expected one of {tuple(AXIAL_OPERATORS)}.")
+        operator = AXIAL_OPERATORS[axial_operator]
+        self.positional_encoding = (
+            SeparablePositionalEncoding2D(in_channels, height, width) if positional_encoding else None
+        )
         self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
-        self.row_operator = QuantizedAxialOperator(bond_dim, height, operator_rank)
-        self.column_operator = QuantizedAxialOperator(bond_dim, width, operator_rank)
+        self.row_operator = operator(bond_dim, height, operator_rank)
+        self.column_operator = operator(bond_dim, width, operator_rank)
         self.out_proj = nn.Conv2d(bond_dim, in_channels, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Row step: (c, h) -> (d, j) for every column w. Column step: (d, w) -> (e, k) for every row j.
-        projected = self.in_proj(self.positional_encoding(x))
+        if self.positional_encoding is not None:
+            x = self.positional_encoding(x)
+        projected = self.in_proj(x)
         row_mixed = F.gelu(torch.einsum("bchw,chjd->bdjw", projected, self.row_operator.materialize()))
         column_mixed = torch.einsum("bdjw,dwke->bejk", row_mixed, self.column_operator.materialize())
         return self.out_proj(column_mixed)
@@ -70,7 +83,8 @@ class MPSBottleneck(nn.Module):
     """Residual bottleneck block combining the axial MPS layer with a local TT-Conv1x1 bypass.
 
     Computes ``x + GELU(BN(axial_mps(BN(x)) + bypass(BN(x))))``; input and output shapes
-    are identical, so the block can follow any encoder stage.
+    are identical, so the block can follow any encoder stage. ``axial_operator`` and
+    ``positional_encoding`` are passed to :class:`AxialMPSLayer`.
     """
 
     def __init__(
@@ -81,10 +95,14 @@ class MPSBottleneck(nn.Module):
         width: int,
         operator_rank: int = AXIAL_OPERATOR_RANK,
         bypass_rank: int = BYPASS_TT_RANK,
+        axial_operator: str = "absolute",
+        positional_encoding: bool = True,
     ):
         super().__init__()
         self.norm_pre = nn.BatchNorm2d(in_channels)
-        self.axial_mps = AxialMPSLayer(in_channels, bond_dim, height, width, operator_rank)
+        self.axial_mps = AxialMPSLayer(
+            in_channels, bond_dim, height, width, operator_rank, axial_operator, positional_encoding
+        )
         self.local_bypass = TTConv2d(in_channels, in_channels, kernel_size=1, max_rank=bypass_rank, gain=1.0)
         self.norm_post = nn.BatchNorm2d(in_channels)
         self.activation = nn.GELU()

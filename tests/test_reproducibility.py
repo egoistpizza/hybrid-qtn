@@ -65,3 +65,14 @@ def test_run_name_encodes_seed_and_tag():
         "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__ablation"
     )
     assert build_run_name("kvasir_seg", "vanilla", 32, "bce_dice", 42) == "kvasir_seg__vanilla_unet__bce_dice__seed42"
+
+
+def test_run_name_marks_the_mps_variant_and_keeps_default_names():
+    common = ("kvasir_seg", "hybrid", 32, "focal_tversky", 43, "kaggle")
+    assert build_run_name(*common) == "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__kaggle"
+    assert build_run_name(*common, axial_operator="relative", positional_encoding=False) == (
+        "kvasir_seg__hybrid_unet_b32_rel_nope__focal_tversky__seed43__kaggle"
+    )
+    assert build_run_name(*common, positional_encoding=False) == (
+        "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"
+    )

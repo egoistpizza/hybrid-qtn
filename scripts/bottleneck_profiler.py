@@ -4,6 +4,7 @@ Every analytic total is checked against the instantiated model, so the reported 
 cannot drift from the implementation. Run as a module from the repository root:
 
     python -m scripts.bottleneck_profiler --bond_dims 16 32 64
+    python -m scripts.bottleneck_profiler --axial_operator relative --no-positional_encoding
 """
 
 import argparse
@@ -15,11 +16,18 @@ from models.factory import (
     BOTTLENECK_CHANNELS,
     BOTTLENECK_DOWNSAMPLING_FACTOR,
     PRE_BOTTLENECK_CHANNELS,
+    add_mps_arguments,
     build_segmentation_model,
     spatial_size_at,
 )
 from models.mps_layer import AXIAL_OPERATOR_RANK, BYPASS_TT_RANK
-from models.tensor_train import binary_digits, capped_ranks, quantize_dimension, tensor_train_parameter_count
+from models.tensor_train import (
+    binary_digits,
+    capped_ranks,
+    interleaved_site_roles,
+    quantize_dimension,
+    tensor_train_parameter_count,
+)
 from models.unet import ENTRY_TT_RANK
 
 CONV_KERNEL_AREA = 9
@@ -89,15 +97,38 @@ def tensor_train_component(
     return ParameterComponent(name, formula, tensor_train_parameter_count(input_modes, output_modes, max_rank))
 
 
-def axial_operator_component(name: str, bond_dim: int, spatial_size: int, max_rank: int) -> ParameterComponent:
+def axial_operator_component(
+    axis: str, bond_dim: int, spatial_size: int, max_rank: int, axial_operator: str
+) -> ParameterComponent:
+    """Absolute operator: 2→2 sites over channel and position bits. Relative operator: 2→2
+    channel sites interleaved with 2→1 sites over the bits of the ``2 * spatial_size`` offsets."""
+    if axial_operator == "relative":
+        roles = interleaved_site_roles(binary_digits(2 * spatial_size), binary_digits(bond_dim))
+        output_modes = tuple(2 if role == "channel" else 1 for role in roles)
+        return tensor_train_component(f"{axis} Toeplitz MPO chain", (2,) * len(roles), output_modes, max_rank)
     site_count = binary_digits(bond_dim) + binary_digits(spatial_size)
-    return tensor_train_component(name, (2,) * site_count, (2,) * site_count, max_rank)
+    return tensor_train_component(f"{axis} MPO chain", (2,) * site_count, (2,) * site_count, max_rank)
 
 
-def axial_mps_bottleneck_profile(in_channels: int, channels: int, bond_dim: int, spatial_size: int) -> BottleneckProfile:
+def axial_mps_bottleneck_profile(
+    in_channels: int,
+    channels: int,
+    bond_dim: int,
+    spatial_size: int,
+    axial_operator: str = "absolute",
+    positional_encoding: bool = True,
+) -> BottleneckProfile:
     """Tensorized bottleneck: TT-Conv3x3 entry stage followed by the MPS bottleneck block."""
+    encoding = (
+        ParameterComponent(
+            "Separable positional encoding",
+            f"{channels}·({spatial_size} + {spatial_size})",
+            channels * (spatial_size + spatial_size),
+        ),
+    ) if positional_encoding else ()
+    variant = f"{axial_operator} operators, {'with' if positional_encoding else 'no'} positional encoding"
     return BottleneckProfile(
-        title=f"Tensorized Axial MPS bottleneck (D={bond_dim}, H=W={spatial_size}, χ={AXIAL_OPERATOR_RANK})",
+        title=f"Tensorized Axial MPS bottleneck (D={bond_dim}, H=W={spatial_size}, χ={AXIAL_OPERATOR_RANK}; {variant})",
         components=(
             tensor_train_component(
                 f"TT-Conv3×3 entry (R={ENTRY_TT_RANK})",
@@ -107,14 +138,10 @@ def axial_mps_bottleneck_profile(in_channels: int, channels: int, bond_dim: int,
             ),
             batchnorm_component("BatchNorm entry", channels),
             batchnorm_component("BatchNorm pre-MPS", channels),
-            ParameterComponent(
-                "Separable positional encoding",
-                f"{channels}·({spatial_size} + {spatial_size})",
-                channels * (spatial_size + spatial_size),
-            ),
+            *encoding,
             conv3x3_component("Conv3×3 in_proj (C→D)", channels, bond_dim, bias=True),
-            axial_operator_component("Row MPO chain", bond_dim, spatial_size, AXIAL_OPERATOR_RANK),
-            axial_operator_component("Column MPO chain", bond_dim, spatial_size, AXIAL_OPERATOR_RANK),
+            axial_operator_component("Row", bond_dim, spatial_size, AXIAL_OPERATOR_RANK, axial_operator),
+            axial_operator_component("Column", bond_dim, spatial_size, AXIAL_OPERATOR_RANK, axial_operator),
             conv3x3_component("Conv3×3 out_proj (D→C)", bond_dim, channels, bias=True),
             tensor_train_component(
                 f"TT-Conv1×1 bypass (R={BYPASS_TT_RANK})",
@@ -131,9 +158,11 @@ def measured_standard_bottleneck(image_size: int) -> int:
     return count_parameters(build_segmentation_model("vanilla", bond_dim=1, image_size=image_size).down4)
 
 
-def measured_axial_mps_bottleneck(bond_dim: int, image_size: int) -> int:
+def measured_axial_mps_bottleneck(
+    bond_dim: int, image_size: int, axial_operator: str = "absolute", positional_encoding: bool = True
+) -> int:
     """Parameters of the hybrid model's entry stage plus its bottleneck transform."""
-    model = build_segmentation_model("hybrid", bond_dim=bond_dim, image_size=image_size)
+    model = build_segmentation_model("hybrid", bond_dim, image_size, axial_operator, positional_encoding)
     return count_parameters(model.down4) + count_parameters(model.transform_1024)
 
 
@@ -178,6 +207,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analytic and measured parameter profile of the U-Net bottleneck")
     parser.add_argument("--bond_dims", type=int, nargs="+", default=[16, 32, 64])
     parser.add_argument("--image_size", type=int, default=512)
+    add_mps_arguments(parser)
     return parser.parse_args()
 
 
@@ -194,8 +224,11 @@ def main() -> None:
     print(render_profile(standard, standard_measured))
 
     for bond_dim in arguments.bond_dims:
-        axial = axial_mps_bottleneck_profile(PRE_BOTTLENECK_CHANNELS, BOTTLENECK_CHANNELS, bond_dim, spatial_size)
-        axial_measured = measured_axial_mps_bottleneck(bond_dim, arguments.image_size)
+        variant = (arguments.axial_operator, arguments.positional_encoding)
+        axial = axial_mps_bottleneck_profile(
+            PRE_BOTTLENECK_CHANNELS, BOTTLENECK_CHANNELS, bond_dim, spatial_size, *variant
+        )
+        axial_measured = measured_axial_mps_bottleneck(bond_dim, arguments.image_size, *variant)
         verify_against_implementation(axial, axial_measured)
         print()
         print(render_profile(axial, axial_measured))

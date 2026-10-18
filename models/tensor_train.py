@@ -203,7 +203,10 @@ def interleaved_site_roles(spatial_bits: int, channel_bits: int) -> tuple[str, .
 
 
 class QuantizedAxialOperator(nn.Module):
-    """Linear operator along one image axis on the joint (channel, position) index.
+    """Absolute-position linear operator along one image axis on the joint (channel, position) index.
+
+    Every pair of input and output positions has its own weights, so the operator is not
+    shift-equivariant; :class:`RelativeAxialOperator` is the shift-equivariant alternative.
 
     The ``bond_dim * spatial_size`` values of one image column (or row) are indexed by
     the binary digits of the channel and the position, one chain site per digit. The
@@ -244,3 +247,57 @@ class QuantizedAxialOperator(nn.Module):
             .permute(self.axis_order)
             .reshape(self.bond_dim, self.spatial_size, self.spatial_size, self.bond_dim)
         )
+
+
+class RelativeAxialOperator(nn.Module):
+    """Relative-position (Toeplitz) linear operator along one image axis.
+
+    The weight between input position ``h`` and output position ``j`` depends only on the
+    offset ``j - h``: ``W[c, h, j, d] = K[c, d, j - h]``. The kernel ``K`` spans every offset
+    of the axis, so each output still sees the whole row or column, and shifting the input
+    shifts the output. Offsets beyond the axis contribute zero (no wrap-around).
+
+    ``K`` is a tensor train over the binary digits of the offset (``2 * spatial_size``
+    slots) interleaved with the digits of the input and output channels; offset sites have
+    no output digit. This is the quantized tensor-train form of a Toeplitz operator.
+
+    Args:
+        bond_dim: Latent channel width; must be a power of two.
+        spatial_size: Length of the mixed axis; must be a power of two.
+        max_rank: Bond dimension (chi) of the chain.
+    """
+
+    def __init__(self, bond_dim: int, spatial_size: int, max_rank: int):
+        super().__init__()
+        self.bond_dim = bond_dim
+        self.spatial_size = spatial_size
+        self.site_roles = interleaved_site_roles(binary_digits(2 * spatial_size), binary_digits(bond_dim))
+        self.chain = TensorTrain(
+            input_modes=(2,) * len(self.site_roles),
+            output_modes=tuple(2 if role == "channel" else 1 for role in self.site_roles),
+            max_rank=max_rank,
+            target_variance=1.0 / (bond_dim * spatial_size),
+        )
+        channel_sites = [site for site, role in enumerate(self.site_roles) if role == "channel"]
+        offset_sites = [site for site, role in enumerate(self.site_roles) if role == "spatial"]
+        output_digits = [len(self.site_roles) + digit for digit in range(len(channel_sites))]
+        self.axis_order = (*channel_sites, *offset_sites, *output_digits)
+        positions = torch.arange(spatial_size)
+        self.register_buffer("offset_index", positions[None, :] - positions[:, None] + spatial_size, persistent=False)
+
+    def kernel(self) -> torch.Tensor:
+        """Kernel of shape ``(in_channel, 2 * spatial_size, out_channel)``.
+
+        Slot ``k`` holds offset ``k - spatial_size``; slot 0 (offset ``-spatial_size``) is never used.
+        """
+        digit_count = len(self.site_roles) + self.site_roles.count("channel")
+        return (
+            self.chain.materialize()
+            .reshape((2,) * digit_count)
+            .permute(self.axis_order)
+            .reshape(self.bond_dim, 2 * self.spatial_size, self.bond_dim)
+        )
+
+    def materialize(self) -> torch.Tensor:
+        """Dense Toeplitz operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
+        return self.kernel()[:, self.offset_index, :]
