@@ -4,6 +4,7 @@ import pytest
 
 from dataset import (
     GroupMap,
+    grouped_kfold_indices,
     grouped_partition_indices,
     groups_for_samples,
     load_config,
@@ -87,3 +88,68 @@ class TestSequenceGrouping:
 
     def test_cvc_config_declares_its_sequence_map(self):
         assert load_config("cvc_clinicdb", CONFIG_DIR).split.group_map == CVC_GROUP_MAP
+
+
+def synthetic_groups() -> list[str]:
+    sizes = [12, 3, 25, 7, 18, 9, 30, 4, 15, 11, 6, 20, 8, 14, 5, 22]
+    return [f"s{group}" for group, size in enumerate(sizes) for _ in range(size)]
+
+
+def owners(groups: list[str], indices: list[int]) -> set[str]:
+    return {groups[index] for index in indices}
+
+
+class TestGroupedKFold:
+    def test_every_group_is_tested_in_exactly_one_fold(self):
+        groups = synthetic_groups()
+        tested = [index for fold in range(5) for index in grouped_kfold_indices(groups, 5, fold, 0.15, seed=42)[2]]
+        assert sorted(tested) == list(range(len(groups)))
+
+    @pytest.mark.parametrize("fold", range(5))
+    def test_partitions_of_a_fold_share_no_group_and_cover_every_sample(self, fold):
+        groups = synthetic_groups()
+        train, val, test = grouped_kfold_indices(groups, 5, fold, 0.15, seed=42)
+        train_groups, val_groups, test_groups = (owners(groups, part) for part in (train, val, test))
+        assert not train_groups & val_groups and not train_groups & test_groups and not val_groups & test_groups
+        assert sorted([*train, *val, *test]) == list(range(len(groups)))
+        assert train and val and test
+
+    def test_folds_are_balanced_within_one_group(self):
+        groups = synthetic_groups()
+        sizes = [len(grouped_kfold_indices(groups, 5, fold, 0.15, seed=42)[2]) for fold in range(5)]
+        assert max(sizes) - min(sizes) <= max(groups.count(group) for group in set(groups))
+
+    def test_folds_are_deterministic_for_a_seed(self):
+        groups = synthetic_groups()
+        assert grouped_kfold_indices(groups, 5, 2, 0.15, seed=7) == grouped_kfold_indices(groups, 5, 2, 0.15, seed=7)
+
+    @pytest.mark.parametrize(
+        "folds, fold, message", [(1, 0, "at least 2 folds"), (5, 5, "fold must lie"), (5, -1, "fold must lie")]
+    )
+    def test_invalid_fold_settings_raise(self, folds, fold, message):
+        with pytest.raises(ValueError, match=message):
+            grouped_kfold_indices(synthetic_groups(), folds, fold, 0.15, seed=0)
+
+    def test_too_few_groups_raise(self):
+        with pytest.raises(ValueError, match="at least 7 groups"):
+            grouped_kfold_indices(["a", "b", "c", "d", "e", "f"], 5, 0, 0.15, seed=0)
+
+    def test_cvc_folds_test_every_frame_once_without_sharing_sequences(self):
+        config = require_on_disk("cvc_clinicdb")
+        mapping = load_group_map(CVC_GROUP_MAP)
+        tested = []
+        for fold in range(5):
+            splits = make_splits(config, fold=fold)
+            partitions = splits.train, splits.val.dataset, splits.test_sets["test"].dataset
+            train, val, test = (_sequences(subset, mapping) for subset in partitions)
+            assert not train & val and not train & test and not val & test
+            tested += partitions[2].indices
+        assert sorted(tested) == list(range(612))
+
+    def test_fold_is_rejected_for_a_config_without_cross_validation(self):
+        with pytest.raises(ValueError, match="cross_validation_folds"):
+            make_splits(load_config("kvasir_seg", CONFIG_DIR), fold=0)
+
+    def test_cvc_configs_declare_five_folds(self):
+        for name in ("cvc_clinicdb", "cvc_clinicdb_affine"):
+            assert load_config(name, CONFIG_DIR).split.folds == 5
