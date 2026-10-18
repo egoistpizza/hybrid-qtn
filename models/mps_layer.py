@@ -19,13 +19,13 @@ class MPSVariant:
     """Design choices of the MPS block.
 
     Attributes:
-        axial_operator: ``absolute`` (:class:`AbsoluteAxialOperator`, separate weights per
-            position pair) or ``relative`` (:class:`RelativeAxialOperator`, weights depend only
-            on the offset, so the block is shift-equivariant).
+        axial_operator: ``relative`` (:class:`RelativeAxialOperator`, weights depend only on the
+            offset, so the block is shift-equivariant) or ``absolute`` (:class:`AbsoluteAxialOperator`,
+            separate weights per position pair).
         positional_encoding: Whether a learned positional encoding is added to the block input.
     """
 
-    axial_operator: str = "absolute"
+    axial_operator: str = "relative"
     positional_encoding: bool = False
 
     def __post_init__(self) -> None:

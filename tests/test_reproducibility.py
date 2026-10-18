@@ -63,19 +63,19 @@ def test_vram_metrics_on_cpu_are_zero_and_complete():
 
 def test_run_name_encodes_seed_and_tag():
     assert build_run_name("kvasir_seg", "hybrid", 32, "focal_tversky", 43, "ablation") == (
-        "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__ablation"
+        "kvasir_seg__hybrid_unet_b32_rel_nope__focal_tversky__seed43__ablation"
     )
     assert build_run_name("kvasir_seg", "vanilla", 32, "bce_dice", 42) == "kvasir_seg__vanilla_unet__bce_dice__seed42"
 
 
 def test_run_name_describes_the_mps_variant():
     common = ("kvasir_seg", "hybrid", 32, "focal_tversky", 43, "kaggle")
-    assert build_run_name(*common) == "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"
-    assert build_run_name(*common, MPSVariant(positional_encoding=True)) == (
+    assert build_run_name(*common) == "kvasir_seg__hybrid_unet_b32_rel_nope__focal_tversky__seed43__kaggle"
+    assert build_run_name(*common, MPSVariant("absolute", positional_encoding=True)) == (
         "kvasir_seg__hybrid_unet_b32__focal_tversky__seed43__kaggle"
     )
-    assert build_run_name(*common, MPSVariant("relative")) == (
-        "kvasir_seg__hybrid_unet_b32_rel_nope__focal_tversky__seed43__kaggle"
+    assert build_run_name(*common, MPSVariant("absolute")) == (
+        "kvasir_seg__hybrid_unet_b32_nope__focal_tversky__seed43__kaggle"
     )
     assert build_run_name("kvasir_seg", "vanilla", 32, "focal_tversky", 43) == (
         "kvasir_seg__vanilla_unet__focal_tversky__seed43"

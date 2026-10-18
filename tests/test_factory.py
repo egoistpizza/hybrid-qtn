@@ -78,4 +78,4 @@ def test_relative_hybrid_keeps_the_output_shape():
 
 def test_mps_settings_are_rejected_for_the_vanilla_model():
     with pytest.raises(ValueError, match="only apply to models with MPS blocks"):
-        build_segmentation_model("vanilla", 32, variant=MPSVariant("relative"))
+        build_segmentation_model("vanilla", 32, variant=MPSVariant("absolute"))

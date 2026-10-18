@@ -23,10 +23,10 @@ def test_axial_bottleneck_formula_matches_the_hybrid_unet(bond_dim):
 @pytest.mark.parametrize(
     "variant, parameters, reduction",
     [
-        (MPSVariant(), 1_226_737, 91.336),
-        (MPSVariant(positional_encoding=True), 1_292_273, 90.874),
-        (MPSVariant("relative"), 1_161_409, 91.798),
+        (MPSVariant(), 1_161_409, 91.798),
         (MPSVariant("relative", positional_encoding=True), 1_226_945, 91.335),
+        (MPSVariant("absolute"), 1_226_737, 91.336),
+        (MPSVariant("absolute", positional_encoding=True), 1_292_273, 90.874),
     ],
 )
 def test_bottleneck_budget_at_bond_dimension_thirty_two(variant, parameters, reduction):
