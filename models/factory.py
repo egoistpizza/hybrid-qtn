@@ -4,7 +4,7 @@ import argparse
 
 import torch.nn as nn
 
-from models.mps_layer import AXIAL_OPERATORS, MPSBottleneck, MPSVariant
+from models.mps_layer import AXIAL_BOUNDARIES, AXIAL_OPERATORS, MPSBottleneck, MPSVariant
 from models.unet import UNet
 
 MODEL_TYPES = ("vanilla", "hybrid", "deep_hybrid")
@@ -24,7 +24,7 @@ def spatial_size_at(image_size: int, downsampling_factor: int) -> int:
 
 
 def add_mps_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the ``--axial_operator`` and ``--positional_encoding`` options, defaulting to :class:`MPSVariant`."""
+    """Add the ``--axial_operator``, ``--positional_encoding`` and ``--axial_boundary`` options, defaulting to :class:`MPSVariant`."""
     default = MPSVariant()
     parser.add_argument(
         "--axial_operator",
@@ -38,11 +38,17 @@ def add_mps_arguments(parser: argparse.ArgumentParser) -> None:
         default=default.positional_encoding,
         help="Add a learned positional encoding in the MPS blocks",
     )
+    parser.add_argument(
+        "--axial_boundary",
+        choices=AXIAL_BOUNDARIES,
+        default=default.boundary,
+        help="Positions beyond the edge for relative operators: zero, or the mean along the axis",
+    )
 
 
 def mps_variant(arguments: argparse.Namespace) -> MPSVariant:
     """The :class:`MPSVariant` selected by the options of :func:`add_mps_arguments`."""
-    return MPSVariant(arguments.axial_operator, arguments.positional_encoding)
+    return MPSVariant(arguments.axial_operator, arguments.positional_encoding, arguments.axial_boundary)
 
 
 def build_segmentation_model(

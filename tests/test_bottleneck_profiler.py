@@ -25,6 +25,7 @@ def test_axial_bottleneck_formula_matches_the_hybrid_unet(bond_dim):
     [
         (MPSVariant(), 1_161_409, 91.798),
         (MPSVariant("relative", positional_encoding=True), 1_226_945, 91.335),
+        (MPSVariant(boundary="mean"), 1_161_409, 91.798),
         (MPSVariant("absolute"), 1_226_737, 91.336),
         (MPSVariant("absolute", positional_encoding=True), 1_292_273, 90.874),
     ],

@@ -255,7 +255,9 @@ class RelativeAxialOperator(nn.Module):
     The weight between input position ``h`` and output position ``j`` depends only on the
     offset ``j - h``: ``W[c, h, j, d] = K[c, d, j - h]``. The kernel ``K`` spans every offset
     of the axis, so each output still sees the whole row or column, and shifting the input
-    shifts the output. Offsets beyond the axis contribute zero (no wrap-around).
+    shifts the output. Offsets beyond the axis contribute zero (no wrap-around); for inputs
+    with a non-zero mean this makes the output depend on the distance to the edges, which the
+    mean boundary of :class:`models.mps_layer.AxialMPSLayer` removes using :meth:`uniform_response`.
 
     ``K`` is a tensor train over the binary digits of the offset (``2 * spatial_size``
     slots) interleaved with the digits of the input and output channels; offset sites have
@@ -301,3 +303,10 @@ class RelativeAxialOperator(nn.Module):
     def materialize(self) -> torch.Tensor:
         """Dense Toeplitz operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
         return self.kernel()[:, self.offset_index, :]
+
+    def uniform_response(self) -> torch.Tensor:
+        """Kernel summed over every used offset, shape ``(in_channel, out_channel)``.
+
+        This is the response to a unit input that is uniform along an axis without edges.
+        """
+        return self.kernel()[:, 1:, :].sum(dim=1)

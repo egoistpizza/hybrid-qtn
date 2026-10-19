@@ -76,6 +76,12 @@ def test_relative_hybrid_keeps_the_output_shape():
         assert model(torch.randn(1, 3, 64, 64)).shape == (1, 1, 64, 64)
 
 
+def test_mean_boundary_hybrid_keeps_the_output_shape():
+    model = build_segmentation_model("deep_hybrid", 4, 64, MPSVariant(boundary="mean")).eval()
+    with torch.no_grad():
+        assert model(torch.randn(1, 3, 64, 64)).shape == (1, 1, 64, 64)
+
+
 def test_mps_settings_are_rejected_for_the_vanilla_model():
     with pytest.raises(ValueError, match="only apply to models with MPS blocks"):
         build_segmentation_model("vanilla", 32, variant=MPSVariant("absolute"))

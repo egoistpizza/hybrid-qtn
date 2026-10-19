@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from models.mps_layer import AxialMPSLayer, MPSBottleneck, MPSVariant, SeparablePositionalEncoding2D
+from models.mps_layer import AxialMPSLayer, MPSBottleneck, MPSVariant, SeparablePositionalEncoding2D, mix_along_axis
+from models.tensor_train import RelativeAxialOperator
 
 
 @pytest.fixture
@@ -112,3 +113,66 @@ def test_relative_bottleneck_gradient_reaches_every_core(sample_tensor: torch.Te
     bottleneck(sample_tensor).mean().backward()
     cores = [*bottleneck.axial_mps.row_operator.chain.cores, *bottleneck.axial_mps.column_operator.chain.cores]
     assert all(core.grad is not None and torch.any(core.grad != 0) for core in cores)
+
+
+ROW_EQUATION, COLUMN_EQUATION = "bchw,chjd->bdjw", "bdjw,dwke->bejk"
+
+
+def mixed(x: torch.Tensor, equation: str, axis: int, mean_boundary: bool) -> torch.Tensor:
+    torch.manual_seed(0)
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
+    with torch.no_grad():
+        response = operator.uniform_response() if mean_boundary else None
+        return mix_along_axis(x, operator.materialize(), equation, axis, response)
+
+
+@pytest.mark.parametrize("equation, axis", [(ROW_EQUATION, 2), (COLUMN_EQUATION, 3)])
+def test_mean_boundary_maps_a_uniform_input_to_a_position_independent_output(equation, axis):
+    uniform = torch.randn(2, 4, 1, 1).expand(2, 4, 8, 8).contiguous()
+    output = mixed(uniform, equation, axis, mean_boundary=True)
+    assert torch.allclose(output, output.mean(dim=axis, keepdim=True).expand_as(output), atol=1e-5)
+    zero_edges = mixed(uniform, equation, axis, mean_boundary=False)
+    assert not torch.allclose(zero_edges, zero_edges.mean(dim=axis, keepdim=True).expand_as(zero_edges), atol=1e-3)
+
+
+def test_mean_boundary_shifts_the_output_of_a_zero_mean_pattern_with_the_input():
+    pattern = torch.zeros(1, 4, 8, 8)
+    pattern[..., 2:4, :] = torch.randn(1, 4, 2, 8)
+    pattern[..., 4:6, :] = -pattern[..., 2:4, :]
+    original = mixed(pattern, ROW_EQUATION, 2, mean_boundary=True)
+    shifted = mixed(torch.roll(pattern, shifts=2, dims=2), ROW_EQUATION, 2, mean_boundary=True)
+    assert torch.allclose(shifted[..., 4:, :], original[..., 2:6, :], atol=1e-5)
+
+
+def test_zero_boundary_is_the_plain_einsum():
+    torch.manual_seed(0)
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
+    features = torch.randn(2, 4, 8, 8)
+    with torch.no_grad():
+        weights = operator.materialize()
+        assert torch.equal(mix_along_axis(features, weights, ROW_EQUATION, 2), torch.einsum(ROW_EQUATION, features, weights))
+
+
+@pytest.mark.parametrize("boundary, flat", [("mean", True), ("zero", False)])
+def test_layer_response_to_a_uniform_input_is_flat_only_with_the_mean_boundary(boundary, flat):
+    torch.manual_seed(0)
+    layer = AxialMPSLayer(8, 4, 16, 16, variant=MPSVariant(boundary=boundary)).eval()
+    with torch.no_grad():
+        output = layer(torch.ones(1, 8, 16, 16))
+    assert torch.allclose(output, output[..., :1, :1].expand_as(output), atol=1e-4) == flat
+
+
+def test_mean_boundary_gradient_reaches_every_core(sample_tensor: torch.Tensor):
+    bottleneck = MPSBottleneck(64, 16, 32, 32, variant=MPSVariant(boundary="mean"))
+    bottleneck(sample_tensor).mean().backward()
+    cores = [*bottleneck.axial_mps.row_operator.chain.cores, *bottleneck.axial_mps.column_operator.chain.cores]
+    assert all(core.grad is not None and torch.any(core.grad != 0) for core in cores)
+
+
+@pytest.mark.parametrize(
+    "variant_arguments, message",
+    [({"boundary": "reflect"}, "Unknown boundary"), ({"axial_operator": "absolute", "boundary": "mean"}, "needs the relative")],
+)
+def test_invalid_boundary_settings_raise(variant_arguments, message):
+    with pytest.raises(ValueError, match=message):
+        MPSVariant(**variant_arguments)

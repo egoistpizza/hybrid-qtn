@@ -36,6 +36,8 @@ Here D is the latent width (`--bond_dim`). Every operator's input and output sha
 
 Mixing stays global along each axis, but a shifted input gives a shifted output; positions beyond the image edge contribute zero.
 
+**Mean boundary** (`--axial_boundary mean`, relative operators only): positions beyond the edge take the mean of the features along the mixed axis instead of zero, i.e. `y = T(x − x̄) + x̄ ΣK` with `T` the zero-edge Toeplitz operator and `ΣK` the kernel summed over all offsets. The block's two 3×3 projections pad by replication in this mode, so a uniform input gives the same output at every position and the block cannot read the distance to the image border; varying content is treated as with zero edges. It adds no parameters. Run names gain `_mean`.
+
 **Absolute axial operators** (`--axial_operator absolute`): the earlier operators hold separate weights for every pair of positions, a matrix product operator over the 10 interleaved binary digits of the joint (channel, position) index, χ = 64. They let the block respond differently to the same structure at different places; on Kvasir-SEG this made the hybrid position-dependent, which the relative operators remove.
 
 ### Exact bottleneck parameter counts (512 × 512 input)
@@ -167,6 +169,7 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 | `--deterministic` | off; deterministic GPU kernels for bit-identical reruns on the same GPU type, about 4× slower |
 | `--axial_operator` | `relative` (default), `absolute`; hybrid models only |
 | `--positional_encoding` / `--no-positional_encoding` | off; hybrid models only |
+| `--axial_boundary` | `zero` (default), `mean`; relative operators only |
 | `--fold` | cross-validation fold (configs with `cross_validation_folds`, e.g. CVC-ClinicDB); default: the holdout split |
 | `--tag` | free-form run suffix |
 

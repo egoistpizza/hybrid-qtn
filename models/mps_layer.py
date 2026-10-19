@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from models.tensor_train import AbsoluteAxialOperator, RelativeAxialOperator, TTConv2d
 
 AXIAL_OPERATORS = {"absolute": AbsoluteAxialOperator, "relative": RelativeAxialOperator}
+AXIAL_BOUNDARIES = ("zero", "mean")
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
@@ -23,24 +24,58 @@ class MPSVariant:
             offset, so the block is shift-equivariant) or ``absolute`` (:class:`AbsoluteAxialOperator`,
             separate weights per position pair).
         positional_encoding: Whether a learned positional encoding is added to the block input.
+        boundary: How the block treats positions beyond the edge: ``zero``, or ``mean``, where
+            relative operators fill them with the mean of the features along the mixed axis (see
+            :func:`mix_along_axis`) and the 3x3 projections pad by replication, so that a uniform
+            input gives a uniform output.
     """
 
     axial_operator: str = "relative"
     positional_encoding: bool = False
+    boundary: str = "zero"
 
     def __post_init__(self) -> None:
         if self.axial_operator not in AXIAL_OPERATORS:
             raise ValueError(
                 f"Unknown axial_operator {self.axial_operator!r}. Expected one of {tuple(AXIAL_OPERATORS)}."
             )
+        if self.boundary not in AXIAL_BOUNDARIES:
+            raise ValueError(f"Unknown boundary {self.boundary!r}. Expected one of {AXIAL_BOUNDARIES}.")
+        if self.boundary != "zero" and self.axial_operator != "relative":
+            raise ValueError(f"The {self.boundary} boundary needs the relative axial operator.")
 
     @property
     def name_suffix(self) -> str:
-        """``_rel`` for relative operators and ``_nope`` without positional encoding.
+        """``_rel`` for relative operators, ``_mean`` for the mean boundary and ``_nope`` without positional encoding.
 
         The suffix describes the settings, not the defaults, so names stay comparable across versions.
         """
-        return ("_rel" if self.axial_operator == "relative" else "") + ("" if self.positional_encoding else "_nope")
+        return (
+            ("_rel" if self.axial_operator == "relative" else "")
+            + ("_mean" if self.boundary == "mean" else "")
+            + ("" if self.positional_encoding else "_nope")
+        )
+
+
+def mix_along_axis(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    equation: str,
+    axis: int,
+    uniform_response: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply an axial operator with ``torch.einsum(equation, x, weights)``.
+
+    With ``uniform_response`` (shape ``(in_channel, out_channel)``), positions beyond the edge
+    take the mean of ``x`` along ``axis`` instead of zero: the operator acts on ``x`` minus its
+    mean, and the mean contributes through the edge-free uniform response. A uniform input
+    then gives the same output at every position.
+    """
+    if uniform_response is None:
+        return torch.einsum(equation, x, weights)
+    mean = x.mean(dim=axis, keepdim=True)
+    mean_weights = uniform_response[:, None, None, :]
+    return torch.einsum(equation, x - mean, weights) + torch.einsum(equation, mean, mean_weights)
 
 
 class SeparablePositionalEncoding2D(nn.Module):
@@ -72,7 +107,7 @@ class AxialMPSLayer(nn.Module):
         height: Feature-map height; fixes the size of the row operator.
         width: Feature-map width; fixes the size of the column operator.
         operator_rank: Bond dimension (chi) of the axial operators.
-        variant: Axial operator type and positional encoding.
+        variant: Axial operator type, positional encoding and boundary.
     """
 
     def __init__(
@@ -89,19 +124,30 @@ class AxialMPSLayer(nn.Module):
         self.positional_encoding = (
             SeparablePositionalEncoding2D(in_channels, height, width) if variant.positional_encoding else None
         )
-        self.in_proj = nn.Conv2d(in_channels, bond_dim, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
+        self.mean_boundary = variant.boundary == "mean"
+        # Zero padding would turn a uniform input into a border ring that the axis-wide operators spread.
+        padding_mode = "replicate" if self.mean_boundary else "zeros"
+        self.in_proj = nn.Conv2d(
+            in_channels, bond_dim, PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2, padding_mode=padding_mode
+        )
         self.row_operator = operator(bond_dim, height, operator_rank)
         self.column_operator = operator(bond_dim, width, operator_rank)
-        self.out_proj = nn.Conv2d(bond_dim, in_channels, kernel_size=PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2)
+        self.out_proj = nn.Conv2d(
+            bond_dim, in_channels, PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2, padding_mode=padding_mode
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Row step: (c, h) -> (d, j) for every column w. Column step: (d, w) -> (e, k) for every row j.
         if self.positional_encoding is not None:
             x = self.positional_encoding(x)
         projected = self.in_proj(x)
-        row_mixed = F.gelu(torch.einsum("bchw,chjd->bdjw", projected, self.row_operator.materialize()))
-        column_mixed = torch.einsum("bdjw,dwke->bejk", row_mixed, self.column_operator.materialize())
+        row_mixed = F.gelu(self._mix(projected, self.row_operator, "bchw,chjd->bdjw", axis=2))
+        column_mixed = self._mix(row_mixed, self.column_operator, "bdjw,dwke->bejk", axis=3)
         return self.out_proj(column_mixed)
+
+    def _mix(self, x: torch.Tensor, operator: nn.Module, equation: str, axis: int) -> torch.Tensor:
+        uniform_response = operator.uniform_response() if self.mean_boundary else None
+        return mix_along_axis(x, operator.materialize(), equation, axis, uniform_response)
 
 
 class MPSBottleneck(nn.Module):

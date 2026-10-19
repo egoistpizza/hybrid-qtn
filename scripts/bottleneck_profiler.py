@@ -126,7 +126,8 @@ def axial_mps_bottleneck_profile(
         ),
     ) if variant.positional_encoding else ()
     encoding_label = "with" if variant.positional_encoding else "no"
-    description = f"{variant.axial_operator} operators, {encoding_label} positional encoding"
+    boundary = f", {variant.boundary} boundary" if variant.axial_operator == "relative" else ""
+    description = f"{variant.axial_operator} operators{boundary}, {encoding_label} positional encoding"
     return BottleneckProfile(
         title=f"Tensorized Axial MPS bottleneck (D={bond_dim}, H=W={spatial_size}, χ={AXIAL_OPERATOR_RANK}; "
         f"{description})",

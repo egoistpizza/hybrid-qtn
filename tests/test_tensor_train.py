@@ -186,3 +186,18 @@ def test_relative_materialization_runs_in_float32_under_autocast():
     operator = RelativeAxialOperator(bond_dim=4, spatial_size=4, max_rank=4)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         assert operator.materialize().dtype == torch.float32
+
+
+def test_uniform_response_sums_the_kernel_over_every_used_offset():
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
+    kernel = operator.kernel()
+    expected = sum(kernel[:, slot, :] for slot in range(1, 16))
+    assert torch.allclose(operator.uniform_response(), expected, atol=1e-6)
+
+
+def test_uniform_response_is_the_full_support_response_to_a_unit_input():
+    operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
+    kernel, size = operator.kernel(), 8
+    for j in range(size):
+        full_support = sum(kernel[:, offset + size, :] for offset in range(-(size - 1), size))
+        assert torch.allclose(operator.uniform_response(), full_support, atol=1e-6)
