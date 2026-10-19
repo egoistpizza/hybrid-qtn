@@ -1,8 +1,21 @@
 import pytest
 import torch
 
-from models.mps_layer import AxialMPSLayer, MPSBottleneck, MPSVariant, SeparablePositionalEncoding2D, mix_along_axis
-from models.tensor_train import RelativeAxialOperator
+from models.mps_layer import (
+    COLUMN_EQUATION,
+    ROW_EQUATION,
+    AxialMPSLayer,
+    MPSBottleneck,
+    MPSVariant,
+    SeparablePositionalEncoding2D,
+    axial_operator_class,
+)
+from models.tensor_train import (
+    AbsoluteAxialOperator,
+    CircularAxialOperator,
+    MeanBoundaryAxialOperator,
+    RelativeAxialOperator,
+)
 
 
 @pytest.fixture
@@ -88,6 +101,11 @@ def test_relative_layer_output_follows_a_shifted_input():
     assert torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-5)
 
 
+def test_circular_layer_output_follows_a_shifted_input():
+    original, shifted = shift_response("circular", shift=4)
+    assert torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-5)
+
+
 def test_absolute_layer_output_does_not_follow_a_shifted_input():
     original, shifted = shift_response("absolute", shift=4)
     assert not torch.allclose(shifted[..., 5:15], original[..., 1:11], atol=1e-3)
@@ -105,25 +123,23 @@ def test_positional_encoding_is_opt_in_and_adds_its_parameters():
 
 def test_unknown_axial_operator_raises():
     with pytest.raises(ValueError, match="Unknown axial_operator"):
-        MPSVariant("circular")
+        MPSVariant("dilated")
 
 
-def test_relative_bottleneck_gradient_reaches_every_core(sample_tensor: torch.Tensor):
-    bottleneck = MPSBottleneck(64, 16, 32, 32, variant=MPSVariant("relative"))
+@pytest.mark.parametrize("axial_operator", ["relative", "circular"])
+def test_offset_operator_gradient_reaches_every_core(sample_tensor: torch.Tensor, axial_operator: str):
+    bottleneck = MPSBottleneck(64, 16, 32, 32, variant=MPSVariant(axial_operator))
     bottleneck(sample_tensor).mean().backward()
     cores = [*bottleneck.axial_mps.row_operator.chain.cores, *bottleneck.axial_mps.column_operator.chain.cores]
     assert all(core.grad is not None and torch.any(core.grad != 0) for core in cores)
 
 
-ROW_EQUATION, COLUMN_EQUATION = "bchw,chjd->bdjw", "bdjw,dwke->bejk"
-
-
 def mixed(x: torch.Tensor, equation: str, axis: int, mean_boundary: bool) -> torch.Tensor:
     torch.manual_seed(0)
-    operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
+    operator_class = MeanBoundaryAxialOperator if mean_boundary else RelativeAxialOperator
+    operator = operator_class(bond_dim=4, spatial_size=8, max_rank=16)
     with torch.no_grad():
-        response = operator.uniform_response() if mean_boundary else None
-        return mix_along_axis(x, operator.materialize(), equation, axis, response)
+        return operator.mix(x, equation, axis)
 
 
 @pytest.mark.parametrize("equation, axis", [(ROW_EQUATION, 2), (COLUMN_EQUATION, 3)])
@@ -144,13 +160,26 @@ def test_mean_boundary_shifts_the_output_of_a_zero_mean_pattern_with_the_input()
     assert torch.allclose(shifted[..., 4:, :], original[..., 2:6, :], atol=1e-5)
 
 
-def test_zero_boundary_is_the_plain_einsum():
+def test_zero_boundary_mixing_is_the_plain_einsum():
     torch.manual_seed(0)
     operator = RelativeAxialOperator(bond_dim=4, spatial_size=8, max_rank=16)
     features = torch.randn(2, 4, 8, 8)
     with torch.no_grad():
-        weights = operator.materialize()
-        assert torch.equal(mix_along_axis(features, weights, ROW_EQUATION, 2), torch.einsum(ROW_EQUATION, features, weights))
+        expected = torch.einsum(ROW_EQUATION, features, operator.materialize())
+        assert torch.equal(operator.mix(features, ROW_EQUATION, 2), expected)
+
+
+@pytest.mark.parametrize(
+    "variant, operator_class",
+    [
+        (MPSVariant(), RelativeAxialOperator),
+        (MPSVariant("absolute"), AbsoluteAxialOperator),
+        (MPSVariant("circular"), CircularAxialOperator),
+        (MPSVariant(boundary="mean"), MeanBoundaryAxialOperator),
+    ],
+)
+def test_each_variant_selects_its_operator_class(variant, operator_class):
+    assert axial_operator_class(variant) is operator_class
 
 
 @pytest.mark.parametrize("boundary, flat", [("mean", True), ("zero", False)])
@@ -171,8 +200,16 @@ def test_mean_boundary_gradient_reaches_every_core(sample_tensor: torch.Tensor):
 
 @pytest.mark.parametrize(
     "variant_arguments, message",
-    [({"boundary": "reflect"}, "Unknown boundary"), ({"axial_operator": "absolute", "boundary": "mean"}, "needs the relative")],
+    [
+        ({"boundary": "reflect"}, "Unknown boundary"),
+        ({"axial_operator": "absolute", "boundary": "mean"}, "needs the relative"),
+        ({"axial_operator": "circular", "boundary": "mean"}, "needs the relative"),
+    ],
 )
 def test_invalid_boundary_settings_raise(variant_arguments, message):
     with pytest.raises(ValueError, match=message):
         MPSVariant(**variant_arguments)
+
+
+def test_default_variant_is_the_relative_operator_with_zero_edges_and_no_encoding():
+    assert MPSVariant() == MPSVariant("relative", positional_encoding=False, boundary="zero")

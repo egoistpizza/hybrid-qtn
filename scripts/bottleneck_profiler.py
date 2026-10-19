@@ -99,13 +99,15 @@ def tensor_train_component(
 
 
 def axial_operator_component(axis: str, bond_dim: int, spatial_size: int, axial_operator: str) -> ParameterComponent:
-    """Absolute operator: 2→2 sites over channel and position bits. Relative operator: 2→2
-    channel sites interleaved with 2→1 sites over the bits of the ``2 * spatial_size`` offsets."""
-    if axial_operator == "relative":
-        roles = interleaved_site_roles(binary_digits(2 * spatial_size), binary_digits(bond_dim))
+    """Absolute operator: 2→2 sites over channel and position bits. Relative and circular
+    operators: 2→2 channel sites interleaved with 2→1 sites over the bits of the offsets
+    (``2 * spatial_size`` relative offsets, ``spatial_size`` circular ones)."""
+    offset_slots = {"relative": 2 * spatial_size, "circular": spatial_size}
+    if axial_operator in offset_slots:
+        roles = interleaved_site_roles(binary_digits(offset_slots[axial_operator]), binary_digits(bond_dim))
         output_modes = tuple(2 if role == "channel" else 1 for role in roles)
-        name = f"{axis} Toeplitz MPO chain"
-        return tensor_train_component(name, (2,) * len(roles), output_modes, AXIAL_OPERATOR_RANK)
+        structure = "Toeplitz" if axial_operator == "relative" else "circulant"
+        return tensor_train_component(f"{axis} {structure} MPO chain", (2,) * len(roles), output_modes, AXIAL_OPERATOR_RANK)
     site_count = binary_digits(bond_dim) + binary_digits(spatial_size)
     return tensor_train_component(f"{axis} MPO chain", (2,) * site_count, (2,) * site_count, AXIAL_OPERATOR_RANK)
 

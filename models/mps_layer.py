@@ -6,10 +6,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.tensor_train import AbsoluteAxialOperator, RelativeAxialOperator, TTConv2d
+from models.tensor_train import (
+    AbsoluteAxialOperator,
+    AxialOperator,
+    CircularAxialOperator,
+    MeanBoundaryAxialOperator,
+    RelativeAxialOperator,
+    TTConv2d,
+)
 
-AXIAL_OPERATORS = {"absolute": AbsoluteAxialOperator, "relative": RelativeAxialOperator}
+AXIAL_OPERATORS = {
+    "absolute": AbsoluteAxialOperator,
+    "relative": RelativeAxialOperator,
+    "circular": CircularAxialOperator,
+}
+OPERATOR_NAME_SUFFIXES = {"absolute": "", "relative": "_rel", "circular": "_circ"}
 AXIAL_BOUNDARIES = ("zero", "mean")
+ROW_EQUATION = "bchw,chjd->bdjw"
+COLUMN_EQUATION = "bdjw,dwke->bejk"
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
@@ -20,14 +34,15 @@ class MPSVariant:
     """Design choices of the MPS block.
 
     Attributes:
-        axial_operator: ``relative`` (:class:`RelativeAxialOperator`, weights depend only on the
-            offset, so the block is shift-equivariant) or ``absolute`` (:class:`AbsoluteAxialOperator`,
-            separate weights per position pair).
+        axial_operator: ``relative`` (default, :class:`RelativeAxialOperator`, weights depend only
+            on the offset), ``absolute`` (:class:`AbsoluteAxialOperator`, separate weights per
+            position pair) or ``circular`` (:class:`CircularAxialOperator`, the offset wraps around
+            the axis; kept to reproduce a reported ablation).
         positional_encoding: Whether a learned positional encoding is added to the block input.
-        boundary: How the block treats positions beyond the edge: ``zero``, or ``mean``, where
-            relative operators fill them with the mean of the features along the mixed axis (see
-            :func:`mix_along_axis`) and the 3x3 projections pad by replication, so that a uniform
-            input gives a uniform output.
+        boundary: How the block treats positions beyond the edge: ``zero`` (default), or ``mean``
+            (kept to reproduce a reported ablation), where relative operators fill them with the
+            mean of the features along the mixed axis (:class:`MeanBoundaryAxialOperator`) and the
+            3x3 projections pad by replication, so that a uniform input gives a uniform output.
     """
 
     axial_operator: str = "relative"
@@ -46,36 +61,20 @@ class MPSVariant:
 
     @property
     def name_suffix(self) -> str:
-        """``_rel`` for relative operators, ``_mean`` for the mean boundary and ``_nope`` without positional encoding.
+        """``_rel`` / ``_circ`` for relative / circular operators, ``_mean`` for the mean boundary and ``_nope`` without positional encoding.
 
         The suffix describes the settings, not the defaults, so names stay comparable across versions.
         """
         return (
-            ("_rel" if self.axial_operator == "relative" else "")
+            OPERATOR_NAME_SUFFIXES[self.axial_operator]
             + ("_mean" if self.boundary == "mean" else "")
             + ("" if self.positional_encoding else "_nope")
         )
 
 
-def mix_along_axis(
-    x: torch.Tensor,
-    weights: torch.Tensor,
-    equation: str,
-    axis: int,
-    uniform_response: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Apply an axial operator with ``torch.einsum(equation, x, weights)``.
-
-    With ``uniform_response`` (shape ``(in_channel, out_channel)``), positions beyond the edge
-    take the mean of ``x`` along ``axis`` instead of zero: the operator acts on ``x`` minus its
-    mean, and the mean contributes through the edge-free uniform response. A uniform input
-    then gives the same output at every position.
-    """
-    if uniform_response is None:
-        return torch.einsum(equation, x, weights)
-    mean = x.mean(dim=axis, keepdim=True)
-    mean_weights = uniform_response[:, None, None, :]
-    return torch.einsum(equation, x - mean, weights) + torch.einsum(equation, mean, mean_weights)
+def axial_operator_class(variant: MPSVariant) -> type[AxialOperator]:
+    """Operator class of ``variant``: the mean boundary replaces the relative operator's zero edges."""
+    return MeanBoundaryAxialOperator if variant.boundary == "mean" else AXIAL_OPERATORS[variant.axial_operator]
 
 
 class SeparablePositionalEncoding2D(nn.Module):
@@ -120,13 +119,12 @@ class AxialMPSLayer(nn.Module):
         variant: MPSVariant = MPSVariant(),
     ):
         super().__init__()
-        operator = AXIAL_OPERATORS[variant.axial_operator]
+        operator = axial_operator_class(variant)
         self.positional_encoding = (
             SeparablePositionalEncoding2D(in_channels, height, width) if variant.positional_encoding else None
         )
-        self.mean_boundary = variant.boundary == "mean"
         # Zero padding would turn a uniform input into a border ring that the axis-wide operators spread.
-        padding_mode = "replicate" if self.mean_boundary else "zeros"
+        padding_mode = "replicate" if variant.boundary == "mean" else "zeros"
         self.in_proj = nn.Conv2d(
             in_channels, bond_dim, PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2, padding_mode=padding_mode
         )
@@ -141,13 +139,9 @@ class AxialMPSLayer(nn.Module):
         if self.positional_encoding is not None:
             x = self.positional_encoding(x)
         projected = self.in_proj(x)
-        row_mixed = F.gelu(self._mix(projected, self.row_operator, "bchw,chjd->bdjw", axis=2))
-        column_mixed = self._mix(row_mixed, self.column_operator, "bdjw,dwke->bejk", axis=3)
+        row_mixed = F.gelu(self.row_operator.mix(projected, ROW_EQUATION, axis=2))
+        column_mixed = self.column_operator.mix(row_mixed, COLUMN_EQUATION, axis=3)
         return self.out_proj(column_mixed)
-
-    def _mix(self, x: torch.Tensor, operator: nn.Module, equation: str, axis: int) -> torch.Tensor:
-        uniform_response = operator.uniform_response() if self.mean_boundary else None
-        return mix_along_axis(x, operator.materialize(), equation, axis, uniform_response)
 
 
 class MPSBottleneck(nn.Module):

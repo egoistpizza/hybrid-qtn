@@ -202,7 +202,19 @@ def interleaved_site_roles(spatial_bits: int, channel_bits: int) -> tuple[str, .
     return tuple(roles)
 
 
-class AbsoluteAxialOperator(nn.Module):
+class AxialOperator(nn.Module):
+    """Linear operator along one image axis; subclasses define :meth:`materialize`."""
+
+    def materialize(self) -> torch.Tensor:
+        """Dense weights of shape ``(in_channel, in_position, out_position, out_channel)``."""
+        raise NotImplementedError
+
+    def mix(self, x: torch.Tensor, equation: str, axis: int) -> torch.Tensor:
+        """Apply the operator to ``x`` along ``axis`` with ``torch.einsum(equation, x, weights)``."""
+        return torch.einsum(equation, x, self.materialize())
+
+
+class AbsoluteAxialOperator(AxialOperator):
     """Absolute-position linear operator along one image axis on the joint (channel, position) index.
 
     Every pair of input and output positions has its own weights, so the operator is not
@@ -249,15 +261,14 @@ class AbsoluteAxialOperator(nn.Module):
         )
 
 
-class RelativeAxialOperator(nn.Module):
+class RelativeAxialOperator(AxialOperator):
     """Relative-position (Toeplitz) linear operator along one image axis.
 
     The weight between input position ``h`` and output position ``j`` depends only on the
     offset ``j - h``: ``W[c, h, j, d] = K[c, d, j - h]``. The kernel ``K`` spans every offset
     of the axis, so each output still sees the whole row or column, and shifting the input
     shifts the output. Offsets beyond the axis contribute zero (no wrap-around); for inputs
-    with a non-zero mean this makes the output depend on the distance to the edges, which the
-    mean boundary of :class:`models.mps_layer.AxialMPSLayer` removes using :meth:`uniform_response`.
+    with a non-zero mean this makes the output depend on the distance to the edges.
 
     ``K`` is a tensor train over the binary digits of the offset (``2 * spatial_size``
     slots) interleaved with the digits of the input and output channels; offset sites have
@@ -273,7 +284,8 @@ class RelativeAxialOperator(nn.Module):
         super().__init__()
         self.bond_dim = bond_dim
         self.spatial_size = spatial_size
-        self.site_roles = interleaved_site_roles(binary_digits(2 * spatial_size), binary_digits(bond_dim))
+        self.offset_slots = self.offset_slot_count(spatial_size)
+        self.site_roles = interleaved_site_roles(binary_digits(self.offset_slots), binary_digits(bond_dim))
         self.chain = TensorTrain(
             input_modes=(2,) * len(self.site_roles),
             output_modes=tuple(2 if role == "channel" else 1 for role in self.site_roles),
@@ -284,24 +296,33 @@ class RelativeAxialOperator(nn.Module):
         offset_sites = [site for site, role in enumerate(self.site_roles) if role == "spatial"]
         output_digits = [len(self.site_roles) + digit for digit in range(len(channel_sites))]
         self.axis_order = (*channel_sites, *offset_sites, *output_digits)
+        offset_index = self.offset_table(spatial_size)
+        self.register_buffer("offset_index", offset_index, persistent=False)
+        self.register_buffer("used_slots", torch.unique(offset_index), persistent=False)
+
+    @staticmethod
+    def offset_slot_count(spatial_size: int) -> int:
+        return 2 * spatial_size
+
+    @staticmethod
+    def offset_table(spatial_size: int) -> torch.Tensor:
+        """Kernel slot of every ``(in_position, out_position)`` pair: slot ``k`` holds offset
+        ``k - spatial_size``; slot 0 (offset ``-spatial_size``) is never used."""
         positions = torch.arange(spatial_size)
-        self.register_buffer("offset_index", positions[None, :] - positions[:, None] + spatial_size, persistent=False)
+        return positions[None, :] - positions[:, None] + spatial_size
 
     def kernel(self) -> torch.Tensor:
-        """Kernel of shape ``(in_channel, 2 * spatial_size, out_channel)``.
-
-        Slot ``k`` holds offset ``k - spatial_size``; slot 0 (offset ``-spatial_size``) is never used.
-        """
+        """Kernel of shape ``(in_channel, offset_slots, out_channel)``, indexed by :meth:`offset_table`."""
         digit_count = len(self.site_roles) + self.site_roles.count("channel")
         return (
             self.chain.materialize()
             .reshape((2,) * digit_count)
             .permute(self.axis_order)
-            .reshape(self.bond_dim, 2 * self.spatial_size, self.bond_dim)
+            .reshape(self.bond_dim, self.offset_slots, self.bond_dim)
         )
 
     def materialize(self) -> torch.Tensor:
-        """Dense Toeplitz operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
+        """Dense operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
         return self.kernel()[:, self.offset_index, :]
 
     def uniform_response(self) -> torch.Tensor:
@@ -309,4 +330,36 @@ class RelativeAxialOperator(nn.Module):
 
         This is the response to a unit input that is uniform along an axis without edges.
         """
-        return self.kernel()[:, 1:, :].sum(dim=1)
+        return self.kernel()[:, self.used_slots, :].sum(dim=1)
+
+
+class CircularAxialOperator(RelativeAxialOperator):
+    """Circulant variant of :class:`RelativeAxialOperator`: ``W[c, h, j, d] = K[c, d, (j - h) mod N]``.
+
+    Offsets wrap around the axis, so the operator has no edges and commutes exactly with
+    circular shifts; the kernel has ``N`` offset slots instead of ``2N``. Kept to reproduce the
+    reported circular-operator ablation, which underfit on CVC-ClinicDB.
+    """
+
+    @staticmethod
+    def offset_slot_count(spatial_size: int) -> int:
+        return spatial_size
+
+    @staticmethod
+    def offset_table(spatial_size: int) -> torch.Tensor:
+        positions = torch.arange(spatial_size)
+        return (positions[None, :] - positions[:, None]) % spatial_size
+
+
+class MeanBoundaryAxialOperator(RelativeAxialOperator):
+    """:class:`RelativeAxialOperator` whose positions beyond the edge take the mean of the input along the axis.
+
+    The Toeplitz operator acts on the input minus its mean, and the mean passes through
+    :meth:`uniform_response`, so a uniform input gives the same output at every position.
+    Kept to reproduce the reported mean-boundary ablation.
+    """
+
+    def mix(self, x: torch.Tensor, equation: str, axis: int) -> torch.Tensor:
+        mean = x.mean(dim=axis, keepdim=True)
+        mean_weights = self.uniform_response()[:, None, None, :]
+        return torch.einsum(equation, x - mean, self.materialize()) + torch.einsum(equation, mean, mean_weights)

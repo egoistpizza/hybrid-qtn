@@ -30,7 +30,8 @@ def add_mps_arguments(parser: argparse.ArgumentParser) -> None:
         "--axial_operator",
         choices=tuple(AXIAL_OPERATORS),
         default=default.axial_operator,
-        help="relative: weights depend only on the offset (shift-equivariant); absolute: weights per position pair",
+        help="relative (default): weights depend only on the offset; absolute: weights per position pair; "
+        "circular: the offset wraps around the axis (reproduces a reported ablation)",
     )
     parser.add_argument(
         "--positional_encoding",
@@ -42,7 +43,8 @@ def add_mps_arguments(parser: argparse.ArgumentParser) -> None:
         "--axial_boundary",
         choices=AXIAL_BOUNDARIES,
         default=default.boundary,
-        help="Positions beyond the edge for relative operators: zero, or the mean along the axis",
+        help="Positions beyond the edge for relative operators: zero (default), or the mean along the axis "
+        "(reproduces a reported ablation)",
     )
 
 
