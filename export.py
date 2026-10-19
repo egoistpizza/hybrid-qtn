@@ -12,6 +12,7 @@ import torch
 from models.factory import MODEL_TYPES, build_segmentation_model
 from models.variant import MPSVariant
 from utils import get_device
+from utils.run_naming import architecture_name
 
 
 def measure_throughput(
@@ -71,6 +72,11 @@ def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, outp
     )
 
 
+def export_filename(model_type: str, bond_dim: int, variant: MPSVariant, image_size: int) -> str:
+    """ONNX file name: the architecture part of the run name plus the input size."""
+    return f"{architecture_name(model_type, bond_dim, variant)}_s{image_size}.onnx"
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
@@ -90,7 +96,7 @@ def main() -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     
     variant = MPSVariant.from_arguments(args)
-    onnx_filename = f"{args.model}_b{args.bond_dim}{variant.name_suffix}_s{args.image_size}.onnx"
+    onnx_filename = export_filename(args.model, args.bond_dim, variant, args.image_size)
     onnx_file_path = output_directory / onnx_filename
     
     model = build_segmentation_model(args.model, args.bond_dim, args.image_size, variant).to(compute_device)

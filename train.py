@@ -19,16 +19,7 @@ from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from dataset import (
-    DEFAULT_TEST_SET,
-    DatasetSplits,
-    build_loader,
-    build_splits,
-    discover_dataset_configs,
-    parse_dataset_arg,
-    slugify_dataset_arg,
-)
-from models.factory import MODEL_TYPES, build_segmentation_model
+from dataset import DEFAULT_TEST_SET, DatasetSplits, build_loader, build_splits
 from models.variant import MPSVariant
 from utils import get_device
 from utils.checkpoints import BEST_LIVE_CHECKPOINT, INTERRUPTED_CHECKPOINT, SWA_CHECKPOINT, load_weights, save_weights
@@ -43,14 +34,12 @@ from utils.loss import (
     FocalTverskyLoss,
 )
 from utils.run_logger import RunLogger, WandbLogger
-from utils.run_naming import build_run_name
+from utils.run_spec import CHECKPOINT_ROOT, RunSpec
 from utils.seed import seed_everything
 
 logger = logging.getLogger(__name__)
 
-LOSS_CHOICES = ("focal_tversky", "bce_dice")
 GRADIENT_CLIP_NORM = 1.0
-CHECKPOINT_ROOT = Path("checkpoints")
 
 LoaderFactory = Callable[[Dataset, bool], DataLoader]
 
@@ -278,26 +267,18 @@ class SegmentationTrainer:
 
 
 def parse_arguments() -> argparse.Namespace:
-    available = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     parser = argparse.ArgumentParser(description="Train a segmentation model")
-    parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
+    RunSpec.add_arguments(parser)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--bond_dim", type=int, default=32)
-    MPSVariant.add_arguments(parser)
-    parser.add_argument("--loss", type=str, default="focal_tversky", choices=LOSS_CHOICES)
     parser.add_argument("--fn_weight", type=float, default=TVERSKY_FN_WEIGHT, help="Focal Tversky weight on false negatives")
     parser.add_argument("--fp_weight", type=float, default=TVERSKY_FP_WEIGHT, help="Focal Tversky weight on false positives")
     parser.add_argument("--focal_gamma", type=float, default=FOCAL_TVERSKY_GAMMA, help="Focal Tversky gamma; the loss exponent is 1/gamma")
-    parser.add_argument("--seed", type=int, default=42, help="Training seed; the data split seed stays fixed")
     parser.add_argument(
         "--deterministic",
         action="store_true",
         help="Use deterministic GPU kernels for bit-identical reruns on the same GPU type (about 4x slower)",
     )
-    parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Comma-separated dataset configs. Available: {available}")
-    parser.add_argument("--fold", type=int, default=None, help="Cross-validation fold; needs cross_validation_folds in the config")
-    parser.add_argument("--tag", type=str, default=None, help="Suffix to distinguish runs of the same config")
     return parser.parse_args()
 
 
@@ -346,39 +327,34 @@ def compile_with_warmup(model: nn.Module, config: TrainingConfig, device: torch.
 def main() -> None:
     init()
     arguments = parse_arguments()
-    dataset_names = parse_dataset_arg(arguments.dataset)
-    seed_everything(arguments.seed, deterministic_algorithms=arguments.deterministic)
+    spec = RunSpec.from_arguments(arguments)
+    seed_everything(spec.seed, deterministic_algorithms=arguments.deterministic)
     device = get_device()
-    splits = build_splits(dataset_names, fold=arguments.fold)
-    dataset_slug = slugify_dataset_arg(dataset_names)
-    variant = MPSVariant.from_arguments(arguments)
-    run_name = build_run_name(
-        dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag, variant,
-        arguments.fold,
-    )
+    splits = build_splits(list(spec.datasets), fold=spec.fold)
+    run_name = spec.run_name
 
     config = TrainingConfig(
-        model_type=arguments.model,
-        dataset=dataset_slug,
-        loss=arguments.loss,
-        seed=arguments.seed,
+        model_type=spec.model_type,
+        dataset=spec.dataset_slug,
+        loss=spec.loss,
+        seed=spec.seed,
         epochs=arguments.epochs,
         batch_size=arguments.batch_size,
-        bond_dim=arguments.bond_dim,
+        bond_dim=spec.bond_dim,
         fn_weight=arguments.fn_weight,
         fp_weight=arguments.fp_weight,
         focal_gamma=arguments.focal_gamma,
         image_size=splits.image_size,
-        mps_variant=variant,
-        fold=arguments.fold,
+        mps_variant=spec.variant,
+        fold=spec.fold,
         deterministic=arguments.deterministic,
-        checkpoint_dir=str(CHECKPOINT_ROOT / run_name),
+        checkpoint_dir=str(spec.checkpoint_dir),
     )
 
     test_sizes = ", ".join(f"{len(test_set.dataset)} {name}" for name, test_set in splits.test_sets.items())
     logger.info(f"Dataset '{config.dataset}': {len(splits.train)} train / {len(splits.val.dataset)} val / test: {test_sizes}")
 
-    model = build_segmentation_model(config.model_type, config.bond_dim, config.image_size, config.mps_variant)
+    model = spec.build_model(config.image_size)
     total_params = log_parameter_breakdown(model)
     model = model.to(device).to(memory_format=torch.channels_last)
     model = compile_with_warmup(model, config, device)

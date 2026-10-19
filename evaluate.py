@@ -12,24 +12,13 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Subset
 
-from dataset import (
-    DatasetSplits,
-    Denormalization,
-    EvaluationSet,
-    build_loader,
-    build_splits,
-    discover_dataset_configs,
-    parse_dataset_arg,
-    slugify_dataset_arg,
-)
-from models.factory import MODEL_TYPES, build_segmentation_model
-from models.variant import MPSVariant
+from dataset import DatasetSplits, Denormalization, EvaluationSet, build_loader, build_splits
 from utils import get_device
 from utils.checkpoints import evaluation_checkpoint, load_weights
 from utils.evaluation import Batch, evaluate_model, metric_suites
 from utils.foreground_maps import full_resolution_maps
 from utils.metrics import MetricAccumulator, binarize
-from utils.run_naming import build_run_name
+from utils.run_spec import CHECKPOINT_ROOT, RunSpec
 
 TEST_SPLIT = "test"
 VALIDATION_SPLIT = "val"
@@ -113,16 +102,8 @@ class ProbabilityMapWriter:
 
 
 def parse_args() -> argparse.Namespace:
-    available_datasets = ", ".join(sorted(discover_dataset_configs())) or "(none)"
     parser = argparse.ArgumentParser(description="Evaluate segmentation models")
-    parser.add_argument("--model", type=str, default="vanilla", choices=MODEL_TYPES)
-    parser.add_argument("--bond_dim", type=int, default=32)
-    MPSVariant.add_arguments(parser)
-    parser.add_argument("--loss", type=str, default="focal_tversky")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tag", type=str, default=None)
-    parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Available: {available_datasets}")
-    parser.add_argument("--fold", type=int, default=None, help="Cross-validation fold of the run")
+    RunSpec.add_arguments(parser)
     parser.add_argument("--split", type=str, default="test", choices=EVALUATION_SPLITS)
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11))
     parser.add_argument("--output_dir", type=str, default=None)
@@ -136,41 +117,62 @@ def evaluation_sets(splits: DatasetSplits, split: str) -> dict[str, EvaluationSe
     return dict(splits.test_sets) if split == TEST_SPLIT else {VALIDATION_SPLIT: splits.val}
 
 
-def main() -> None:
-    args = parse_args()
-    device = get_device()
-    dataset_names = parse_dataset_arg(args.dataset)
-    dataset_slug = slugify_dataset_arg(dataset_names)
+def evaluate_run(
+    spec: RunSpec,
+    splits: DatasetSplits,
+    device: torch.device,
+    split: str = TEST_SPLIT,
+    num_samples: int = 10,
+    output_dir: Path | None = None,
+    run_name: str | None = None,
+    save_maps: bool = False,
+) -> dict[str, dict[str, float]]:
+    """Evaluate the checkpoint of ``spec`` (or of ``run_name``) on every set of ``split``.
 
-    splits = build_splits(dataset_names, fold=args.fold)
-
-    variant = MPSVariant.from_arguments(args)
-    run_name = args.run or build_run_name(
-        dataset_slug, args.model, args.bond_dim, args.loss, args.seed, args.tag, variant, args.fold
-    )
-    model = build_segmentation_model(args.model, args.bond_dim, splits.image_size, variant)
-    model = model.to(device).to(memory_format=torch.channels_last)
-    checkpoint = evaluation_checkpoint(Path("checkpoints") / run_name)
+    Writes qualitative panels to ``output_dir`` and, with ``save_maps``, probability maps;
+    returns the metrics of each evaluated set.
+    """
+    run_name = run_name or spec.run_name
+    model = spec.build_model(splits.image_size).to(device).to(memory_format=torch.channels_last)
+    checkpoint = evaluation_checkpoint(CHECKPOINT_ROOT / run_name)
     print(f"Loading weights from: {checkpoint}")
     load_weights(model, checkpoint, device)
 
-    output_dir = Path(args.output_dir) if args.output_dir else Path("outputs") / "visualizations" / run_name
-    for set_name, evaluation_set in evaluation_sets(splits, args.split).items():
+    output_dir = output_dir or Path("outputs") / "visualizations" / run_name
+    results = {}
+    for set_name, evaluation_set in evaluation_sets(splits, split).items():
         dataset = evaluation_set.dataset
-        print(f"Dataset '{dataset_slug}': {len(dataset)} {set_name} samples on {device}")
-        loader = build_loader(dataset, EVALUATION_BATCH_SIZE, shuffle=False, seed=args.seed)
+        print(f"Dataset '{spec.dataset_slug}': {len(dataset)} {set_name} samples on {device}")
+        loader = build_loader(dataset, EVALUATION_BATCH_SIZE, shuffle=False, seed=spec.seed)
         suites = metric_suites(compute_hd95=True, foreground_maps=evaluation_set.foreground_maps)
-        if args.save_maps:
+        if save_maps:
             suites.append(ProbabilityMapWriter(Path("outputs") / "prediction_maps" / run_name / set_name))
-        metrics = evaluate_model(model, loader, device, suites, description=f"Evaluating {set_name}")
-        print(" | ".join(f"{set_name} {name}: {value:.4f}" for name, value in metrics.items()))
+        results[set_name] = evaluate_model(model, loader, device, suites, description=f"Evaluating {set_name}")
+        print(" | ".join(f"{set_name} {name}: {value:.4f}" for name, value in results[set_name].items()))
 
         # Panels use a separate batch-size-1 pass: logits near the threshold depend on the batch size.
         panel_positions = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(VISUALIZATION_SEED))
-        panel_loader = DataLoader(Subset(dataset, panel_positions[: args.num_samples].tolist()), batch_size=1, shuffle=False)
+        panel_loader = DataLoader(Subset(dataset, panel_positions[:num_samples].tolist()), batch_size=1, shuffle=False)
         panel_writer = PanelWriter(output_dir / set_name, evaluation_set.denormalization)
         evaluate_model(model, panel_loader, device, [panel_writer], description="Saving visualizations")
     print(f"Visualizations saved to: {output_dir.absolute()}")
+    return results
+
+
+def main() -> None:
+    args = parse_args()
+    spec = RunSpec.from_arguments(args)
+    splits = build_splits(list(spec.datasets), fold=spec.fold)
+    evaluate_run(
+        spec,
+        splits,
+        get_device(),
+        split=args.split,
+        num_samples=args.num_samples,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+        run_name=args.run,
+        save_maps=args.save_maps,
+    )
 
 
 if __name__ == "__main__":

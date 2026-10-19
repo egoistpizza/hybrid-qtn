@@ -161,7 +161,7 @@ hqtn hybrid-qtn:latest train.py --model vanilla               --dataset kvasir_s
 
 | Argument | Values / default |
 |---|---|
-| `--model` | `vanilla`, `hybrid`, `deep_hybrid` |
+| `--model` | `hybrid` (default), `vanilla`, `deep_hybrid` |
 | `--bond_dim` | default 32 |
 | `--loss` | `focal_tversky` (default), `bce_dice` |
 | `--fn_weight` / `--fp_weight` / `--focal_gamma` | 0.3 / 0.7 / 4/3 |
@@ -195,13 +195,15 @@ Aggregate the `test_swa_*` / `test_best_live_*` summary values across seeds as m
 hqtn hybrid-qtn:latest evaluate.py --model hybrid --bond_dim 32 --dataset kvasir_seg --seed 42 --split test
 ```
 
-This loads `best_swa_model.pth`, falling back to `best_model.pth` if absent. It evaluates every test set of the dataset and prints Dice, IoU, MAE, F2 and HD95 for each, plus the camouflage metrics when the dataset config enables them. It writes 5–10 qualitative panels per set to `outputs/visualizations/<run>/<set>/`. Use `--run <name>` to evaluate a checkpoint directory by name, and `--save_maps` to save the probability maps at ground-truth resolution to `outputs/prediction_maps/<run>/<set>/`.
+`evaluate.py` takes the same run options as `train.py` (model, dataset, loss, seed, bond dimension, MPS variant, fold, tag), so it resolves the checkpoint directory training wrote. It loads `best_swa_model.pth`, falling back to `best_model.pth` if absent. It evaluates every test set of the dataset and prints Dice, IoU, MAE, F2 and HD95 for each, plus the camouflage metrics when the dataset config enables them. It writes 5–10 qualitative panels per set to `outputs/visualizations/<run>/<set>/`. Use `--run <name>` to evaluate a checkpoint directory by name, and `--save_maps` to save the probability maps at ground-truth resolution to `outputs/prediction_maps/<run>/<set>/`.
 
 ### 3.9 ONNX export and throughput
 
 ```bash
 hqtn hybrid-qtn:latest export.py --model hybrid --bond_dim 32 --image_size 512 --iterations 100
 ```
+
+The ONNX file is named after the architecture part of the run name and the input size, e.g. `outputs/onnx/hybrid_unet_b32_rel_nope_s512.onnx` or `vanilla_unet_s512.onnx`.
 
 ---
 
