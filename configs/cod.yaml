@@ -1,0 +1,66 @@
+# Camouflaged object detection benchmark config
+#
+# Layout expected after running `python -m scripts.download_cod`:
+#   data/cod/train/{cod10k,camo}/{images,masks}
+#   data/cod/test/{cod10k,camo,chameleon,nc4k}/{images,masks}
+#
+# Official protocol: COD10K-train + CAMO-train for training, four separate test sets.
+# Validation is carved from the training sources; see dataset/predefined.py.
+
+dataset_name: cod
+
+image_ext: .jpg
+mask_ext:  .png
+strict_pairing: true
+mask_threshold: 127
+# Two CHAMELEON masks differ in size from their images by a few pixels.
+align_mask_to_image: true
+# Also report S-measure, E-measure, weighted F-measure and MAE at ground-truth resolution.
+foreground_map_metrics: true
+
+sources:
+  cod10k_train:
+    images_dir: data/cod/train/cod10k/images
+    masks_dir:  data/cod/train/cod10k/masks
+  camo_train:
+    images_dir: data/cod/train/camo/images
+    masks_dir:  data/cod/train/camo/masks
+  cod10k:
+    images_dir: data/cod/test/cod10k/images
+    masks_dir:  data/cod/test/cod10k/masks
+  camo:
+    images_dir: data/cod/test/camo/images
+    masks_dir:  data/cod/test/camo/masks
+  chameleon:
+    images_dir: data/cod/test/chameleon/images
+    masks_dir:  data/cod/test/chameleon/masks
+  nc4k:
+    images_dir: data/cod/test/nc4k/images
+    masks_dir:  data/cod/test/nc4k/masks
+
+train_sources: [cod10k_train, camo_train]
+test_sources: [cod10k, camo, chameleon, nc4k]
+validation_fraction: 0.1
+
+# Natural images have a canonical orientation, so only horizontal flips are used.
+train_transforms:
+  - name: Resize
+    height: 512
+    width: 512
+  - name: HorizontalFlip
+    p: 0.5
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+eval_transforms:
+  - name: Resize
+    height: 512
+    width: 512
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2

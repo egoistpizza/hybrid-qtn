@@ -1,21 +1,8 @@
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-import numpy as np
 import onnxruntime as ort
 import pytest
 import torch
 
-from export import (
-    build_export_model,
-    export_model_to_onnx,
-    benchmark_pytorch_throughput,
-    benchmark_onnx_throughput
-)
+from export import benchmark_onnx_throughput, benchmark_pytorch_throughput, export_model_to_onnx, measure_throughput
 
 
 @pytest.fixture
@@ -34,18 +21,6 @@ def minimal_pytorch_model() -> torch.nn.Module:
             return self.conv(x)
             
     return MinimalModel()
-
-
-def test_build_export_model_returns_correct_instances():
-    vanilla_model = build_export_model("vanilla", bond_dim=16)
-    assert vanilla_model.__class__.__name__ == "UNet"
-    
-    hybrid_model = build_export_model("hybrid", bond_dim=16)
-    assert hybrid_model.__class__.__name__ == "UNetDeepHybrid"
-    assert getattr(hybrid_model, "transform_1024", None) is not None
-    
-    deep_hybrid_model = build_export_model("deep_hybrid", bond_dim=16)
-    assert getattr(deep_hybrid_model, "transform_512", None) is not None
 
 
 def test_export_model_to_onnx_creates_valid_file(minimal_pytorch_model, dummy_input_tensor, tmp_path):
@@ -81,3 +56,11 @@ def test_benchmark_onnx_throughput_returns_valid_fps(minimal_pytorch_model, dumm
     
     assert isinstance(fps, float)
     assert fps > 0.0
+
+
+def test_measure_throughput_times_only_the_measured_calls():
+    calls, synchronized = [], []
+    rate = measure_throughput(lambda: calls.append(1), iterations=4, warmup=2, synchronize=lambda: synchronized.append(len(calls)))
+    assert len(calls) == 6
+    assert synchronized == [2, 6]
+    assert rate > 0.0

@@ -1,107 +1,170 @@
+"""Train / validation / test splits shared by training and evaluation.
+
+The split seed is fixed and independent of the training seed, so every run of a dataset
+and its later evaluation see the same partitions.
+"""
+
 from __future__ import annotations
 
-import copy
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 import torch
-import yaml
-from torch.utils.data import ConcatDataset, Subset
+from torch.utils.data import ConcatDataset, Dataset, Subset
 
-from .groups import grouped_split_indices, groups_for_samples
-from .loader import load_dataset
-from .transforms import build_transforms_from_config
+from .base import GenericSegmentationDataset
+from .config import DatasetConfig, GroupedSplit, PredefinedSplit, SplitFractions, load_config
+from .groups import grouped_kfold_indices, grouped_partition_indices, groups_for_samples
+from .predefined import predefined_split_datasets
+from .transforms import EVAL_STAGE, TRAIN_STAGE, Denormalization
 
-CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
-DEFAULT_VAL_FRACTION = 0.2
 DEFAULT_SPLIT_SEED = 42
-REQUIRED_KEYS = ("images_dir", "masks_dir")
+DEFAULT_TEST_SET = "test"
 
-def discover_dataset_configs(config_dir: str | Path | None = None) -> dict[str, Path]:
-    directory = Path(config_dir) if config_dir is not None else CONFIG_DIR
-    found: dict[str, Path] = {}
-    
-    for path in sorted(directory.glob("*.yaml")):
-        try:
-            config = yaml.safe_load(path.read_text())
-        except yaml.YAMLError:
-            continue
-            
-        if isinstance(config, dict) and all(k in config for k in REQUIRED_KEYS):
-            found[path.stem] = path
-            
-    return found
 
-def resolve_config(name: str, config_dir: str | Path | None = None) -> Path:
-    available = discover_dataset_configs(config_dir)
-    
-    if name not in available:
-        directory = Path(config_dir) if config_dir is not None else CONFIG_DIR
-        listed = ", ".join(sorted(available)) or "(none found)"
-        raise ValueError(
-            f"Unknown dataset {name!r}. Available: {listed}. "
-            f"Add a YAML with {' and '.join(REQUIRED_KEYS)} under {directory}."
-        )
-        
-    return available[name]
+@dataclass(frozen=True)
+class EvaluationSet:
+    """A validation or test set, whether it is scored with the foreground-map metrics, and
+    how its network inputs map back to displayable images.
+    """
+
+    dataset: Dataset
+    foreground_maps: bool
+    denormalization: Denormalization
+
+
+@dataclass(frozen=True)
+class DatasetSplits:
+    """Partitions of one or more datasets at a common input size.
+
+    ``test_sets`` maps test-set names to sets: a single ``"test"`` entry for holdout
+    splits, or one entry per official test source for predefined splits.
+    """
+
+    train: Dataset
+    val: EvaluationSet
+    test_sets: Mapping[str, EvaluationSet]
+    image_size: int
+
 
 def parse_dataset_arg(value: str) -> list[str]:
+    """Split a comma-separated ``--dataset`` value into config names."""
     names = [part.strip() for part in str(value).split(",") if part.strip()]
     if not names:
         raise ValueError("--dataset must name at least one dataset config")
     return names
 
+
 def slugify_dataset_arg(names: list[str]) -> str:
+    """Dataset part of a run name; joint training joins the names with ``+``."""
     return "+".join(names)
 
-def make_splits(
-    name: str,
-    val_fraction: float = DEFAULT_VAL_FRACTION,
-    seed: int = DEFAULT_SPLIT_SEED,
-    config_dir: str | Path | None = None,
-) -> tuple[Subset, Subset]:
-    base_dataset = load_dataset(resolve_config(name, config_dir))
-    
-    group_spec = base_dataset.config.get("group_map")
-    
-    if group_spec is not None:
-        groups = groups_for_samples(
-            (sample_id for _, _, sample_id in base_dataset.samples),
-            group_spec,
-            root=CONFIG_DIR.parent,
-        )
-        train_idx, val_idx = grouped_split_indices(groups, val_fraction, seed)
+
+def _random_partition_indices(total: int, fractions: SplitFractions, seed: int) -> tuple[list[int], list[int], list[int]]:
+    permutation = torch.randperm(total, generator=torch.Generator().manual_seed(seed)).tolist()
+    train_size, val_size, _ = fractions.sizes(total)
+    return (
+        sorted(permutation[:train_size]),
+        sorted(permutation[train_size : train_size + val_size]),
+        sorted(permutation[train_size + val_size :]),
+    )
+
+
+def _holdout_split_datasets(
+    config: DatasetConfig, seed: int, fold: int | None
+) -> tuple[Dataset, Dataset, dict[str, Dataset]]:
+    split = config.split
+    if fold is not None and not (isinstance(split, GroupedSplit) and split.folds):
+        raise ValueError(f"{config.name}: --fold needs a grouped config with cross_validation_folds")
+    train_dataset = GenericSegmentationDataset(split.source, config.pipelines, stage=TRAIN_STAGE)
+    eval_dataset = train_dataset.with_stage(EVAL_STAGE)
+    if isinstance(split, GroupedSplit):
+        groups = groups_for_samples((sample_id for _, _, sample_id in train_dataset.samples), split.group_map)
+        if fold is None:
+            train_indices, val_indices, test_indices = grouped_partition_indices(
+                groups, (split.fractions.val, split.fractions.test), seed
+            )
+        else:
+            train_indices, val_indices, test_indices = grouped_kfold_indices(
+                groups, split.folds, fold, split.fractions.val, seed
+            )
     else:
-        train_size = int((1.0 - val_fraction) * len(base_dataset))
-        val_size = len(base_dataset) - train_size
-        
-        subsets = torch.utils.data.random_split(
-            base_dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(seed),
-        )
-        train_idx, val_idx = subsets[0].indices, subsets[1].indices
+        train_indices, val_indices, test_indices = _random_partition_indices(len(train_dataset), split.fractions, seed)
+    return (
+        Subset(train_dataset, train_indices),
+        Subset(eval_dataset, val_indices),
+        {DEFAULT_TEST_SET: Subset(eval_dataset, test_indices)},
+    )
 
-    train_dataset = base_dataset
-    val_dataset = copy.copy(base_dataset)
 
-    if "train_transforms" in base_dataset.config and "val_transforms" in base_dataset.config:
-        train_dataset.transform = build_transforms_from_config(base_dataset.config["train_transforms"])
-        val_dataset.transform = build_transforms_from_config(base_dataset.config["val_transforms"])
+def make_splits(config: DatasetConfig, seed: int = DEFAULT_SPLIT_SEED, fold: int | None = None) -> DatasetSplits:
+    """Split one dataset by its split policy, or by one cross-validation ``fold``.
 
-    return Subset(train_dataset, train_idx), Subset(val_dataset, val_idx)
+    Training uses the ``train`` pipeline; validation and test use the deterministic
+    ``eval`` pipeline.
 
-def build_train_val(
+    Raises:
+        ValueError: If ``fold`` is given for a config without ``cross_validation_folds``.
+    """
+    if isinstance(config.split, PredefinedSplit):
+        if fold is not None:
+            raise ValueError(f"{config.name}: --fold needs a grouped config with cross_validation_folds")
+        train, val, test_sets = predefined_split_datasets(config, seed)
+    else:
+        train, val, test_sets = _holdout_split_datasets(config, seed, fold)
+    def evaluation_set(dataset: Dataset) -> EvaluationSet:
+        return EvaluationSet(dataset, config.foreground_map_metrics, config.pipelines.denormalization)
+
+    return DatasetSplits(
+        train=train,
+        val=evaluation_set(val),
+        test_sets={name: evaluation_set(dataset) for name, dataset in test_sets.items()},
+        image_size=config.image_size,
+    )
+
+
+def _concatenate(sets: list[EvaluationSet]) -> EvaluationSet:
+    if len(sets) == 1:
+        return sets[0]
+    denormalizations = {evaluation_set.denormalization for evaluation_set in sets}
+    if len(denormalizations) != 1:
+        raise ValueError(f"Jointly evaluated datasets must share their normalization, got {denormalizations}")
+    return EvaluationSet(
+        ConcatDataset([evaluation_set.dataset for evaluation_set in sets]),
+        any(evaluation_set.foreground_maps for evaluation_set in sets),
+        denormalizations.pop(),
+    )
+
+
+def build_splits(
     names: list[str],
-    val_fraction: float = DEFAULT_VAL_FRACTION,
     seed: int = DEFAULT_SPLIT_SEED,
     config_dir: str | Path | None = None,
-):
-    splits = [make_splits(n, val_fraction, seed, config_dir) for n in names]
-    
+    fold: int | None = None,
+) -> DatasetSplits:
+    """Split each named dataset and concatenate the partitions for joint training.
+
+    Test sets that share a name are concatenated; differently named sets stay separate.
+    ``fold`` selects one cross-validation fold of every dataset (see :func:`make_splits`).
+
+    Raises:
+        ValueError: If the datasets produce different input sizes.
+    """
+    splits = [make_splits(load_config(name, config_dir), seed, fold) for name in names]
     if len(splits) == 1:
         return splits[0]
-        
-    return (
-        ConcatDataset([train for train, _ in splits]),
-        ConcatDataset([val for _, val in splits]),
+    sizes = {name: split.image_size for name, split in zip(names, splits)}
+    if len(set(sizes.values())) != 1:
+        raise ValueError(f"Jointly trained datasets must share an input size, got {sizes}")
+
+    grouped: dict[str, list[EvaluationSet]] = {}
+    for split in splits:
+        for name, evaluation_set in split.test_sets.items():
+            grouped.setdefault(name, []).append(evaluation_set)
+    return DatasetSplits(
+        train=ConcatDataset([split.train for split in splits]),
+        val=_concatenate([split.val for split in splits]),
+        test_sets={name: _concatenate(sets) for name, sets in grouped.items()},
+        image_size=splits[0].image_size,
     )
