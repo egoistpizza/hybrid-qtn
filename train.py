@@ -28,8 +28,8 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
-from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model, mps_variant
-from models.mps_layer import MPSVariant
+from models.factory import MODEL_TYPES, build_segmentation_model
+from models.variant import MPSVariant
 from utils import get_device
 from utils.checkpoints import BEST_LIVE_CHECKPOINT, INTERRUPTED_CHECKPOINT, SWA_CHECKPOINT, load_weights, save_weights
 from utils.evaluation import evaluate_model, metric_suites
@@ -284,7 +284,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--bond_dim", type=int, default=32)
-    add_mps_arguments(parser)
+    MPSVariant.add_arguments(parser)
     parser.add_argument("--loss", type=str, default="focal_tversky", choices=LOSS_CHOICES)
     parser.add_argument("--fn_weight", type=float, default=TVERSKY_FN_WEIGHT, help="Focal Tversky weight on false negatives")
     parser.add_argument("--fp_weight", type=float, default=TVERSKY_FP_WEIGHT, help="Focal Tversky weight on false positives")
@@ -351,7 +351,7 @@ def main() -> None:
     device = get_device()
     splits = build_splits(dataset_names, fold=arguments.fold)
     dataset_slug = slugify_dataset_arg(dataset_names)
-    variant = mps_variant(arguments)
+    variant = MPSVariant.from_arguments(arguments)
     run_name = build_run_name(
         dataset_slug, arguments.model, arguments.bond_dim, arguments.loss, arguments.seed, arguments.tag, variant,
         arguments.fold,

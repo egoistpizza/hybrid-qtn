@@ -9,7 +9,8 @@ import numpy as np
 import onnxruntime as ort
 import torch
 
-from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model, mps_variant
+from models.factory import MODEL_TYPES, build_segmentation_model
+from models.variant import MPSVariant
 from utils import get_device
 
 
@@ -74,7 +75,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
     parser.add_argument("--bond_dim", type=int, default=32)
-    add_mps_arguments(parser)
+    MPSVariant.add_arguments(parser)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--iterations", type=int, default=100)
@@ -88,7 +89,7 @@ def main() -> None:
     output_directory = Path(args.output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     
-    variant = mps_variant(args)
+    variant = MPSVariant.from_arguments(args)
     onnx_filename = f"{args.model}_b{args.bond_dim}{variant.name_suffix}_s{args.image_size}.onnx"
     onnx_file_path = output_directory / onnx_filename
     

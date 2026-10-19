@@ -1,80 +1,17 @@
 """Axial matrix product state (MPS) bottleneck for the hybrid U-Net."""
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.tensor_train import (
-    AbsoluteAxialOperator,
-    AxialOperator,
-    CircularAxialOperator,
-    MeanBoundaryAxialOperator,
-    RelativeAxialOperator,
-    TTConv2d,
-)
+from models.tensor_train import TTConv2d
+from models.variant import MPSVariant
 
-AXIAL_OPERATORS = {
-    "absolute": AbsoluteAxialOperator,
-    "relative": RelativeAxialOperator,
-    "circular": CircularAxialOperator,
-}
-OPERATOR_NAME_SUFFIXES = {"absolute": "", "relative": "_rel", "circular": "_circ"}
-AXIAL_BOUNDARIES = ("zero", "mean")
 ROW_EQUATION = "bchw,chjd->bdjw"
 COLUMN_EQUATION = "bdjw,dwke->bejk"
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
-
-
-@dataclass(frozen=True)
-class MPSVariant:
-    """Design choices of the MPS block.
-
-    Attributes:
-        axial_operator: ``relative`` (default, :class:`RelativeAxialOperator`, weights depend only
-            on the offset), ``absolute`` (:class:`AbsoluteAxialOperator`, separate weights per
-            position pair) or ``circular`` (:class:`CircularAxialOperator`, the offset wraps around
-            the axis; kept to reproduce a reported ablation).
-        positional_encoding: Whether a learned positional encoding is added to the block input.
-        boundary: How the block treats positions beyond the edge: ``zero`` (default), or ``mean``
-            (kept to reproduce a reported ablation), where relative operators fill them with the
-            mean of the features along the mixed axis (:class:`MeanBoundaryAxialOperator`) and the
-            3x3 projections pad by replication, so that a uniform input gives a uniform output.
-    """
-
-    axial_operator: str = "relative"
-    positional_encoding: bool = False
-    boundary: str = "zero"
-
-    def __post_init__(self) -> None:
-        if self.axial_operator not in AXIAL_OPERATORS:
-            raise ValueError(
-                f"Unknown axial_operator {self.axial_operator!r}. Expected one of {tuple(AXIAL_OPERATORS)}."
-            )
-        if self.boundary not in AXIAL_BOUNDARIES:
-            raise ValueError(f"Unknown boundary {self.boundary!r}. Expected one of {AXIAL_BOUNDARIES}.")
-        if self.boundary != "zero" and self.axial_operator != "relative":
-            raise ValueError(f"The {self.boundary} boundary needs the relative axial operator.")
-
-    @property
-    def name_suffix(self) -> str:
-        """``_rel`` / ``_circ`` for relative / circular operators, ``_mean`` for the mean boundary and ``_nope`` without positional encoding.
-
-        The suffix describes the settings, not the defaults, so names stay comparable across versions.
-        """
-        return (
-            OPERATOR_NAME_SUFFIXES[self.axial_operator]
-            + ("_mean" if self.boundary == "mean" else "")
-            + ("" if self.positional_encoding else "_nope")
-        )
-
-
-def axial_operator_class(variant: MPSVariant) -> type[AxialOperator]:
-    """Operator class of ``variant``: the mean boundary replaces the relative operator's zero edges."""
-    return MeanBoundaryAxialOperator if variant.boundary == "mean" else AXIAL_OPERATORS[variant.axial_operator]
 
 
 class SeparablePositionalEncoding2D(nn.Module):
@@ -119,12 +56,11 @@ class AxialMPSLayer(nn.Module):
         variant: MPSVariant = MPSVariant(),
     ):
         super().__init__()
-        operator = axial_operator_class(variant)
+        operator = variant.operator_class
         self.positional_encoding = (
             SeparablePositionalEncoding2D(in_channels, height, width) if variant.positional_encoding else None
         )
-        # Zero padding would turn a uniform input into a border ring that the axis-wide operators spread.
-        padding_mode = "replicate" if variant.boundary == "mean" else "zeros"
+        padding_mode = variant.padding_mode
         self.in_proj = nn.Conv2d(
             in_channels, bond_dim, PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2, padding_mode=padding_mode
         )

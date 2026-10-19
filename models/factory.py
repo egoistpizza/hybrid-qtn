@@ -1,10 +1,9 @@
 """Model construction shared by training, evaluation, export and the parameter profiler."""
 
-import argparse
-
 import torch.nn as nn
 
-from models.mps_layer import AXIAL_BOUNDARIES, AXIAL_OPERATORS, MPSBottleneck, MPSVariant
+from models.mps_layer import MPSBottleneck
+from models.variant import MPSVariant
 from models.unet import UNet
 
 MODEL_TYPES = ("vanilla", "hybrid", "deep_hybrid")
@@ -23,36 +22,6 @@ def spatial_size_at(image_size: int, downsampling_factor: int) -> int:
     return image_size // downsampling_factor
 
 
-def add_mps_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the ``--axial_operator``, ``--positional_encoding`` and ``--axial_boundary`` options, defaulting to :class:`MPSVariant`."""
-    default = MPSVariant()
-    parser.add_argument(
-        "--axial_operator",
-        choices=tuple(AXIAL_OPERATORS),
-        default=default.axial_operator,
-        help="relative (default): weights depend only on the offset; absolute: weights per position pair; "
-        "circular: the offset wraps around the axis (reproduces a reported ablation)",
-    )
-    parser.add_argument(
-        "--positional_encoding",
-        action=argparse.BooleanOptionalAction,
-        default=default.positional_encoding,
-        help="Add a learned positional encoding in the MPS blocks",
-    )
-    parser.add_argument(
-        "--axial_boundary",
-        choices=AXIAL_BOUNDARIES,
-        default=default.boundary,
-        help="Positions beyond the edge for relative operators: zero (default), or the mean along the axis "
-        "(reproduces a reported ablation)",
-    )
-
-
-def mps_variant(arguments: argparse.Namespace) -> MPSVariant:
-    """The :class:`MPSVariant` selected by the options of :func:`add_mps_arguments`."""
-    return MPSVariant(arguments.axial_operator, arguments.positional_encoding, arguments.axial_boundary)
-
-
 def build_segmentation_model(
     model_type: str,
     bond_dim: int,
@@ -67,7 +36,7 @@ def build_segmentation_model(
         bond_dim: Latent width D of the MPS blocks; ignored for ``vanilla``.
         image_size: Square input size. The MPS blocks are sized to the resulting feature
             maps, so hybrid models only accept inputs of this size.
-        variant: Axial operator type and positional encoding of every MPS block.
+        variant: Axial operator, positional encoding and boundary of every MPS block.
 
     Raises:
         ValueError: For an unknown model type, or a non-default ``variant`` for ``vanilla``.
@@ -77,7 +46,7 @@ def build_segmentation_model(
 
     if model_type == "vanilla":
         if variant != MPSVariant():
-            raise ValueError("axial_operator and positional_encoding only apply to models with MPS blocks")
+            raise ValueError("axial_operator, positional_encoding and boundary only apply to models with MPS blocks")
         return UNet()
 
     def mps_block(channels: int, downsampling_factor: int) -> MPSBottleneck:

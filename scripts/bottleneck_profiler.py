@@ -16,12 +16,11 @@ from models.factory import (
     BOTTLENECK_CHANNELS,
     BOTTLENECK_DOWNSAMPLING_FACTOR,
     PRE_BOTTLENECK_CHANNELS,
-    add_mps_arguments,
     build_segmentation_model,
-    mps_variant,
     spatial_size_at,
 )
-from models.mps_layer import AXIAL_OPERATOR_RANK, BYPASS_TT_RANK, MPSVariant
+from models.mps_layer import AXIAL_OPERATOR_RANK, BYPASS_TT_RANK
+from models.variant import MPSVariant
 from models.tensor_train import (
     binary_digits,
     capped_ranks,
@@ -127,12 +126,9 @@ def axial_mps_bottleneck_profile(
             channels * (spatial_size + spatial_size),
         ),
     ) if variant.positional_encoding else ()
-    encoding_label = "with" if variant.positional_encoding else "no"
-    boundary = f", {variant.boundary} boundary" if variant.axial_operator == "relative" else ""
-    description = f"{variant.axial_operator} operators{boundary}, {encoding_label} positional encoding"
     return BottleneckProfile(
         title=f"Tensorized Axial MPS bottleneck (D={bond_dim}, H=W={spatial_size}, χ={AXIAL_OPERATOR_RANK}; "
-        f"{description})",
+        f"{variant.description})",
         components=(
             tensor_train_component(
                 f"TT-Conv3×3 entry (R={ENTRY_TT_RANK})",
@@ -209,7 +205,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analytic and measured parameter profile of the U-Net bottleneck")
     parser.add_argument("--bond_dims", type=int, nargs="+", default=[16, 32, 64])
     parser.add_argument("--image_size", type=int, default=512)
-    add_mps_arguments(parser)
+    MPSVariant.add_arguments(parser)
     return parser.parse_args()
 
 
@@ -226,7 +222,7 @@ def main() -> None:
     print(render_profile(standard, standard_measured))
 
     for bond_dim in arguments.bond_dims:
-        variant = mps_variant(arguments)
+        variant = MPSVariant.from_arguments(arguments)
         axial = axial_mps_bottleneck_profile(
             PRE_BOTTLENECK_CHANNELS, BOTTLENECK_CHANNELS, bond_dim, spatial_size, variant
         )

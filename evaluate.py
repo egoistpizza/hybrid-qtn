@@ -22,7 +22,8 @@ from dataset import (
     parse_dataset_arg,
     slugify_dataset_arg,
 )
-from models.factory import MODEL_TYPES, add_mps_arguments, build_segmentation_model, mps_variant
+from models.factory import MODEL_TYPES, build_segmentation_model
+from models.variant import MPSVariant
 from utils import get_device
 from utils.checkpoints import evaluation_checkpoint, load_weights
 from utils.evaluation import Batch, evaluate_model, metric_suites
@@ -116,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate segmentation models")
     parser.add_argument("--model", type=str, default="vanilla", choices=MODEL_TYPES)
     parser.add_argument("--bond_dim", type=int, default=32)
-    add_mps_arguments(parser)
+    MPSVariant.add_arguments(parser)
     parser.add_argument("--loss", type=str, default="focal_tversky")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", type=str, default=None)
@@ -143,7 +144,7 @@ def main() -> None:
 
     splits = build_splits(dataset_names, fold=args.fold)
 
-    variant = mps_variant(args)
+    variant = MPSVariant.from_arguments(args)
     run_name = args.run or build_run_name(
         dataset_slug, args.model, args.bond_dim, args.loss, args.seed, args.tag, variant, args.fold
     )
