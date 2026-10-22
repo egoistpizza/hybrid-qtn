@@ -33,7 +33,7 @@ from utils.loss import (
     BCEDiceLoss,
     FocalTverskyLoss,
 )
-from utils.run_logger import RunLogger, WandbLogger
+from utils.run_logger import CombinedLogger, JsonFileLogger, RunLogger, WandbLogger
 from utils.run_spec import CHECKPOINT_ROOT, RunSpec
 from utils.seed import seed_everything
 
@@ -369,7 +369,7 @@ def main() -> None:
         scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs),
         device=device,
         config=config,
-        run_logger=WandbLogger(),
+        run_logger=CombinedLogger(WandbLogger(), JsonFileLogger(spec.checkpoint_dir)),
     )
     trainer.fit(run_name=run_name, total_params=total_params)
 

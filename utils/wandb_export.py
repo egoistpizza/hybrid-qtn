@@ -1,9 +1,27 @@
-"""Export the configuration, summary and full history of a W&B run to JSON."""
+"""Find W&B runs by name and export the configuration, summary and full history of a run to JSON."""
 
 import argparse
 import json
+import re
+from typing import Iterable, Optional
 
 import wandb
+
+from utils.run_logger import WANDB_PROJECT
+
+
+def runs_with_name_suffix(suffixes: Iterable[str], project: str = WANDB_PROJECT, entity: Optional[str] = None) -> list:
+    """Every run of ``project`` whose name ends in ``__<suffix>`` for one of ``suffixes``.
+
+    ``entity`` defaults to the logged-in user's default entity.
+
+    Raises:
+        wandb.errors.CommError: If W&B cannot be reached or the login is missing.
+    """
+    api = wandb.Api(timeout=60)
+    entity = entity or api.default_entity
+    pattern = "__(" + "|".join(re.escape(suffix) for suffix in suffixes) + ")$"
+    return list(api.runs(f"{entity}/{project}", filters={"display_name": {"$regex": pattern}}, per_page=200))
 
 
 def export_run(entity: str, project: str, run_id: str, output: str) -> None:

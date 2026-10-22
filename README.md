@@ -189,6 +189,43 @@ SEEDS="42 43 44 45 46" hqtn -e SEEDS --entrypoint bash hybrid-qtn:latest scripts
 
 Aggregate the `test_swa_*` / `test_best_live_*` summary values across seeds as mean ± std.
 
+#### 3.7.1 Ablation queue and result collection
+
+`scripts/run_queue.py` trains the Kvasir-SEG ablation grid: vanilla and hybrid × bond dimension {32, 64} × axial operator {relative, absolute, circular, mean boundary} × positional encoding {off, on} × loss {Focal Tversky, BCE + Dice}, 34 configurations × seeds 42–44 = 102 runs, in priority tiers:
+
+| Tier | Runs | Configurations |
+|---|---|---|
+| 1 | 6 | vanilla, hybrid (b32, relative, no PE) |
+| 2 | 3 | hybrid b64 (relative, no PE) |
+| 3 | 9 | hybrid b32: rel+PE, abs+PE, abs no-PE |
+| 4 | 9 | hybrid b64: rel+PE, abs+PE, abs no-PE |
+| 5 | 6 | hybrid b32: circular, mean (no PE) |
+| 6 | 6 | `bce_dice` for vanilla and default hybrid |
+| 7 | 18 | circular and mean: b32 with PE, b64 with and without PE |
+| 8 | 45 | `bce_dice` for the other 15 hybrid configs |
+| 9 | – | reruns of runs that finished only in W&B, to recover their checkpoints |
+
+Run it from the repository root, always through `-m`:
+
+```bash
+python -m scripts.run_queue --tag showcase_runs --dry_run                  # print the queue
+python -m scripts.run_queue --tag showcase_runs --tiers 1 --seeds 42 --epochs 1   # smoke test, tag showcase_runs_e1
+python -m scripts.run_queue --tag showcase_runs --max_hours 20             # inside tmux
+```
+
+- **Done check:** a run is skipped when its directory is in the backup folder with test metrics, or when W&B has a finished run of that name with test metrics. The second kind has no checkpoints and is retrained in tier 9 under `<tag>_rerun`. W&B must be logged in (`wandb login`); otherwise the queue refuses to start unless you pass `--skip_wandb_check`.
+- **Progress:** `outputs/queue/<tag>/status.txt` (state, timing estimate, current epoch, test Dice per run), plus one log per run in `outputs/queue/<tag>/logs/`.
+- **Backup:** each finished run directory (weights, `config.json`, `history.jsonl`, `summary.json`, `queue_record.json`) is copied to `/workspace/hybrid-qtn/<tag>/checkpoints/<run>/`, and the status file and logs to `/workspace/hybrid-qtn/<tag>/queue/`. Change the location with `--backup_root`, or turn it off with `--no_backup`.
+- **Stopping:** `touch outputs/queue/<tag>/STOP` stops after the current run. Ctrl-C (or `kill <pid>`) stops the current run and saves its weights; a second Ctrl-C kills it. Relaunching skips finished runs; `--max_hours` counts from each launch.
+
+`train.py` mirrors every run into its checkpoint directory as `config.json`, `history.jsonl` (every logged step) and `summary.json` (test metrics), so results don't depend on W&B.
+
+`scripts/collect_results.py` gathers everything for comparison tables and slides into `/workspace/hybrid-qtn/<tag>/results/`: `results_per_run.csv`, `results_by_config.csv` / `.md` (mean ± std over seeds), `history.csv` (per-epoch curves), a JSON export of every W&B run, the queue files, and the environment (git commit and diff, configs, pip freeze, GPU):
+
+```bash
+python -m scripts.collect_results --tag showcase_runs
+```
+
 ### 3.8 Evaluate a trained model on the held-out test set
 
 ```bash
