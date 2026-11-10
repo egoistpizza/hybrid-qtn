@@ -1,0 +1,6 @@
+# Installed on top of the Kaggle GPU image by scripts/kaggle_session.py.
+# Kaggle's preinstalled torch, numpy, scipy, Pillow and PyYAML are used as they are;
+# only packages whose API the code depends on are pinned to requirements.txt.
+albucore==0.0.24
+albumentations==2.0.8
+wandb==0.28.0

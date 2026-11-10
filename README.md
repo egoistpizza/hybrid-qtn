@@ -244,6 +244,12 @@ python train.py --model hybrid --dataset kvasir_seg --seed 42 --tag paper_v1 --r
 - `history.jsonl` is rewound to the resumed epoch, so the curves never repeat an epoch, and the run continues the same W&B run (`wandb_run_id.txt`). W&B cannot drop points it already received, so an epoch that ran twice may appear twice there; use `history.jsonl` for figures.
 - Starting without `--resume` deletes the run's `last.pt`, so a new attempt never mixes with an old one.
 
+#### 3.7.3 Kaggle sessions
+
+`notebooks/kaggle_session.ipynb` runs one session of a queue on Kaggle through `scripts/kaggle_session.py`. It installs `requirements-kaggle.txt` on top of Kaggle's preinstalled torch, downloads the dataset to `/tmp`, copies `checkpoints/`, `outputs/` and `backup/` from the previous version's output when it is attached as an input, records GPU utilization and CPU load in `outputs/kaggle/usage.csv`, and runs the queue with the time left of an 11-hour session budget (`--max_hours`). Start each session with *Save & Run All*; to continue, attach the latest version's output and run it again. The notebook's first cell lists the steps.
+
+Kaggle's torch may differ from `requirements.txt`; `collect_results` records the environment of every result, and the runs compared with each other should come from the same environment and GPU type.
+
 ### 3.8 Evaluate a trained model on the held-out test set
 
 ```bash

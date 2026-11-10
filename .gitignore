@@ -236,5 +236,8 @@ data/
 # Generic directory for cache files
 cache/
 
+# Finished runs backed up by scripts/kaggle_session.py
+/backup/
+
 # Test Artifacts
 augmentation_preview.png
