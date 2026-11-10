@@ -49,6 +49,7 @@ class TestDatasetConsistency:
         assert {name: load_config(name, CONFIG_DIR).image_size for name in discover_dataset_configs(CONFIG_DIR)} == {
             "cod": 512,
             "cvc_clinicdb": 512,
+            "duts": 512,
             "kvasir_seg": 512,
             "mass_roads": 512,
         }

@@ -128,6 +128,7 @@ hqtn hybrid-qtn:latest -m scripts.download_kvasir_seg --insecure
 hqtn hybrid-qtn:latest -m scripts.download_cvc_clinicdb
 hqtn hybrid-qtn:latest -m scripts.download_mass_roads
 hqtn hybrid-qtn:latest -m scripts.download_cod
+hqtn hybrid-qtn:latest -m scripts.download_duts
 ```
 
 | Dataset | Source | Credentials |
@@ -136,6 +137,7 @@ hqtn hybrid-qtn:latest -m scripts.download_cod
 | CVC-ClinicDB (612 frames, 29 sequences) | Kaggle mirror by default; `--source local --archive <file>` for a manually downloaded archive | Kaggle |
 | Massachusetts Roads | Kaggle | Kaggle |
 | Camouflaged objects: COD10K, CAMO, CHAMELEON, NC4K (4,040 train / 6,473 test images) | Official SINet-V2 training and testing archives (Google Drive); non-commercial research use only | none |
+| Salient objects: DUTS (10,553 DUTS-TR train / 5,019 DUTS-TE test images) | Official archives from saliencydetection.net; size and SHA-256 pinned | none |
 
 For Kaggle, export `KAGGLE_USERNAME` and `KAGGLE_KEY` before running the helper.
 
