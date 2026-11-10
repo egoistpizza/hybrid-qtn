@@ -7,10 +7,14 @@ live and the SWA model are evaluated once on each test set after training.
 
 import argparse
 import logging
+import random
+import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,7 +26,16 @@ from tqdm import tqdm
 from dataset import DEFAULT_TEST_SET, DatasetSplits, build_loader, build_splits
 from models.variant import MPSVariant
 from utils import get_device
-from utils.checkpoints import BEST_LIVE_CHECKPOINT, INTERRUPTED_CHECKPOINT, SWA_CHECKPOINT, load_weights, save_weights
+from utils.checkpoints import (
+    BEST_LIVE_CHECKPOINT,
+    INTERRUPTED_CHECKPOINT,
+    SWA_CHECKPOINT,
+    TRAINING_STATE_CHECKPOINT,
+    clean_state_dict,
+    load_weights,
+    save_training_state,
+    save_weights,
+)
 from utils.evaluation import evaluate_model, metric_suites
 from utils.hardware import reset_peak_vram, vram_metrics
 from utils.init_first import init
@@ -33,13 +46,25 @@ from utils.loss import (
     BCEDiceLoss,
     FocalTverskyLoss,
 )
-from utils.run_logger import CombinedLogger, JsonFileLogger, RunLogger, WandbLogger
-from utils.run_spec import CHECKPOINT_ROOT, RunSpec
+from utils.run_logger import (
+    COMPLETED,
+    INTERRUPTED,
+    OUT_OF_TIME,
+    CombinedLogger,
+    JsonFileLogger,
+    RunLogger,
+    WandbLogger,
+)
+from utils.run_spec import CHECKPOINT_ROOT, EXIT_OUT_OF_TIME, RunSpec
 from utils.seed import seed_everything
 
 logger = logging.getLogger(__name__)
 
 GRADIENT_CLIP_NORM = 1.0
+
+# Settings that may differ between the sessions of one resumed run; every other setting
+# must match the saved state. ``max_hours`` is also kept out of the logged run config.
+SESSION_SETTINGS = ("max_hours", "checkpoint_dir", "deterministic")
 
 LoaderFactory = Callable[[Dataset, bool], DataLoader]
 
@@ -67,11 +92,51 @@ class TrainingConfig:
     swa_start_pct: float = 0.75
     swa_lr: float = 5e-5
     deterministic: bool = False
+    max_hours: Optional[float] = None
     checkpoint_dir: str = str(CHECKPOINT_ROOT)
 
     @property
     def swa_start_epoch(self) -> int:
         return int(self.epochs * self.swa_start_pct)
+
+
+def unwrapped(module: nn.Module) -> nn.Module:
+    """The module behind a ``torch.compile`` wrapper, so saved keys match compiled and eager runs."""
+    return getattr(module, "_orig_mod", module)
+
+
+def rng_states() -> dict[str, Any]:
+    """Global Python, NumPy and PyTorch RNG states."""
+    states = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        states["cuda"] = torch.cuda.get_rng_state_all()
+    return states
+
+
+def restore_rng_states(states: dict[str, Any]) -> None:
+    random.setstate(states["python"])
+    np.random.set_state(states["numpy"])
+    torch.set_rng_state(states["torch"])
+    if "cuda" in states and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(states["cuda"])
+
+
+def run_settings(config: "TrainingConfig") -> dict[str, Any]:
+    """The settings a resumed run must share with the saved state."""
+    return {name: value for name, value in asdict(config).items() if name not in SESSION_SETTINGS}
+
+
+def check_resumable(saved: dict[str, Any], config: "TrainingConfig") -> None:
+    """Refuse to resume with settings that differ from the saved state's.
+
+    Raises:
+        ValueError: Naming every setting that differs.
+    """
+    current = run_settings(config)
+    changed = sorted(name for name in saved.keys() | current.keys() if saved.get(name) != current.get(name))
+    if changed:
+        details = ", ".join(f"{name}: saved {saved.get(name)!r}, now {current.get(name)!r}" for name in changed)
+        raise ValueError(f"Cannot resume with changed settings ({details}). Use the original options or start a new run.")
 
 
 def prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
@@ -102,6 +167,7 @@ class SegmentationTrainer:
         device: torch.device,
         config: TrainingConfig,
         run_logger: RunLogger,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.model = model
         self.splits = splits
@@ -114,12 +180,14 @@ class SegmentationTrainer:
         self.device = device
         self.config = config
         self.run_logger = run_logger
+        self.clock = clock
 
         self.use_amp = device.type == "cuda"
         self.scaler = GradScaler(enabled=self.use_amp)
         self.swa_model = AveragedModel(self.model)
         self.swa_scheduler = SWALR(self.optimizer, swa_lr=config.swa_lr)
         self.best_val_dice = float("-inf")
+        self.best_weights: Optional[dict[str, torch.Tensor]] = None
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -185,9 +253,17 @@ class SegmentationTrainer:
                 self.swa_model(self._images(batch))
 
     def _save_if_best(self, val_dice: float) -> None:
+        """Save the live weights when they beat the best validation Dice.
+
+        A CPU copy is also kept for the training state, so a resumed run can rewrite the
+        best checkpoint to match the epoch it resumes from.
+        """
         if val_dice > self.best_val_dice:
             self.best_val_dice = val_dice
-            save_weights(self.model, self.checkpoint_dir / BEST_LIVE_CHECKPOINT)
+            self.best_weights = {
+                name: tensor.detach().cpu().clone() for name, tensor in clean_state_dict(self.model.state_dict()).items()
+            }
+            torch.save(self.best_weights, self.checkpoint_dir / BEST_LIVE_CHECKPOINT)
             logger.info(f"New best live model saved. Val Dice: {val_dice:.4f}")
 
     def _advance_schedule(self, in_swa_phase: bool) -> float:
@@ -197,6 +273,50 @@ class SegmentationTrainer:
             return self.swa_scheduler.get_last_lr()[0]
         self.scheduler.step()
         return self.optimizer.param_groups[0]["lr"]
+
+    def training_state(self, epoch: int) -> dict[str, Any]:
+        """Everything needed to continue after ``epoch`` as an uninterrupted run would."""
+        loader_generator = self.train_loader.generator
+        return {
+            "epoch": epoch,
+            "settings": run_settings(self.config),
+            "model": unwrapped(self.model).state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "swa_model": unwrapped(self.swa_model.module).state_dict(),
+            "swa_n_averaged": self.swa_model.n_averaged.clone(),
+            "swa_scheduler": self.swa_scheduler.state_dict(),
+            "best_val_dice": self.best_val_dice,
+            "best_weights": self.best_weights,
+            "train_loader_generator": loader_generator.get_state() if loader_generator is not None else None,
+            "rng": rng_states(),
+        }
+
+    def restore(self, state: dict[str, Any]) -> int:
+        """Load a :meth:`training_state` and return the last finished epoch.
+
+        RNG states are restored last, so nothing between here and the next epoch can
+        advance them. :meth:`fit` checks the settings with :func:`check_resumable` first.
+        """
+        unwrapped(self.model).load_state_dict(state["model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        # A scaler saved without AMP (CPU, MPS) holds no state; an AMP scaler then starts fresh.
+        if state["scaler"] and self.scaler.is_enabled():
+            self.scaler.load_state_dict(state["scaler"])
+        unwrapped(self.swa_model.module).load_state_dict(state["swa_model"])
+        self.swa_model.n_averaged.copy_(state["swa_n_averaged"])
+        self.swa_scheduler.load_state_dict(state["swa_scheduler"])
+        self.best_val_dice = state["best_val_dice"]
+        self.best_weights = state["best_weights"]
+        if self.best_weights is not None:
+            # The best checkpoint may come from an epoch that was interrupted before its state was saved.
+            torch.save(self.best_weights, self.checkpoint_dir / BEST_LIVE_CHECKPOINT)
+        if self.train_loader.generator is not None and state["train_loader_generator"] is not None:
+            self.train_loader.generator.set_state(state["train_loader_generator"])
+        restore_rng_states(state["rng"])
+        return state["epoch"]
 
     def _run_epoch(self, epoch: int) -> None:
         reset_peak_vram(self.device)
@@ -216,6 +336,8 @@ class SegmentationTrainer:
             }
         )
         self._save_if_best(val_metrics["dice"])
+        # Last, so the state only ever describes a fully finished epoch.
+        save_training_state(self.training_state(epoch), self.checkpoint_dir / TRAINING_STATE_CHECKPOINT)
 
     def _finalize_swa(self) -> Optional[nn.Module]:
         """Recompute BatchNorm, save and validate the SWA model; ``None`` if no epoch was averaged."""
@@ -249,21 +371,61 @@ class SegmentationTrainer:
                 self.run_logger.summarize(results)
                 logger.info(" | ".join(f"{name}: {value:.4f}" for name, value in results.items()))
 
-    def fit(self, run_name: str, total_params: int) -> None:
-        """Run training, SWA finalization and test reporting; an interrupt saves the current weights."""
-        self.run_logger.start(run_name, {**asdict(self.config), "total_params": total_params})
+    def _out_of_time(self, started: float, longest_epoch: float) -> bool:
+        """Whether one more epoch, as long as the longest so far, would overrun ``max_hours``."""
+        if self.config.max_hours is None:
+            return False
+        return self.clock() - started + longest_epoch > self.config.max_hours * 3600
+
+    def fit(self, run_name: str, total_params: int, resume_state: Optional[dict[str, Any]] = None) -> str:
+        """Run training, SWA finalization and test reporting; an interrupt saves the current weights.
+
+        With ``resume_state``, training continues after the epoch that state was saved at;
+        without it, a training state left by an earlier attempt is removed. With ``max_hours``,
+        training stops before an epoch that would not finish in time; the last finished epoch
+        is already saved, so ``--resume`` continues from there.
+
+        Returns:
+            :data:`COMPLETED`, :data:`OUT_OF_TIME` or :data:`INTERRUPTED`.
+
+        Raises:
+            ValueError: If ``resume_state`` was saved with different run settings.
+        """
+        if resume_state is not None:
+            check_resumable(resume_state["settings"], self.config)
+            resume_after_epoch = resume_state["epoch"]
+        else:
+            (self.checkpoint_dir / TRAINING_STATE_CHECKPOINT).unlink(missing_ok=True)
+            resume_after_epoch = None
+        logged_config = {name: value for name, value in asdict(self.config).items() if name != "max_hours"}
+        self.run_logger.start(run_name, {**logged_config, "total_params": total_params}, resume_after_epoch)
+        first_epoch = 1
+        if resume_state is not None:
+            first_epoch = self.restore(resume_state) + 1
+            logger.info(f"Resuming after epoch {first_epoch - 1}")
         logger.info("Starting training...")
+        started = self.clock()
+        longest_epoch = 0.0
+        outcome = INTERRUPTED
         try:
-            for epoch in range(1, self.config.epochs + 1):
+            for epoch in range(first_epoch, self.config.epochs + 1):
+                if self._out_of_time(started, longest_epoch):
+                    logger.warning(f"Stopping before epoch {epoch}: it would exceed the {self.config.max_hours:g}h budget. Rerun with --resume.")
+                    outcome = OUT_OF_TIME
+                    return outcome
+                epoch_started = self.clock()
                 self._run_epoch(epoch)
+                longest_epoch = max(longest_epoch, self.clock() - epoch_started)
             swa_model = self._finalize_swa()
             self._report_test_metrics(swa_model)
+            outcome = COMPLETED
         except KeyboardInterrupt:
             logger.warning("Training interrupted. Saving current state...")
             save_weights(self.model, self.checkpoint_dir / INTERRUPTED_CHECKPOINT)
         finally:
-            self.run_logger.finish()
-            logger.info("Training finished.")
+            self.run_logger.finish(outcome)
+            logger.info(f"Training {outcome.replace('_', ' ')}.")
+        return outcome
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -278,6 +440,17 @@ def parse_arguments() -> argparse.Namespace:
         "--deterministic",
         action="store_true",
         help="Use deterministic GPU kernels for bit-identical reruns on the same GPU type (about 4x slower)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=f"Continue from the run's {TRAINING_STATE_CHECKPOINT} if it exists; start fresh otherwise",
+    )
+    parser.add_argument(
+        "--max_hours",
+        type=float,
+        default=None,
+        help="Training time budget; stops before an epoch that would exceed it, to be continued with --resume",
     )
     return parser.parse_args()
 
@@ -348,6 +521,7 @@ def main() -> None:
         mps_variant=spec.variant,
         fold=spec.fold,
         deterministic=arguments.deterministic,
+        max_hours=arguments.max_hours,
         checkpoint_dir=str(spec.checkpoint_dir),
     )
 
@@ -369,9 +543,24 @@ def main() -> None:
         scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs),
         device=device,
         config=config,
-        run_logger=CombinedLogger(WandbLogger(), JsonFileLogger(spec.checkpoint_dir)),
+        run_logger=CombinedLogger(WandbLogger(spec.checkpoint_dir), JsonFileLogger(spec.checkpoint_dir)),
     )
-    trainer.fit(run_name=run_name, total_params=total_params)
+    outcome = trainer.fit(run_name=run_name, total_params=total_params, resume_state=resume_state(arguments, spec))
+    if outcome == OUT_OF_TIME:
+        sys.exit(EXIT_OUT_OF_TIME)
+
+
+def resume_state(arguments: argparse.Namespace, spec: RunSpec) -> Optional[dict[str, Any]]:
+    """The saved training state of this run when ``--resume`` is set and one exists.
+
+    Loaded on the CPU: RNG states must stay there, and ``load_state_dict`` moves the
+    model and optimizer tensors to their parameters' device.
+    """
+    path = Path(spec.checkpoint_dir) / TRAINING_STATE_CHECKPOINT
+    if not arguments.resume or not path.exists():
+        return None
+    # Our own file holding RNG and optimizer state, not only tensors.
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ Older checkpoints that still carry the wrappers are cleaned on load.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
@@ -15,6 +17,7 @@ import torch.nn as nn
 BEST_LIVE_CHECKPOINT = "best_model.pth"
 SWA_CHECKPOINT = "best_swa_model.pth"
 INTERRUPTED_CHECKPOINT = "interrupted_model.pth"
+TRAINING_STATE_CHECKPOINT = "last.pt"
 WRAPPER_PREFIXES = ("_orig_mod.", "module.")
 SWA_COUNTER_KEY = "n_averaged"
 
@@ -46,6 +49,18 @@ def load_weights(model: nn.Module, path: Path, device: torch.device) -> None:
         raise FileNotFoundError(f"Checkpoint required but not found at: {path}")
     state_dict = torch.load(path, map_location=device, weights_only=True)
     getattr(model, "_orig_mod", model).load_state_dict(clean_state_dict(state_dict))
+
+
+def save_training_state(state: Mapping[str, Any], path: Path) -> Path:
+    """Write a resumable training state through a temporary file.
+
+    The rename is atomic, so an interruption during the write leaves the previous
+    complete state in place instead of a truncated file.
+    """
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(dict(state), temporary)
+    os.replace(temporary, path)
+    return path
 
 
 def evaluation_checkpoint(run_dir: Path) -> Path:

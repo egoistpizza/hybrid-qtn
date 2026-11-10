@@ -1,4 +1,3 @@
-import argparse
 import json
 import textwrap
 from collections import Counter
@@ -6,11 +5,13 @@ from collections import Counter
 import pytest
 
 import scripts.run_queue as run_queue
+import train
 from scripts.run_queue import (
     DONE,
     DONE_METRIC,
     DONE_NOT_BACKED_UP,
     FAILED,
+    PAUSED,
     PENDING,
     QUEUE_RECORD_FILE,
     RERUN_TIER,
@@ -68,13 +69,12 @@ def test_queue_names_match_the_runs_finished_before():
 
 
 @pytest.mark.parametrize("item", build_queue("showcase_runs"), ids=lambda item: item.run_name)
-def test_train_arguments_select_the_queued_run(item):
-    parser = argparse.ArgumentParser()
-    RunSpec.add_arguments(parser)
-    parser.add_argument("--epochs", type=int)
-    arguments = parser.parse_args(item.train_arguments(epochs=100))
+def test_train_arguments_select_the_queued_run(item, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["train.py", *item.train_arguments(epochs=100, max_hours=2.5)])
+    arguments = train.parse_arguments()
     assert RunSpec.from_arguments(arguments) == item.spec
     assert arguments.epochs == 100
+    assert arguments.resume and arguments.max_hours == 2.5
 
 
 def test_shortened_runs_get_their_own_tag():
@@ -144,11 +144,16 @@ FAKE_TRAIN = textwrap.dedent(
     """
     import json, os, sys
     from pathlib import Path
+    run_dir = Path(os.environ["FAKE_RUN_DIR"])
+    if "--resume" in sys.argv and (run_dir / "last.pt").exists():
+        print("Resuming after epoch 1", flush=True)
     print("Epoch 1/1 [Train]", flush=True)
     if os.environ["FAKE_OUTCOME"] == "fail":
         sys.exit(3)
-    run_dir = Path(os.environ["FAKE_RUN_DIR"])
     run_dir.mkdir(parents=True, exist_ok=True)
+    if os.environ["FAKE_OUTCOME"] == "pause":
+        (run_dir / "last.pt").write_bytes(b"state")
+        sys.exit(75)
     (run_dir / "best_model.pth").write_bytes(b"weights")
     (run_dir / "summary.json").write_text(json.dumps({"test_best_live_dice": 0.91, "test_swa_dice": 0.92}))
     """
@@ -177,3 +182,47 @@ def test_run_one_trains_and_backs_up_a_run(repo, tmp_path, monkeypatch, outcome)
     else:
         assert state.status == FAILED and "exit code 3" in state.note
         assert not paths.backup_run_dir(item).exists()
+
+
+def test_a_paused_run_keeps_its_state_and_resumes_on_the_next_launch(repo, tmp_path, monkeypatch):
+    (repo / "train.py").write_text(FAKE_TRAIN)
+    paths = QueuePaths("t", tmp_path / "backup")
+    paths.logs_dir.mkdir(parents=True)
+    item = build_queue("t", seeds=[42], tiers=[1])[0]
+    monkeypatch.setenv("FAKE_RUN_DIR", str(paths.local_run_dir(item)))
+
+    monkeypatch.setenv("FAKE_OUTCOME", "pause")
+    paused = RunState(item)
+    assert run_queue.run_one(paused, Launch("t", 0.0, None, 1, "main @ abc"), [paused], paths)
+    assert paused.status == PAUSED
+    assert (paths.local_run_dir(item) / "last.pt").exists()
+
+    monkeypatch.setenv("FAKE_OUTCOME", "success")
+    resumed = RunState(item)
+    assert run_queue.run_one(resumed, Launch("t", 0.0, None, 1, "main @ abc"), [resumed], paths)
+    assert resumed.status == DONE
+    assert "Resuming after epoch 1" in paths.log_file(item).read_text()
+
+
+def test_the_queue_stops_after_a_paused_run(tmp_path, monkeypatch):
+    paths = QueuePaths("t", None)
+    states = [RunState(item) for item in build_queue("t", seeds=[42], tiers=[1])]
+    started = []
+
+    def pause(state, launch, all_states, queue_paths):
+        started.append(state.item.run_name)
+        state.status = PAUSED
+        return True
+
+    monkeypatch.setattr(run_queue, "run_one", pause)
+    monkeypatch.setattr(run_queue, "write_text_atomically", lambda path, text: None)
+    monkeypatch.setattr(run_queue, "back_up_queue_files", lambda *arguments: None)
+    monkeypatch.setattr(run_queue, "render_status", lambda *arguments, **keywords: "")
+    launch = Launch("t", run_queue.time.time(), 10.0, 1, "main @ abc")
+    monkeypatch.setattr(run_queue, "REPO_ROOT", tmp_path)
+    paths.status_file.parent.mkdir(parents=True, exist_ok=True)
+
+    run_queue.run_queue(launch, states, paths)
+
+    assert started == [states[0].item.run_name]
+    assert launch.state.startswith("paused")

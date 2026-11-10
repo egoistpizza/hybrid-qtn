@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader, Dataset
 
 from dataset import DatasetSplits, Denormalization, EvaluationSet
@@ -30,8 +31,9 @@ class RecordingLogger:
         self.logged: list[dict] = []
         self.summary: dict[str, float] = {}
 
-    def start(self, name: str, config: dict) -> None:
+    def start(self, name: str, config: dict, resume_after_epoch=None) -> None:
         self.config = dict(config)
+        self.resume_after_epoch = resume_after_epoch
 
     def log(self, metrics: dict) -> None:
         self.logged.append(dict(metrics))
@@ -39,8 +41,8 @@ class RecordingLogger:
     def summarize(self, metrics: dict) -> None:
         self.summary.update(metrics)
 
-    def finish(self) -> None:
-        pass
+    def finish(self, outcome="completed") -> None:
+        self.outcome = outcome
 
     def keys(self) -> set[str]:
         return {key for entry in self.logged for key in entry}
@@ -147,6 +149,203 @@ def test_foreground_map_metrics_are_off_by_default(trainer_and_recorder):
     trainer, recorder = trainer_and_recorder
     trainer.fit(run_name="synthetic", total_params=0)
     assert not any(key.endswith("s_measure") for key in recorder.keys())
+
+
+def load_training_state(checkpoint_dir: Path) -> dict:
+    return torch.load(checkpoint_dir / "last.pt", weights_only=False)
+
+
+def test_every_epoch_ends_with_a_complete_training_state(trainer_and_recorder):
+    trainer, _ = trainer_and_recorder
+    trainer.fit(run_name="synthetic", total_params=0)
+    checkpoint_dir = Path(trainer.config.checkpoint_dir)
+    state = load_training_state(checkpoint_dir)
+
+    assert state["epoch"] == 4
+    assert state["best_val_dice"] == trainer.best_val_dice
+    assert state["swa_n_averaged"].item() == 3
+    assert state["scheduler"]["last_epoch"] == trainer.scheduler.last_epoch
+    assert {"model", "optimizer", "scaler", "swa_model", "swa_scheduler", "train_loader_generator", "rng"} <= set(state)
+    assert not (checkpoint_dir / "last.pt.tmp").exists()
+
+
+def test_an_interrupted_validation_leaves_the_previous_epoch_state(trainer_and_recorder, monkeypatch):
+    trainer, _ = trainer_and_recorder
+    original_evaluate = trainer.evaluate
+    validations = 0
+
+    def interrupt_second_validation(model, loader, description, compute_hd95, foreground_maps=False):
+        nonlocal validations
+        validations += 1
+        if validations == 2:
+            raise KeyboardInterrupt
+        return original_evaluate(model, loader, description, compute_hd95, foreground_maps)
+
+    monkeypatch.setattr(trainer, "evaluate", interrupt_second_validation)
+    trainer.fit(run_name="synthetic", total_params=0)
+
+    assert load_training_state(Path(trainer.config.checkpoint_dir))["epoch"] == 1
+
+
+def interrupt_validation(trainer: SegmentationTrainer, monkeypatch, at: int) -> None:
+    """Raise ``KeyboardInterrupt`` during the ``at``-th call of ``trainer.evaluate``."""
+    original_evaluate = trainer.evaluate
+    calls = 0
+
+    def interrupting(model, loader, description, compute_hd95, foreground_maps=False):
+        nonlocal calls
+        calls += 1
+        if calls == at:
+            raise KeyboardInterrupt
+        return original_evaluate(model, loader, description, compute_hd95, foreground_maps)
+
+    monkeypatch.setattr(trainer, "evaluate", interrupting)
+
+
+@pytest.mark.parametrize(
+    "swa_start_pct, finished_epochs",
+    [(0.75, 1), (0.5, 2)],
+    ids=["resume-before-swa", "resume-during-swa"],
+)
+def test_a_resumed_run_matches_an_uninterrupted_one(tmp_path, monkeypatch, swa_start_pct, finished_epochs):
+    def trainer_in(directory: Path, run_logger: RecordingLogger) -> SegmentationTrainer:
+        trainer = build_trainer(directory, {"test": evaluation_set(SquareDataset(3))}, run_logger)
+        trainer.config.swa_start_pct = swa_start_pct
+        return trainer
+
+    uninterrupted_log = RecordingLogger()
+    uninterrupted = trainer_in(tmp_path / "uninterrupted", uninterrupted_log)
+    uninterrupted.fit(run_name="synthetic", total_params=0)
+
+    resumed_dir = tmp_path / "resumed"
+    first_part = trainer_in(resumed_dir, RecordingLogger())
+    interrupt_validation(first_part, monkeypatch, at=finished_epochs + 1)
+    first_part.fit(run_name="synthetic", total_params=0)
+    state = load_training_state(resumed_dir)
+    assert state["epoch"] == finished_epochs
+
+    resumed_log = RecordingLogger()
+    resumed = trainer_in(resumed_dir, resumed_log)
+    resumed.fit(run_name="synthetic", total_params=0, resume_state=state)
+
+    for name, expected in uninterrupted.model.state_dict().items():
+        assert torch.equal(resumed.model.state_dict()[name], expected), name
+    for name, expected in uninterrupted.swa_model.state_dict().items():
+        assert torch.equal(resumed.swa_model.state_dict()[name], expected), name
+    assert resumed.best_val_dice == uninterrupted.best_val_dice
+    assert resumed_log.summary == uninterrupted_log.summary
+    epochs_after_resume = [entry for entry in uninterrupted_log.logged if entry.get("epoch", 0) > finished_epochs]
+    assert [entry for entry in resumed_log.logged if "epoch" in entry] == epochs_after_resume
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_the_time_budget_stops_before_an_epoch_that_would_not_finish(trainer_and_recorder, monkeypatch):
+    trainer, recorder = trainer_and_recorder
+    clock = FakeClock()
+    trainer.clock = clock
+    trainer.config.max_hours = 2.5
+    run_epoch = trainer._run_epoch
+
+    def one_hour_epoch(epoch: int) -> None:
+        run_epoch(epoch)
+        clock.now += 3600
+
+    monkeypatch.setattr(trainer, "_run_epoch", one_hour_epoch)
+    trainer.fit(run_name="synthetic", total_params=0)
+
+    checkpoint_dir = Path(trainer.config.checkpoint_dir)
+    assert load_training_state(checkpoint_dir)["epoch"] == 2
+    assert not any(key.startswith("test_") for key in recorder.keys())
+    assert not (checkpoint_dir / "best_swa_model.pth").exists()
+
+    next_session = RecordingLogger()
+    resumed = build_trainer(checkpoint_dir, {"test": evaluation_set(SquareDataset(3))}, next_session)
+    resumed.fit(run_name="synthetic", total_params=0, resume_state=load_training_state(checkpoint_dir))
+    assert [entry["epoch"] for entry in next_session.logged if "epoch" in entry] == [3, 4]
+    assert "test_swa_dice" in next_session.summary
+
+
+def test_resuming_with_a_changed_epoch_count_is_refused_before_anything_starts(tmp_path, monkeypatch):
+    first_part = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    interrupt_validation(first_part, monkeypatch, at=3)
+    first_part.fit(run_name="synthetic", total_params=0)
+
+    run_logger = RecordingLogger()
+    resumed = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, run_logger)
+    resumed.config.epochs = 8
+    resumed.config.max_hours = 5.0  # a session setting; may change between sessions
+    with pytest.raises(ValueError, match="epochs: saved 4, now 8"):
+        resumed.fit(run_name="synthetic", total_params=0, resume_state=load_training_state(tmp_path))
+    assert not hasattr(run_logger, "config")
+
+
+def test_a_fresh_start_removes_the_state_of_an_earlier_attempt(tmp_path, monkeypatch):
+    earlier = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    interrupt_validation(earlier, monkeypatch, at=3)
+    earlier.fit(run_name="synthetic", total_params=0)
+    assert (tmp_path / "last.pt").exists()
+
+    fresh = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    interrupt_validation(fresh, monkeypatch, at=1)
+    fresh.fit(run_name="synthetic", total_params=0)
+
+    assert not (tmp_path / "last.pt").exists()
+
+
+def test_resuming_rewrites_the_best_checkpoint_of_the_saved_state(tmp_path, monkeypatch):
+    first_part = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    interrupt_validation(first_part, monkeypatch, at=3)
+    first_part.fit(run_name="synthetic", total_params=0)
+    state = load_training_state(tmp_path)
+    # An epoch that was interrupted after writing a new best checkpoint but before saving its state.
+    torch.save({name: torch.zeros_like(tensor) for name, tensor in state["best_weights"].items()}, tmp_path / "best_model.pth")
+
+    resumed = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    resumed.restore(state)
+
+    rewritten = torch.load(tmp_path / "best_model.pth", weights_only=True)
+    assert all(torch.equal(rewritten[name], tensor) for name, tensor in state["best_weights"].items())
+
+
+def test_a_state_saved_without_amp_resumes_with_amp(tmp_path, monkeypatch):
+    first_part = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    interrupt_validation(first_part, monkeypatch, at=3)
+    first_part.fit(run_name="synthetic", total_params=0)
+    state = load_training_state(tmp_path)
+    assert state["scaler"] == {}
+
+    resumed = build_trainer(tmp_path, {"test": evaluation_set(SquareDataset(3))}, RecordingLogger())
+    resumed.scaler = GradScaler("cpu", enabled=True)  # as on a CUDA machine, where AMP is on
+    assert resumed.restore(state) == 2
+
+
+def test_fit_reports_how_the_run_ended(trainer_and_recorder, monkeypatch, tmp_path):
+    trainer, recorder = trainer_and_recorder
+    assert trainer.fit(run_name="synthetic", total_params=0) == "completed"
+    assert recorder.outcome == "completed"
+
+    stopped_log = RecordingLogger()
+    stopped = build_trainer(tmp_path / "stopped", {"test": evaluation_set(SquareDataset(3))}, stopped_log)
+    clock = FakeClock()
+    stopped.clock = clock
+    stopped.config.max_hours = 0.5
+    run_epoch = stopped._run_epoch
+
+    def one_hour_epoch(epoch: int) -> None:
+        run_epoch(epoch)
+        clock.now += 3600
+
+    monkeypatch.setattr(stopped, "_run_epoch", one_hour_epoch)
+    assert stopped.fit(run_name="synthetic", total_params=0) == "out_of_time"
+    assert stopped_log.outcome == "out_of_time"
+    assert "max_hours" not in stopped_log.config
 
 
 def test_failed_compile_warmup_leaves_no_gradients(monkeypatch, tmp_path):

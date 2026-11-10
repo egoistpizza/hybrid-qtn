@@ -18,6 +18,9 @@ from utils.run_naming import build_run_name
 
 CHECKPOINT_ROOT = Path("checkpoints")
 LOSS_CHOICES = ("focal_tversky", "bce_dice")
+# train.py's exit status when it stopped on its --max_hours budget and can continue with --resume
+# (EX_TEMPFAIL: "try again later").
+EXIT_OUT_OF_TIME = 75
 
 
 @dataclass(frozen=True)

@@ -216,7 +216,8 @@ python -m scripts.run_queue --tag showcase_runs --max_hours 20             # ins
 - **Done check:** a run is skipped when its directory is in the backup folder with test metrics, or when W&B has a finished run of that name with test metrics. The second kind has no checkpoints and is retrained in tier 9 under `<tag>_rerun`. W&B must be logged in (`wandb login`); otherwise the queue refuses to start unless you pass `--skip_wandb_check`.
 - **Progress:** `outputs/queue/<tag>/status.txt` (state, timing estimate, current epoch, test Dice per run), plus one log per run in `outputs/queue/<tag>/logs/`.
 - **Backup:** each finished run directory (weights, `config.json`, `history.jsonl`, `summary.json`, `queue_record.json`) is copied to `/workspace/hybrid-qtn/<tag>/checkpoints/<run>/`, and the status file and logs to `/workspace/hybrid-qtn/<tag>/queue/`. Change the location with `--backup_root`, or turn it off with `--no_backup`.
-- **Stopping:** `touch outputs/queue/<tag>/STOP` stops after the current run. Ctrl-C (or `kill <pid>`) stops the current run and saves its weights; a second Ctrl-C kills it. Relaunching skips finished runs; `--max_hours` counts from each launch.
+- **Stopping:** `touch outputs/queue/<tag>/STOP` stops after the current run. Ctrl-C (or `kill <pid>`) stops the current run and saves its weights; a second Ctrl-C kills it. Relaunching skips finished runs and resumes unfinished ones from their last finished epoch (see 3.7.2).
+- **Time budget:** `--max_hours` counts from each launch. Each run gets the remaining budget as its own `--max_hours`; a run that would overrun it pauses at an epoch boundary (status `paused`), the queue stops, and the next launch resumes that run.
 
 `train.py` mirrors every run into its checkpoint directory as `config.json`, `history.jsonl` (every logged step) and `summary.json` (test metrics), so results don't depend on W&B.
 
@@ -225,6 +226,19 @@ python -m scripts.run_queue --tag showcase_runs --max_hours 20             # ins
 ```bash
 python -m scripts.collect_results --tag showcase_runs
 ```
+
+#### 3.7.2 Resuming on time-limited GPUs
+
+Every epoch ends by writing `last.pt` to the run directory: model, optimizer, schedulers, AMP scaler, SWA weights, best validation Dice and its weights, and every RNG state. `--resume` continues from it, or starts fresh when there is none, so the same command can be repeated each session:
+
+```bash
+python train.py --model hybrid --dataset kvasir_seg --seed 42 --tag paper_v1 --resume --max_hours 10.5
+```
+
+- A resumed run trains the same weights as an uninterrupted one (`tests/test_train.py`). Only `max_hours`, `checkpoint_dir` and `deterministic` may change between sessions; any other changed option is refused.
+- `--max_hours` stops before an epoch that would overrun it, judged by the longest epoch so far, and exits with status 75. It covers the epochs only: start-up (splits, `torch.compile`) and the final SWA BatchNorm pass and test evaluation are outside it, so leave a margin below the hard limit. A session that ends during the final phase repeats only that phase on resume.
+- `history.jsonl` is rewound to the resumed epoch, so the curves never repeat an epoch, and the run continues the same W&B run (`wandb_run_id.txt`). W&B cannot drop points it already received, so an epoch that ran twice may appear twice there; use `history.jsonl` for figures.
+- Starting without `--resume` deletes the run's `last.pt`, so a new attempt never mixes with an old one.
 
 ### 3.8 Evaluate a trained model on the held-out test set
 

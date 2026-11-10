@@ -44,8 +44,9 @@ from statistics import mean
 from typing import Iterable, Optional, Sequence
 
 from models.variant import MPSVariant
+from utils.checkpoints import TRAINING_STATE_CHECKPOINT
 from utils.run_logger import RUN_SUMMARY_FILE
-from utils.run_spec import CHECKPOINT_ROOT, RunSpec
+from utils.run_spec import CHECKPOINT_ROOT, EXIT_OUT_OF_TIME, RunSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QUEUE_ROOT = Path("outputs") / "queue"
@@ -172,13 +173,19 @@ class QueueItem:
     def is_rerun(self) -> bool:
         return self.tier == RERUN_TIER
 
-    def train_arguments(self, epochs: int) -> list[str]:
-        """Options for ``train.py``; they resolve to :attr:`spec` through :meth:`RunSpec.from_arguments`."""
+    def train_arguments(self, epochs: int, max_hours: Optional[float] = None) -> list[str]:
+        """Options for ``train.py``; they resolve to :attr:`spec` through :meth:`RunSpec.from_arguments`.
+
+        ``--resume`` continues a run that an earlier launch paused or interrupted; ``max_hours``
+        is the queue's remaining budget, so a long run pauses instead of being cut off.
+        """
         config = self.config
         arguments = [
             "--model", config.model, "--dataset", DATASET, "--loss", config.loss, "--seed", str(self.seed),
-            "--tag", self.tag, "--epochs", str(epochs),
+            "--tag", self.tag, "--epochs", str(epochs), "--resume",
         ]
+        if max_hours is not None:
+            arguments += ["--max_hours", f"{max_hours:.3f}"]
         if config.model != "vanilla":
             variant = config.variant
             arguments += [
@@ -273,11 +280,15 @@ DONE_NOT_BACKED_UP = "done*"
 WANDB_ONLY = "wandb"
 FAILED = "failed"
 INTERRUPTED = "interrupted"
+PAUSED = "paused"
 
 STATUS_LEGEND = (
     "done = results and checkpoints in the backup folder; done* = finished but not yet copied to the backup folder; "
-    "wandb = finished in W&B only, no checkpoints (retrained in tier 9)"
+    "wandb = finished in W&B only, no checkpoints (retrained in tier 9); "
+    "paused = stopped on the time budget, resumes on the next launch"
 )
+# The queue does not start a run with less budget left than this.
+MIN_RUN_START_SECONDS = 15 * 60
 
 
 def read_json(path: Optional[Path]) -> Optional[dict]:
@@ -528,14 +539,15 @@ def run_one(state: RunState, launch: Launch, states: list[RunState], paths: Queu
     """Train one item; returns ``False`` if the queue was interrupted during it."""
     item = state.item
     local_dir = paths.local_run_dir(item)
-    shutil.rmtree(local_dir, ignore_errors=True)  # a leftover of an unfinished attempt
+    if not (local_dir / TRAINING_STATE_CHECKPOINT).exists():
+        shutil.rmtree(local_dir, ignore_errors=True)  # a leftover of an attempt that saved no epoch
     log_file = paths.log_file(item)
     if log_file.exists():
         previous = paths.logs_dir / "previous" / f"{log_file.stem}.{datetime.now():%Y%m%d-%H%M%S}.log"
         previous.parent.mkdir(parents=True, exist_ok=True)
         log_file.rename(previous)
 
-    command = [sys.executable, "train.py", *item.train_arguments(launch.epochs)]
+    command = [sys.executable, "train.py", *item.train_arguments(launch.epochs, remaining_hours(launch))]
     started = time.time()
     state.started_at, state.duration_s, state.note = started, None, ""
     environment = {**os.environ, **CHILD_ENVIRONMENT}
@@ -575,6 +587,9 @@ def run_one(state: RunState, launch: Launch, states: list[RunState], paths: Queu
         (local_dir / QUEUE_RECORD_FILE).write_text(json.dumps(record, indent=2))
         state.status = DONE_NOT_BACKED_UP
         back_up_run(state, paths)
+    elif process.returncode == EXIT_OUT_OF_TIME and not interrupted:
+        state.status = PAUSED
+        state.note = "(time budget reached; relaunch to resume)"
     else:
         state.status = INTERRUPTED if interrupted else FAILED
         state.note = f"(exit code {process.returncode}, see log)"
@@ -583,10 +598,18 @@ def run_one(state: RunState, launch: Launch, states: list[RunState], paths: Queu
     return not interrupted
 
 
+def remaining_hours(launch: Launch) -> Optional[float]:
+    """Budget left in this launch, or ``None`` without ``--max_hours``."""
+    if not launch.max_hours:
+        return None
+    return launch.max_hours - (time.time() - launch.started) / 3600
+
+
 def run_queue(launch: Launch, states: list[RunState], paths: QueuePaths) -> None:
+    """Train the pending runs in order. With ``--max_hours``, each run gets the remaining
+    budget and pauses at an epoch boundary when it runs out; the next launch resumes it."""
     signal.signal(signal.SIGINT, raise_interrupted)
     signal.signal(signal.SIGTERM, raise_interrupted)
-    budget_s = launch.max_hours * 3600 if launch.max_hours else None
     try:
         for state in states:
             if state.status != PENDING:
@@ -594,12 +617,15 @@ def run_queue(launch: Launch, states: list[RunState], paths: QueuePaths) -> None
             if paths.stop_file.exists():
                 launch.state = "stopped by the STOP file"
                 break
-            average = mean_duration(states) or 0.0
-            if budget_s and time.time() - launch.started + average > budget_s:
-                launch.state = f"stopped: the next run would exceed the {launch.max_hours:g}h budget"
+            remaining = remaining_hours(launch)
+            if remaining is not None and remaining * 3600 < MIN_RUN_START_SECONDS:
+                launch.state = f"stopped: less than {MIN_RUN_START_SECONDS // 60} min of the {launch.max_hours:g}h budget left"
                 break
             if not run_one(state, launch, states, paths):
                 launch.state = "interrupted (Ctrl-C or SIGTERM)"
+                break
+            if state.status == PAUSED:
+                launch.state = f"paused: the {launch.max_hours:g}h budget ran out; relaunch to resume {state.item.run_name}"
                 break
         else:
             failed = sum(state.status == FAILED for state in states)
