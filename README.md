@@ -216,6 +216,12 @@ python -m scripts.run_queue --tag showcase_runs --max_hours 20             # ins
 - **Done check:** a run is skipped when its directory is in the backup folder with test metrics, or when W&B has a finished run of that name with test metrics. The second kind has no checkpoints and is retrained in tier 9 under `<tag>_rerun`. W&B must be logged in (`wandb login`); otherwise the queue refuses to start unless you pass `--skip_wandb_check`.
 - **Progress:** `outputs/queue/<tag>/status.txt` (state, timing estimate, current epoch, test Dice per run), plus one log per run in `outputs/queue/<tag>/logs/`.
 - **Backup:** each finished run directory (weights, `config.json`, `history.jsonl`, `summary.json`, `queue_record.json`) is copied to `/workspace/hybrid-qtn/<tag>/checkpoints/<run>/`, and the status file and logs to `/workspace/hybrid-qtn/<tag>/queue/`. Change the location with `--backup_root`, or turn it off with `--no_backup`.
+- **Off-instance copy (optional):** on hosts whose disk does not outlive the instance (e.g. Vast.ai without a volume), `--sync syncthing` shares `<backup_root>/<tag>/` as a send-only Syncthing folder, ID `hybrid-qtn-<tag>`, and requests a rescan after every run, so each finished run reaches your other devices shortly after its backup. It shares with the devices passed as `--syncthing_device <ID>` (default: every device already paired), and the queue refuses to start if Syncthing is unreachable or no device is paired. The status file shows each device's connection and progress. The API is reached at `$SYNCTHING_URL` (default `http://127.0.0.1:18384`) with `$SYNCTHING_API_KEY` (default `$OPEN_BUTTON_TOKEN`, as on the Vast.ai images). On the receiving device, accept the folder as **Receive Only** and enable file versioning; [docs/syncthing_backup.md](docs/syncthing_backup.md) walks through both machines step by step. Before destroying the instance, wait until every device has everything:
+
+  ```bash
+  python -m scripts.run_queue --tag showcase_runs --sync syncthing --syncthing_device <PC device ID>
+  python -m scripts.backup_sync --tag showcase_runs --wait
+  ```
 - **Stopping:** `touch outputs/queue/<tag>/STOP` stops after the current run. Ctrl-C (or `kill <pid>`) stops the current run and saves its weights; a second Ctrl-C kills it. Relaunching skips finished runs; `--max_hours` counts from each launch.
 
 `train.py` mirrors every run into its checkpoint directory as `config.json`, `history.jsonl` (every logged step) and `summary.json` (test metrics), so results don't depend on W&B.

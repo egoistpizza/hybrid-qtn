@@ -13,11 +13,14 @@ are done only in W&B have no checkpoints; a final tier trains them again under t
 
 Each finished run directory is copied to ``<backup_root>/<tag>/checkpoints/<run>/`` (permanent
 storage that outlives the pod), and the status file and logs to ``<backup_root>/<tag>/queue/``.
+With ``--sync syncthing`` that folder is also pushed to other machines as runs finish, for hosts
+whose disk does not outlive the instance (see :mod:`scripts.backup_sync`).
 
 Usage (from the repository root, always through ``-m``):
     python -m scripts.run_queue --tag showcase_runs --dry_run
     python -m scripts.run_queue --tag showcase_runs --tiers 1 --seeds 42 --epochs 1
     python -m scripts.run_queue --tag showcase_runs --max_hours 20
+    python -m scripts.run_queue --tag showcase_runs --sync syncthing --syncthing_device <PC device ID>
 
 Progress: ``outputs/queue/<tag>/status.txt``; one log per run in ``outputs/queue/<tag>/logs/``.
 ``touch outputs/queue/<tag>/STOP`` stops the queue after the current run; Ctrl-C stops the
@@ -44,6 +47,7 @@ from statistics import mean
 from typing import Iterable, Optional, Sequence
 
 from models.variant import MPSVariant
+from scripts.backup_sync import SYNC_CHOICES, BackupSync, NoSync, SyncError, create_backup_sync
 from utils.run_logger import RUN_SUMMARY_FILE
 from utils.run_spec import CHECKPOINT_ROOT, RunSpec
 
@@ -391,6 +395,7 @@ class Launch:
     epochs: int
     git: str
     state: str = "running"
+    sync: BackupSync = field(default_factory=NoSync)
 
 
 def render_status(launch: Launch, states: list[RunState], paths: QueuePaths, current: Optional[RunState] = None) -> str:
@@ -424,6 +429,7 @@ def render_status(launch: Launch, states: list[RunState], paths: QueuePaths, cur
             f"Log:      {paths.log_file(current.item).relative_to(REPO_ROOT)}",
         ]
     lines.append(f"Backup:   {paths.backup_dir or 'disabled'}")
+    lines.append(f"Sync:     {launch.sync.status()}")
     lines += ["", "Tiers:"]
     descriptions = {tier.number: tier.description for tier in build_tiers()}
     descriptions[RERUN_TIER] = "reruns of runs done only in W&B, for their checkpoints"
@@ -580,6 +586,8 @@ def run_one(state: RunState, launch: Launch, states: list[RunState], paths: Queu
         state.note = f"(exit code {process.returncode}, see log)"
     write_text_atomically(paths.status_file, render_status(launch, states, paths))
     back_up_queue_files(paths, log_file)
+    if paths.backup_dir:
+        launch.sync.notify(paths.backup_dir)
     return not interrupted
 
 
@@ -609,6 +617,8 @@ def run_queue(launch: Launch, states: list[RunState], paths: QueuePaths) -> None
     finally:
         write_text_atomically(paths.status_file, render_status(launch, states, paths))
         back_up_queue_files(paths)
+        if paths.backup_dir:
+            launch.sync.notify(paths.backup_dir)
     print(f"Queue {launch.state}. Status: {paths.status_file.relative_to(REPO_ROOT)}")
 
 
@@ -622,6 +632,14 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dry_run", action="store_true", help="Print the queue and exit; writes nothing")
     parser.add_argument("--backup_root", type=Path, default=DEFAULT_BACKUP_ROOT, help="Permanent storage for finished runs")
     parser.add_argument("--no_backup", action="store_true", help="Keep finished runs only in checkpoints/")
+    parser.add_argument(
+        "--sync", choices=SYNC_CHOICES, default="none",
+        help="Push the backup folder to other machines as runs finish; syncthing: a send-only Syncthing folder",
+    )
+    parser.add_argument(
+        "--syncthing_device", nargs="+", default=[],
+        help="Syncthing device ID(s) to share the backup folder with; default: every device already paired",
+    )
     parser.add_argument("--skip_wandb_check", action="store_true", help="Do not look up finished runs in W&B")
     parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity; default: your default entity")
     return parser.parse_args(argv)
@@ -634,6 +652,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     backup_root = None if arguments.no_backup else arguments.backup_root
     if backup_root and not backup_root.parent.is_dir() and not arguments.dry_run:
         sys.exit(f"Backup folder parent {backup_root.parent} does not exist; pass --backup_root or --no_backup.")
+    if arguments.sync != "none" and backup_root is None:
+        sys.exit("--sync copies the backup folder, so it cannot be combined with --no_backup.")
+    try:
+        sync = create_backup_sync(arguments.sync, tag, arguments.syncthing_device)
+    except SyncError as error:
+        sys.exit(f"Backup sync: {error}")
     paths = QueuePaths(tag, backup_root)
     selected_tiers = arguments.tiers or [tier.number for tier in build_tiers()] + [RERUN_TIER]
     items = build_queue(tag, arguments.seeds, [tier for tier in selected_tiers if tier != RERUN_TIER])
@@ -651,7 +675,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             print(f"Warning: {message}", file=sys.stderr)
 
     states = resolve_queue(items, paths, wandb_summaries, rerun_candidates)
-    launch = Launch(tag, time.time(), arguments.max_hours, arguments.epochs, git_description())
+    launch = Launch(tag, time.time(), arguments.max_hours, arguments.epochs, git_description(), sync=sync)
 
     if arguments.dry_run:
         launch.state = "dry run (nothing started)"
@@ -670,6 +694,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if paths.stop_file.exists():
         paths.stop_file.unlink()
         print("Removed a STOP file left from an earlier launch.")
+    if paths.backup_dir:
+        try:
+            sync.prepare(paths.backup_dir)
+        except SyncError as error:
+            sys.exit(f"Backup sync: {error}")
+        if arguments.sync != "none":
+            print(f"Sync: {sync.status()}")
     for state in states:
         if state.status == DONE_NOT_BACKED_UP:
             back_up_run(state, paths)

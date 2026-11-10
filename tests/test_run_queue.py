@@ -138,6 +138,33 @@ def test_status_lists_every_run_and_tier(repo, tmp_path):
     assert "Progress: 0/102 finished" in text
     assert all(f"tier {tier} " in text for tier in range(1, 9))
     assert all(state.item.run_name in text for state in states)
+    assert "Sync:     off" in text
+
+
+class RecordingSync:
+    def __init__(self):
+        self.notified = []
+
+    def prepare(self, folder):
+        pass
+
+    def notify(self, path):
+        self.notified.append(path)
+
+    def status(self):
+        return "laptop connected, up to date"
+
+
+def test_status_shows_the_backup_sync(repo, tmp_path):
+    paths = QueuePaths("t", tmp_path / "backup")
+    states = resolve_queue(build_queue("t", seeds=[42], tiers=[1]), paths, {})
+    text = render_status(Launch("t", 0.0, None, 100, "main @ abc", sync=RecordingSync()), states, paths)
+    assert "Sync:     laptop connected, up to date" in text
+
+
+def test_sync_needs_the_backup_folder(repo):
+    with pytest.raises(SystemExit, match="--no_backup"):
+        run_queue.main(["--tag", "t", "--sync", "syncthing", "--no_backup", "--dry_run", "--skip_wandb_check"])
 
 
 FAKE_TRAIN = textwrap.dedent(
@@ -164,11 +191,13 @@ def test_run_one_trains_and_backs_up_a_run(repo, tmp_path, monkeypatch, outcome)
     monkeypatch.setenv("FAKE_OUTCOME", outcome)
     monkeypatch.setenv("FAKE_RUN_DIR", str(paths.local_run_dir(item)))
     state = RunState(item)
+    sync = RecordingSync()
 
-    assert run_queue.run_one(state, Launch("t", 0.0, None, 1, "main @ abc"), [state], paths)
+    assert run_queue.run_one(state, Launch("t", 0.0, None, 1, "main @ abc", sync=sync), [state], paths)
 
     assert "Epoch 1/1 [Train]" in paths.log_file(item).read_text()
     assert (paths.backup_queue_dir / "logs" / paths.log_file(item).name).exists()
+    assert sync.notified == [paths.backup_dir]
     if outcome == "success":
         assert state.status == DONE and state.summary["test_swa_dice"] == 0.92
         backup = paths.backup_run_dir(item)
