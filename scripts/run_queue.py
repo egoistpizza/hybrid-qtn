@@ -1,4 +1,4 @@
-"""Train the Kvasir-SEG ablation grid as a resumable, prioritized queue.
+"""Train the ablation grid on one dataset (Kvasir-SEG by default) as a resumable, prioritized queue.
 
 The grid is vanilla and hybrid U-Nets x bond dimension {32, 64} x axial operator {relative,
 absolute, circular, mean boundary} x positional encoding {off, on} x loss {Focal Tversky,
@@ -43,6 +43,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable, Optional, Sequence
 
+from dataset import discover_dataset_configs
 from models.variant import MPSVariant
 from utils.checkpoints import TRAINING_STATE_CHECKPOINT
 from utils.run_logger import RUN_SUMMARY_FILE
@@ -51,7 +52,7 @@ from utils.run_spec import CHECKPOINT_ROOT, EXIT_OUT_OF_TIME, RunSpec
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QUEUE_ROOT = Path("outputs") / "queue"
 DEFAULT_BACKUP_ROOT = Path("/workspace/hybrid-qtn")
-DATASET = "kvasir_seg"
+DEFAULT_DATASET = "kvasir_seg"
 DEFAULT_SEEDS = (42, 43, 44)
 DEFAULT_EPOCHS = 100
 FOCAL_TVERSKY = "focal_tversky"
@@ -81,9 +82,9 @@ class Config:
     variant: MPSVariant = field(default_factory=MPSVariant)
     loss: str = FOCAL_TVERSKY
 
-    def spec(self, seed: int, tag: str) -> RunSpec:
+    def spec(self, seed: int, tag: str, dataset: str = DEFAULT_DATASET) -> RunSpec:
         return RunSpec(
-            model_type=self.model, datasets=(DATASET,), loss=self.loss, seed=seed,
+            model_type=self.model, datasets=(dataset,), loss=self.loss, seed=seed,
             bond_dim=self.bond_dim, variant=self.variant, tag=tag,
         )
 
@@ -160,10 +161,11 @@ class QueueItem:
     config: Config
     seed: int
     tag: str
+    dataset: str = DEFAULT_DATASET
 
     @property
     def spec(self) -> RunSpec:
-        return self.config.spec(self.seed, self.tag)
+        return self.config.spec(self.seed, self.tag, self.dataset)
 
     @property
     def run_name(self) -> str:
@@ -181,7 +183,7 @@ class QueueItem:
         """
         config = self.config
         arguments = [
-            "--model", config.model, "--dataset", DATASET, "--loss", config.loss, "--seed", str(self.seed),
+            "--model", config.model, "--dataset", self.dataset, "--loss", config.loss, "--seed", str(self.seed),
             "--tag", self.tag, "--epochs", str(epochs), "--resume",
         ]
         if max_hours is not None:
@@ -202,15 +204,20 @@ def queue_tag(tag: str, epochs: int) -> str:
     return tag if epochs == DEFAULT_EPOCHS else f"{tag}_e{epochs}"
 
 
-def build_queue(tag: str, seeds: Sequence[int] = DEFAULT_SEEDS, tiers: Optional[Iterable[int]] = None) -> list[QueueItem]:
-    """Items of tiers 1-8 in priority order: tier by tier, and within a tier seed by seed.
+def build_queue(
+    tag: str,
+    seeds: Sequence[int] = DEFAULT_SEEDS,
+    tiers: Optional[Iterable[int]] = None,
+    dataset: str = DEFAULT_DATASET,
+) -> list[QueueItem]:
+    """Items of tiers 1-8 on ``dataset`` in priority order: tier by tier, and within a tier seed by seed.
 
     Raises:
         ValueError: If two items share a run name.
     """
     selected = set(tiers) if tiers is not None else None
     items = [
-        QueueItem(tier.number, config, seed, tag)
+        QueueItem(tier.number, config, seed, tag, dataset)
         for tier in build_tiers()
         if selected is None or tier.number in selected
         for seed in seeds
@@ -224,7 +231,7 @@ def build_queue(tag: str, seeds: Sequence[int] = DEFAULT_SEEDS, tiers: Optional[
 
 
 def rerun_item(item: QueueItem) -> QueueItem:
-    return QueueItem(RERUN_TIER, item.config, item.seed, item.tag + RERUN_SUFFIX)
+    return QueueItem(RERUN_TIER, item.config, item.seed, item.tag + RERUN_SUFFIX, item.dataset)
 
 
 # --------------------------------------------------------------------------- paths and state
@@ -639,8 +646,9 @@ def run_queue(launch: Launch, states: list[RunState], paths: QueuePaths) -> None
 
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the Kvasir-SEG ablation grid as a resumable queue")
+    parser = argparse.ArgumentParser(description="Train the ablation grid on one dataset as a resumable queue")
     parser.add_argument("--tag", required=True, help="Run-name suffix of every run, e.g. showcase_runs")
+    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET, help="Dataset config to train on (configs/<name>.yaml)")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
     parser.add_argument("--tiers", type=int, nargs="+", default=None, help=f"Tiers to run (1-8, {RERUN_TIER} = reruns); default all")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Fewer epochs add _e<epochs> to the tag (smoke tests)")
@@ -656,14 +664,17 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     arguments = parse_arguments(argv)
     os.chdir(REPO_ROOT)
+    available = discover_dataset_configs()
+    if arguments.dataset not in available:
+        sys.exit(f"Unknown dataset {arguments.dataset!r}. Available: {', '.join(sorted(available))}")
     tag = queue_tag(arguments.tag, arguments.epochs)
     backup_root = None if arguments.no_backup else arguments.backup_root
     if backup_root and not backup_root.parent.is_dir() and not arguments.dry_run:
         sys.exit(f"Backup folder parent {backup_root.parent} does not exist; pass --backup_root or --no_backup.")
     paths = QueuePaths(tag, backup_root)
     selected_tiers = arguments.tiers or [tier.number for tier in build_tiers()] + [RERUN_TIER]
-    items = build_queue(tag, arguments.seeds, [tier for tier in selected_tiers if tier != RERUN_TIER])
-    rerun_candidates = build_queue(tag, arguments.seeds) if RERUN_TIER in selected_tiers else []
+    items = build_queue(tag, arguments.seeds, [tier for tier in selected_tiers if tier != RERUN_TIER], arguments.dataset)
+    rerun_candidates = build_queue(tag, arguments.seeds, dataset=arguments.dataset) if RERUN_TIER in selected_tiers else []
 
     wandb_summaries: dict[str, dict] = {}
     if not arguments.skip_wandb_check:
@@ -684,7 +695,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print(render_status(launch, states, paths))
         next_state = next((state for state in states if state.status == PENDING), None)
         if next_state:
-            print("First command: python train.py " + " ".join(next_state.item.train_arguments(arguments.epochs)))
+            first_arguments = next_state.item.train_arguments(arguments.epochs, remaining_hours(launch))
+            print("First command: python train.py " + " ".join(first_arguments))
         return
 
     paths.logs_dir.mkdir(parents=True, exist_ok=True)

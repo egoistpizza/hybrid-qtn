@@ -34,6 +34,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from scripts.run_queue import (
     DEFAULT_BACKUP_ROOT,
+    DEFAULT_DATASET,
     DEFAULT_SEEDS,
     DONE_METRIC,
     QUEUE_RECORD_FILE,
@@ -108,9 +109,9 @@ class RunRecord:
         return row
 
 
-def expected_items(tag: str, seeds: Sequence[int]) -> dict[str, QueueItem]:
-    """Every run name the queue can produce for ``tag``, originals and reruns."""
-    originals = build_queue(tag, seeds)
+def expected_items(tag: str, seeds: Sequence[int], dataset: str = DEFAULT_DATASET) -> dict[str, QueueItem]:
+    """Every run name the queue can produce for ``tag`` on ``dataset``, originals and reruns."""
+    originals = build_queue(tag, seeds, dataset=dataset)
     return {item.run_name: item for item in originals + [rerun_item(item) for item in originals]}
 
 
@@ -288,6 +289,7 @@ def copy_queue_files(tag: str, destination: Path) -> None:
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Gather results, logs and environment of one queue tag")
     parser.add_argument("--tag", required=True, help="Queue tag, e.g. showcase_runs (or showcase_runs_e1)")
+    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET, help="Dataset the queue trained on")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
     parser.add_argument("--backup_root", type=Path, default=DEFAULT_BACKUP_ROOT)
     parser.add_argument("--output_dir", type=Path, default=None, help="Default: <backup_root>/<tag>/results")
@@ -301,7 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     tag_dir = arguments.backup_root / arguments.tag
     output_dir = arguments.output_dir or tag_dir / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
-    items = expected_items(arguments.tag, arguments.seeds)
+    items = expected_items(arguments.tag, arguments.seeds, arguments.dataset)
 
     records = local_records(tag_dir / "checkpoints", items)
     print(f"Backed-up run directories: {len(records)} in {tag_dir / 'checkpoints'}")

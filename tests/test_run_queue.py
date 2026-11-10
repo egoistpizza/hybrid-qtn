@@ -77,6 +77,22 @@ def test_train_arguments_select_the_queued_run(item, monkeypatch):
     assert arguments.resume and arguments.max_hours == 2.5
 
 
+def test_a_queue_on_another_dataset_trains_that_dataset(monkeypatch):
+    items = build_queue("paper_v1", seeds=[42], tiers=[1], dataset="duts")
+    assert [item.run_name for item in items] == [
+        "duts__vanilla_unet__focal_tversky__seed42__paper_v1",
+        "duts__hybrid_unet_b32_rel_nope__focal_tversky__seed42__paper_v1",
+    ]
+    monkeypatch.setattr("sys.argv", ["train.py", *items[1].train_arguments(epochs=100)])
+    assert RunSpec.from_arguments(train.parse_arguments()) == items[1].spec
+    assert run_queue.rerun_item(items[1]).dataset == "duts"
+
+
+def test_an_unknown_dataset_is_rejected_before_anything_starts():
+    with pytest.raises(SystemExit, match="Unknown dataset 'dutz'"):
+        run_queue.main(["--tag", "t", "--dataset", "dutz", "--dry_run", "--skip_wandb_check"])
+
+
 def test_shortened_runs_get_their_own_tag():
     assert queue_tag("showcase_runs", 100) == "showcase_runs"
     assert queue_tag("showcase_runs", 1) == "showcase_runs_e1"

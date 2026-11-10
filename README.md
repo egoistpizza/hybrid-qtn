@@ -193,7 +193,7 @@ Aggregate the `test_swa_*` / `test_best_live_*` summary values across seeds as m
 
 #### 3.7.1 Ablation queue and result collection
 
-`scripts/run_queue.py` trains the Kvasir-SEG ablation grid: vanilla and hybrid × bond dimension {32, 64} × axial operator {relative, absolute, circular, mean boundary} × positional encoding {off, on} × loss {Focal Tversky, BCE + Dice}, 34 configurations × seeds 42–44 = 102 runs, in priority tiers:
+`scripts/run_queue.py` trains the ablation grid on Kvasir-SEG, or on another dataset with `--dataset`: vanilla and hybrid × bond dimension {32, 64} × axial operator {relative, absolute, circular, mean boundary} × positional encoding {off, on} × loss {Focal Tversky, BCE + Dice}, 34 configurations × seeds 42–44 = 102 runs, in priority tiers:
 
 | Tier | Runs | Configurations |
 |---|---|---|
@@ -213,6 +213,7 @@ Run it from the repository root, always through `-m`:
 python -m scripts.run_queue --tag showcase_runs --dry_run                  # print the queue
 python -m scripts.run_queue --tag showcase_runs --tiers 1 --seeds 42 --epochs 1   # smoke test, tag showcase_runs_e1
 python -m scripts.run_queue --tag showcase_runs --max_hours 20             # inside tmux
+python -m scripts.run_queue --tag paper_v1 --dataset duts --tiers 1 --max_hours 10.5   # vanilla vs hybrid on DUTS
 ```
 
 - **Done check:** a run is skipped when its directory is in the backup folder with test metrics, or when W&B has a finished run of that name with test metrics. The second kind has no checkpoints and is retrained in tier 9 under `<tag>_rerun`. W&B must be logged in (`wandb login`); otherwise the queue refuses to start unless you pass `--skip_wandb_check`.
@@ -227,6 +228,7 @@ python -m scripts.run_queue --tag showcase_runs --max_hours 20             # ins
 
 ```bash
 python -m scripts.collect_results --tag showcase_runs
+python -m scripts.collect_results --tag paper_v1 --dataset duts
 ```
 
 #### 3.7.2 Resuming on time-limited GPUs

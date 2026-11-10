@@ -59,3 +59,13 @@ def test_collect_builds_tables_from_backed_up_runs(tmp_path):
     assert abs(float(by_config["test_swa_dice_mean"]) - 0.85) < 1e-9
     assert len(list(csv.DictReader((results / "history.csv").open()))) == 6
     assert (results / "environment" / "configs" / "kvasir_seg.yaml").exists()
+
+
+def test_collect_finds_the_runs_of_the_dataset_the_queue_trained(tmp_path):
+    (item,) = [item for item in build_queue("t", seeds=[42], tiers=[1], dataset="duts") if item.config.model == "hybrid"]
+    write_run(tmp_path / "t" / "checkpoints" / item.run_name, 42, 0.80)
+
+    main(["--tag", "t", "--dataset", "duts", "--seeds", "42", "--backup_root", str(tmp_path), "--skip_wandb"])
+
+    (by_config,) = list(csv.DictReader((tmp_path / "t" / "results" / "results_by_config.csv").open()))
+    assert by_config["config"] == "hybrid b32 rel no-PE" and by_config["n_seeds"] == "1"
