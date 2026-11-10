@@ -81,7 +81,7 @@ out:
 ```python
 from dataset import build_splits, discover_dataset_configs
 
-print(sorted(discover_dataset_configs()))       # ['cod', 'cvc_clinicdb', 'kvasir_seg', 'mass_roads']
+print(sorted(discover_dataset_configs()))       # ['cod', 'cvc_clinicdb', 'duts', 'kvasir_seg', 'mass_roads']
 
 splits = build_splits(["kvasir_seg"])           # 70 / 15 / 15, fixed split seed 42
 splits.train                                    # a Dataset using train_transforms
@@ -122,7 +122,9 @@ foreground_map_metrics: bool = false  # also report S-measure, E-measure, weight
   from the training sources.
 
 `configs/cod.yaml` uses this schema for the camouflaged object detection benchmark
-(COD10K-train + CAMO-train for training; COD10K, CAMO, CHAMELEON and NC4K for testing).
+(COD10K-train + CAMO-train for training; COD10K, CAMO, CHAMELEON and NC4K for testing),
+and `configs/duts.yaml` for the DUTS salient object detection benchmark (DUTS-TR for
+training, DUTS-TE for testing).
 
 Or, from a config mapping:
 

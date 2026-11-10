@@ -205,6 +205,27 @@ def test_every_cod_test_pair_loads():
     assert shapes == {(1, 512, 512)}
 
 
+def test_duts_benchmark_protocol():
+    if not (REPO_ROOT / "data/duts/test/duts_te/images").is_dir():
+        pytest.skip("duts not on disk")
+    splits = make_splits(load_config("duts", CONFIG_DIR))
+    assert (len(splits.train), len(splits.val.dataset)) == (9498, 1055)
+    assert {name: len(test_set.dataset) for name, test_set in splits.test_sets.items()} == {"duts_te": 5019}
+    held_out = {sample for _, _, sample in splits.test_sets["duts_te"].dataset.samples}
+    assert not (set(sample_ids(splits.train)) | set(sample_ids(splits.val.dataset))) & held_out
+
+
+def test_duts_config_declares_the_benchmark_protocol():
+    config = load_config("duts", CONFIG_DIR)
+    assert [source.name for source in config.split.train_sources] == ["duts/duts_tr"]
+    assert list(config.split.test_sources) == ["duts_te"]
+    assert config.foreground_map_metrics is True
+
+
+def test_natural_image_benchmarks_share_one_pipeline():
+    assert load_config("duts", CONFIG_DIR).pipelines == load_config("cod", CONFIG_DIR).pipelines
+
+
 def test_joint_test_sets_must_share_their_normalization(tmp_path):
     configs = tmp_path / "configs"
     write_config(configs, "first", predefined_config(tmp_path / "first"))
