@@ -81,6 +81,13 @@ def test_the_queue_gets_the_time_left_and_the_extra_options(monkeypatch):
     assert "--skip_wandb_check" not in queue_command(arguments, extra, 10.25, wandb_logged_in=True)
 
 
+def test_the_queue_looks_up_finished_runs_in_the_team_entity():
+    arguments, extra = parse_arguments(["--dataset", "duts", "--tag", "paper_v1"])
+    command = queue_command(arguments, extra, 10.0, wandb_logged_in=True, wandb_entity="team")
+    assert command[command.index("--wandb_entity") + 1] == "team"
+    assert "--wandb_entity" not in queue_command(arguments, extra, 10.0, wandb_logged_in=True)
+
+
 def test_an_unknown_dataset_stops_the_session_before_any_set_up(monkeypatch):
     monkeypatch.setattr(kaggle_session, "environment_report", lambda: pytest.fail("set-up started"))
     with pytest.raises(SystemExit, match="No downloader for 'dutz'"):

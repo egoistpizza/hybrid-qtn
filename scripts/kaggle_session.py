@@ -170,8 +170,18 @@ def query_gpus() -> list[list[str]]:
     return [[field.strip() for field in line.split(",")] for line in result.stdout.strip().splitlines()]
 
 
-def queue_command(arguments: argparse.Namespace, queue_options: Sequence[str], hours_left: float, wandb_logged_in: bool) -> list[str]:
-    """The ``scripts.run_queue`` command of this session."""
+def queue_command(
+    arguments: argparse.Namespace,
+    queue_options: Sequence[str],
+    hours_left: float,
+    wandb_logged_in: bool,
+    wandb_entity: Optional[str] = None,
+) -> list[str]:
+    """The ``scripts.run_queue`` command of this session.
+
+    ``wandb_entity`` (``WANDB_ENTITY``, which ``wandb.init`` also reads) makes the queue look
+    up finished runs in the same W&B project the training logs to.
+    """
     command = [
         sys.executable, "-m", "scripts.run_queue",
         "--dataset", arguments.dataset, "--tag", arguments.tag, "--epochs", str(arguments.epochs),
@@ -180,6 +190,8 @@ def queue_command(arguments: argparse.Namespace, queue_options: Sequence[str], h
     ]
     if not wandb_logged_in:
         command.append("--skip_wandb_check")
+    elif wandb_entity:
+        command += ["--wandb_entity", wandb_entity]
     return command
 
 
@@ -218,7 +230,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     hours_left = arguments.max_hours - (time.monotonic() - session_started) / 3600
     with UsageMonitor(REPO_ROOT / USAGE_FILE):
-        run(queue_command(arguments, queue_options, hours_left, wandb_logged_in), env=environment)
+        run(queue_command(arguments, queue_options, hours_left, wandb_logged_in, os.environ.get("WANDB_ENTITY")), env=environment)
 
     tag = queue_tag(arguments.tag, arguments.epochs)
     run([sys.executable, "-m", "scripts.collect_results", "--tag", tag, "--dataset", arguments.dataset,
