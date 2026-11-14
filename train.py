@@ -66,12 +66,18 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     swa_start_pct: float = 0.75
     swa_lr: float = 5e-5
+    swa_anneal_pct: float = 0.1
     deterministic: bool = False
     checkpoint_dir: str = str(CHECKPOINT_ROOT)
 
     @property
     def swa_start_epoch(self) -> int:
         return int(self.epochs * self.swa_start_pct)
+
+    @property
+    def swa_anneal_epochs(self) -> int:
+        """Epochs over which SWALR moves the learning rate to ``swa_lr``: 10 at 100 epochs, scaled with the run length."""
+        return max(1, round(self.epochs * self.swa_anneal_pct))
 
 
 def prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
@@ -118,7 +124,7 @@ class SegmentationTrainer:
         self.use_amp = device.type == "cuda"
         self.scaler = GradScaler(enabled=self.use_amp)
         self.swa_model = AveragedModel(self.model)
-        self.swa_scheduler = SWALR(self.optimizer, swa_lr=config.swa_lr)
+        self.swa_scheduler = SWALR(self.optimizer, swa_lr=config.swa_lr, anneal_epochs=config.swa_anneal_epochs)
         self.best_val_dice = float("-inf")
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)

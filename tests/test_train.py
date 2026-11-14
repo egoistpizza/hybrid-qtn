@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -112,6 +113,17 @@ def test_swa_averages_only_the_final_epochs(trainer_and_recorder):
     trainer.fit(run_name="synthetic", total_params=0)
     assert trainer.swa_model.n_averaged.item() == 3
     assert [entry["is_swa_active"] for entry in recorder.logged if "is_swa_active" in entry] == [0.0, 1.0, 1.0, 1.0]
+
+
+@pytest.mark.parametrize(("epochs", "anneal_epochs"), [(100, 10), (28, 3), (4, 1)])
+def test_swa_anneal_scales_with_the_number_of_epochs(tmp_path, epochs, anneal_epochs):
+    config = replace(training_config(tmp_path), epochs=epochs)
+    assert config.swa_anneal_epochs == anneal_epochs
+
+
+def test_swa_scheduler_uses_the_scaled_anneal(trainer_and_recorder):
+    trainer, _ = trainer_and_recorder
+    assert trainer.swa_scheduler.anneal_epochs == trainer.config.swa_anneal_epochs
 
 
 def test_fit_logs_peak_vram_and_test_only_paper_metrics(trainer_and_recorder):
