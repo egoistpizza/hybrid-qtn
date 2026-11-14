@@ -19,7 +19,13 @@ Usage (from the repository root, always through ``-m``):
     python -m scripts.run_queue --tag showcase_runs --tiers 1 --seeds 42 --epochs 1
     python -m scripts.run_queue --tag showcase_runs --max_hours 20
 
-Progress: ``outputs/queue/<tag>/status.txt``; one log per run in ``outputs/queue/<tag>/logs/``.
+Two GPUs train two runs at once as two lanes of the same queue: every lane takes every
+``--lanes``-th run from position ``--lane``, on its own GPU (the ``--lane``-th visible one)::
+
+    python -m scripts.run_queue --tag showcase_runs --lanes 2 --lane 0 &
+    python -m scripts.run_queue --tag showcase_runs --lanes 2 --lane 1
+
+Progress: ``outputs/queue/<tag>/status.txt`` (``status_lane<n>.txt`` per lane); one log per run in ``outputs/queue/<tag>/logs/``.
 ``touch outputs/queue/<tag>/STOP`` stops the queue after the current run; Ctrl-C stops the
 current run (its weights are saved) and a second Ctrl-C kills it. Launching the same command
 again skips finished runs.
@@ -239,8 +245,17 @@ def rerun_item(item: QueueItem) -> QueueItem:
 
 @dataclass(frozen=True)
 class QueuePaths:
+    """Files of one queue. Lanes of the same queue share the logs, the run directories and
+    the STOP file, but each lane has its own lock and status file."""
+
     tag: str
     backup_root: Optional[Path]
+    lane: int = 0
+    lanes: int = 1
+
+    @property
+    def lane_suffix(self) -> str:
+        return f"_lane{self.lane}" if self.lanes > 1 else ""
 
     @property
     def queue_dir(self) -> Path:
@@ -252,7 +267,7 @@ class QueuePaths:
 
     @property
     def status_file(self) -> Path:
-        return self.queue_dir / "status.txt"
+        return self.queue_dir / f"status{self.lane_suffix}.txt"
 
     @property
     def stop_file(self) -> Path:
@@ -260,7 +275,12 @@ class QueuePaths:
 
     @property
     def lock_file(self) -> Path:
+        """Held exclusively by a single-lane queue and shared by the lanes of a multi-lane one."""
         return self.queue_dir / ".lock"
+
+    @property
+    def lane_lock_file(self) -> Path:
+        return self.queue_dir / f".lock{self.lane_suffix}"
 
     def log_file(self, item: QueueItem) -> Path:
         return self.logs_dir / f"{item.run_name}.log"
@@ -353,6 +373,15 @@ def resolve_queue(
     return states + [resolve_state(item, paths, wandb_summaries) for item in reruns]
 
 
+def lane_states(states: list[RunState], lane: int, lanes: int) -> list[RunState]:
+    """The runs one lane trains: every ``lanes``-th state from position ``lane``.
+
+    Every lane builds the same full list, so the lanes split it without overlap, and a run
+    paused in one session is resumed by the same lane in the next.
+    """
+    return states[lane::lanes]
+
+
 def finished_wandb_summaries(tag: str, entity: Optional[str]) -> dict[str, dict]:
     """Summary of every finished W&B run named ``...__<tag>`` that has test metrics."""
     from utils.wandb_export import runs_with_name_suffix
@@ -409,6 +438,8 @@ class Launch:
     epochs: int
     git: str
     state: str = "running"
+    # GPU of this lane (a CUDA_VISIBLE_DEVICES entry); None leaves the choice to train.py.
+    gpu: Optional[str] = None
 
 
 def render_status(launch: Launch, states: list[RunState], paths: QueuePaths, current: Optional[RunState] = None) -> str:
@@ -424,8 +455,9 @@ def render_status(launch: Launch, states: list[RunState], paths: QueuePaths, cur
         f"~{format_duration(average * pending)} for the {pending} runs left"
         if average else "available after the first run finishes"
     )
+    lane = f", lane {paths.lane} of {paths.lanes} on GPU {launch.gpu}" if paths.lanes > 1 else ""
     lines = [
-        f"Queue:    {launch.tag}  ({len(states)} runs, {launch.epochs} epoch{'s' if launch.epochs != 1 else ''} each)",
+        f"Queue:    {launch.tag}  ({len(states)} runs, {launch.epochs} epoch{'s' if launch.epochs != 1 else ''} each{lane})",
         f"State:    {launch.state}",
         f"Updated:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Launched: {launched} ({format_duration(now - launch.started)} ago{budget})",
@@ -504,7 +536,7 @@ def back_up_queue_files(paths: QueuePaths, log_file: Optional[Path] = None) -> N
     try:
         (paths.backup_queue_dir / "logs").mkdir(parents=True, exist_ok=True)
         if paths.status_file.exists():
-            shutil.copy2(paths.status_file, paths.backup_queue_dir / "status.txt")
+            shutil.copy2(paths.status_file, paths.backup_queue_dir / paths.status_file.name)
         logs = [log_file] if log_file else list(paths.logs_dir.glob("*.log"))
         for log in logs:
             if log and log.exists():
@@ -526,12 +558,27 @@ def git_description() -> str:
     return f"{git('rev-parse', '--abbrev-ref', 'HEAD')} @ {commit}{dirty}"
 
 
-def gpu_name() -> str:
+def gpu_name(gpu: Optional[str] = None) -> str:
+    """Name of ``gpu`` (an index or UUID), or of the first GPU."""
+    selection = ["--id", gpu] if gpu else []
     try:
-        result = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
+        result = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader", *selection], capture_output=True, text=True)
         return result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
     except OSError:
         return ""
+
+
+def visible_gpus() -> list[str]:
+    """GPUs this process may use: the ``CUDA_VISIBLE_DEVICES`` entries if it is set, else
+    the index of every GPU ``nvidia-smi`` lists (none without ``nvidia-smi``)."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        return [gpu.strip() for gpu in visible.split(",") if gpu.strip()]
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return result.stdout.split()
 
 
 class Interrupted(Exception):
@@ -558,6 +605,8 @@ def run_one(state: RunState, launch: Launch, states: list[RunState], paths: Queu
     started = time.time()
     state.started_at, state.duration_s, state.note = started, None, ""
     environment = {**os.environ, **CHILD_ENVIRONMENT}
+    if launch.gpu is not None:
+        environment["CUDA_VISIBLE_DEVICES"] = launch.gpu
     interrupted = False
     with log_file.open("w") as log:
         log.write(f"# {datetime.now():%Y-%m-%d %H:%M:%S}  tier {item.tier}  {' '.join(command)}\n")
@@ -589,7 +638,7 @@ def run_one(state: RunState, launch: Launch, states: list[RunState], paths: Queu
             "run_name": item.run_name, "tier": item.tier, "seed": item.seed, "tag": item.tag, "epochs": launch.epochs,
             "command": command, "started_at": datetime.fromtimestamp(started).isoformat(timespec="seconds"),
             "finished_at": datetime.fromtimestamp(finished).isoformat(timespec="seconds"),
-            "duration_s": state.duration_s, "code": launch.git, "gpu": gpu_name(),
+            "duration_s": state.duration_s, "code": launch.git, "gpu": gpu_name(launch.gpu),
         }
         (local_dir / QUEUE_RECORD_FILE).write_text(json.dumps(record, indent=2))
         state.status = DONE_NOT_BACKED_UP
@@ -645,6 +694,29 @@ def run_queue(launch: Launch, states: list[RunState], paths: QueuePaths) -> None
     print(f"Queue {launch.state}. Status: {paths.status_file.relative_to(REPO_ROOT)}")
 
 
+def acquire_locks(paths: QueuePaths) -> list:
+    """Lock the queue for this launch; the open lock files must stay referenced.
+
+    A single-lane queue holds the queue lock alone. The lanes of a multi-lane queue share
+    it, and each also holds its own lane lock, so lanes run side by side but never next to
+    a single-lane queue of the same tag, nor twice.
+    """
+    if paths.lanes == 1:
+        wanted = [(paths.lock_file, fcntl.LOCK_EX)]
+    else:
+        wanted = [(paths.lock_file, fcntl.LOCK_SH), (paths.lane_lock_file, fcntl.LOCK_EX)]
+    locks = []
+    for path, mode in wanted:
+        lock = path.open("w")
+        try:
+            fcntl.flock(lock, mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lane = f" (lane {paths.lane})" if paths.lanes > 1 else ""
+            sys.exit(f"Another queue with tag {paths.tag}{lane} is already running.")
+        locks.append(lock)
+    return locks
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the ablation grid on one dataset as a resumable queue")
     parser.add_argument("--tag", required=True, help="Run-name suffix of every run, e.g. showcase_runs")
@@ -658,6 +730,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no_backup", action="store_true", help="Keep finished runs only in checkpoints/")
     parser.add_argument("--skip_wandb_check", action="store_true", help="Do not look up finished runs in W&B")
     parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity; default: your default entity")
+    parser.add_argument("--lanes", type=int, default=1, help="Queues running side by side, one per GPU")
+    parser.add_argument("--lane", type=int, default=0, help="This queue's lane, 0 to --lanes - 1; it trains on the lane-th visible GPU")
     return parser.parse_args(argv)
 
 
@@ -667,11 +741,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     available = discover_dataset_configs()
     if arguments.dataset not in available:
         sys.exit(f"Unknown dataset {arguments.dataset!r}. Available: {', '.join(sorted(available))}")
+    if not 0 <= arguments.lane < arguments.lanes:
+        sys.exit(f"--lane must be between 0 and {arguments.lanes - 1} for --lanes {arguments.lanes}.")
+    gpu = None
+    if arguments.lanes > 1 and not arguments.dry_run:
+        gpus = visible_gpus()
+        if len(gpus) < arguments.lanes:
+            sys.exit(f"--lanes {arguments.lanes} needs one GPU per lane; found {len(gpus)}.")
+        gpu = gpus[arguments.lane]
     tag = queue_tag(arguments.tag, arguments.epochs)
     backup_root = None if arguments.no_backup else arguments.backup_root
     if backup_root and not backup_root.parent.is_dir() and not arguments.dry_run:
         sys.exit(f"Backup folder parent {backup_root.parent} does not exist; pass --backup_root or --no_backup.")
-    paths = QueuePaths(tag, backup_root)
+    paths = QueuePaths(tag, backup_root, arguments.lane, arguments.lanes)
     selected_tiers = arguments.tiers or [tier.number for tier in build_tiers()] + [RERUN_TIER]
     items = build_queue(tag, arguments.seeds, [tier for tier in selected_tiers if tier != RERUN_TIER], arguments.dataset)
     rerun_candidates = build_queue(tag, arguments.seeds, dataset=arguments.dataset) if RERUN_TIER in selected_tiers else []
@@ -687,8 +769,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 sys.exit(f"{message} Log in with `wandb login`, or pass --skip_wandb_check to retrain them.")
             print(f"Warning: {message}", file=sys.stderr)
 
-    states = resolve_queue(items, paths, wandb_summaries, rerun_candidates)
-    launch = Launch(tag, time.time(), arguments.max_hours, arguments.epochs, git_description())
+    states = lane_states(resolve_queue(items, paths, wandb_summaries, rerun_candidates), arguments.lane, arguments.lanes)
+    launch = Launch(tag, time.time(), arguments.max_hours, arguments.epochs, git_description(), gpu=gpu)
 
     if arguments.dry_run:
         launch.state = "dry run (nothing started)"
@@ -700,11 +782,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
 
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
-    lock = paths.lock_file.open("w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        sys.exit(f"Another queue with tag {tag} is already running.")
+    locks = acquire_locks(paths)  # held until the process exits
     if paths.stop_file.exists():
         paths.stop_file.unlink()
         print("Removed a STOP file left from an earlier launch.")

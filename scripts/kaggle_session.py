@@ -10,7 +10,8 @@ version of the notebook in ``notebooks/kaggle_session.ipynb``) therefore:
    when it is attached as an input, so unfinished runs resume from their ``last.pt``;
 5. samples GPU utilization and CPU load into ``outputs/kaggle/usage.csv``;
 6. runs ``scripts.run_queue`` with the time left in the session, so the current run pauses
-   at an epoch boundary instead of being killed, then gathers the results.
+   at an epoch boundary instead of being killed, then gathers the results. With several
+   GPUs, one queue lane runs per GPU (``--lanes``, default: one per GPU), side by side.
 
 Everything under ``/kaggle/working/hybrid-qtn`` is kept as the version's output.
 
@@ -34,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from scripts.run_queue import DEFAULT_DATASET, DEFAULT_EPOCHS, queue_tag
+from scripts.run_queue import DEFAULT_DATASET, DEFAULT_EPOCHS, queue_tag, visible_gpus
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 KAGGLE_INPUT = Path("/kaggle/input")
@@ -77,6 +78,22 @@ def environment_report() -> str:
 def run(command: Sequence[str], **options) -> None:
     print("$ " + " ".join(command), flush=True)
     subprocess.run(command, cwd=REPO_ROOT, check=True, **options)
+
+
+def run_side_by_side(commands: Sequence[Sequence[str]], **options) -> None:
+    """Run ``commands`` at the same time and wait for all of them.
+
+    Raises:
+        subprocess.CalledProcessError: For the first command that failed, once all have ended.
+    """
+    processes = []
+    for command in commands:
+        print("$ " + " ".join(command), flush=True)
+        processes.append(subprocess.Popen(command, cwd=REPO_ROOT, **options))
+    return_codes = [process.wait() for process in processes]
+    for command, return_code in zip(commands, return_codes):
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
 
 
 def link_data_directory(repo: Path, scratch: Path) -> Path:
@@ -176,8 +193,10 @@ def queue_command(
     hours_left: float,
     wandb_logged_in: bool,
     wandb_entity: Optional[str] = None,
+    lane: int = 0,
+    lanes: int = 1,
 ) -> list[str]:
-    """The ``scripts.run_queue`` command of this session.
+    """The ``scripts.run_queue`` command of this session, for one lane of ``lanes``.
 
     ``wandb_entity`` (``WANDB_ENTITY``, which ``wandb.init`` also reads) makes the queue look
     up finished runs in the same W&B project the training logs to.
@@ -188,6 +207,8 @@ def queue_command(
         "--max_hours", f"{hours_left:.3f}", "--backup_root", str(REPO_ROOT / BACKUP_DIR),
         *queue_options,
     ]
+    if lanes > 1:
+        command += ["--lanes", str(lanes), "--lane", str(lane)]
     if not wandb_logged_in:
         command.append("--skip_wandb_check")
     elif wandb_entity:
@@ -201,6 +222,7 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Name
     parser.add_argument("--tag", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--max_hours", type=float, default=DEFAULT_MAX_HOURS, help="Budget of the whole session, set-up included")
+    parser.add_argument("--lanes", type=int, default=None, help="Queue lanes run side by side, one per GPU; default: one per visible GPU")
     parser.add_argument("--skip_install", action="store_true")
     parser.add_argument("--skip_download", action="store_true")
     return parser.parse_known_args(argv)
@@ -228,9 +250,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print("WANDB_API_KEY is not set: W&B logs offline and the queue skips its W&B check.", flush=True)
         environment["WANDB_MODE"] = "offline"
 
+    lanes = arguments.lanes or max(1, len(visible_gpus()))
     hours_left = arguments.max_hours - (time.monotonic() - session_started) / 3600
+    commands = [
+        queue_command(arguments, queue_options, hours_left, wandb_logged_in, os.environ.get("WANDB_ENTITY"), lane, lanes)
+        for lane in range(lanes)
+    ]
     with UsageMonitor(REPO_ROOT / USAGE_FILE):
-        run(queue_command(arguments, queue_options, hours_left, wandb_logged_in, os.environ.get("WANDB_ENTITY")), env=environment)
+        run_side_by_side(commands, env=environment)
 
     tag = queue_tag(arguments.tag, arguments.epochs)
     run([sys.executable, "-m", "scripts.collect_results", "--tag", tag, "--dataset", arguments.dataset,

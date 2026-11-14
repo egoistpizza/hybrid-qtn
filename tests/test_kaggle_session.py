@@ -1,4 +1,6 @@
 import csv
+import subprocess
+import sys
 
 import pytest
 
@@ -101,3 +103,23 @@ def test_usage_samples_are_appended_per_gpu(tmp_path):
     rows = list(csv.DictReader(path.open()))
     assert [(row["gpu"], row["utilization_pct"]) for row in rows] == [("0", "97"), ("1", "0")]
     assert all(row["cpu_load_1min"] and row["cpus"] for row in rows)
+
+
+def test_each_lane_gets_its_own_queue_command():
+    arguments, extra = parse_arguments(["--dataset", "duts", "--tag", "paper_v1"])
+    commands = [queue_command(arguments, extra, 10.0, wandb_logged_in=True, lane=lane, lanes=2) for lane in range(2)]
+    assert [command[command.index("--lane") + 1] for command in commands] == ["0", "1"]
+    assert all(command[command.index("--lanes") + 1] == "2" for command in commands)
+    assert "--lanes" not in queue_command(arguments, extra, 10.0, wandb_logged_in=True)
+
+
+def test_lanes_run_side_by_side_and_a_failed_one_is_reported_after_all_end(tmp_path):
+    finished = tmp_path / "finished"
+    fail = [sys.executable, "-c", "import sys; sys.exit(3)"]
+    slow = [sys.executable, "-c", f"import pathlib, time; time.sleep(0.5); pathlib.Path({str(finished)!r}).write_text('done')"]
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        kaggle_session.run_side_by_side([fail, slow])
+
+    assert error.value.returncode == 3
+    assert finished.read_text() == "done"

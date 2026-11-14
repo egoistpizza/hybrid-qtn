@@ -221,6 +221,12 @@ python -m scripts.run_queue --tag paper_v1 --dataset duts --tiers 1 --max_hours 
 - **Backup:** each finished run directory (weights, `config.json`, `history.jsonl`, `summary.json`, `queue_record.json`) is copied to `/workspace/hybrid-qtn/<tag>/checkpoints/<run>/`, and the status file and logs to `/workspace/hybrid-qtn/<tag>/queue/`. Change the location with `--backup_root`, or turn it off with `--no_backup`.
 - **Stopping:** `touch outputs/queue/<tag>/STOP` stops after the current run. Ctrl-C (or `kill <pid>`) stops the current run and saves its weights; a second Ctrl-C kills it. Relaunching skips finished runs and resumes unfinished ones from their last finished epoch (see 3.7.2).
 - **Time budget:** `--max_hours` counts from each launch. Each run gets the remaining budget as its own `--max_hours`; a run that would overrun it pauses at an epoch boundary (status `paused`), the queue stops, and the next launch resumes that run.
+- **Several GPUs:** `--lanes N --lane i` runs lane `i` of `N` queues side by side: it trains every `N`-th run of the queue from position `i`, on the `i`-th visible GPU, so lanes never share a run and a paused run is resumed by the same lane. Each lane has its own status file (`status_lane<i>.txt`); a queue with too few GPUs, or next to a single-lane queue of the same tag, refuses to start.
+
+  ```bash
+  python -m scripts.run_queue --tag paper_v1 --dataset duts --tiers 1 --seeds 42 --lanes 2 --lane 0 &
+  python -m scripts.run_queue --tag paper_v1 --dataset duts --tiers 1 --seeds 42 --lanes 2 --lane 1
+  ```
 
 `train.py` mirrors every run into its checkpoint directory as `config.json`, `history.jsonl` (every logged step) and `summary.json` (test metrics), so results don't depend on W&B.
 
@@ -246,7 +252,7 @@ python train.py --model hybrid --dataset kvasir_seg --seed 42 --tag paper_v1 --r
 
 #### 3.7.3 Kaggle sessions
 
-`notebooks/kaggle_session.ipynb` runs one session of a queue on Kaggle through `scripts/kaggle_session.py`. It installs `requirements-kaggle.txt` on top of Kaggle's preinstalled torch, downloads the dataset to `/tmp`, copies `checkpoints/`, `outputs/` and `backup/` from the previous version's output when it is attached as an input, records GPU utilization and CPU load in `outputs/kaggle/usage.csv`, and runs the queue with the time left of an 11-hour session budget (`--max_hours`). Start each session with *Save & Run All*; to continue, attach the latest version's output and run it again. The notebook's first cell lists the steps.
+`notebooks/kaggle_session.ipynb` runs one session of a queue on Kaggle through `scripts/kaggle_session.py`. It installs `requirements-kaggle.txt` on top of Kaggle's preinstalled torch, downloads the dataset to `/tmp`, copies `checkpoints/`, `outputs/` and `backup/` from the previous version's output when it is attached as an input, records GPU utilization and CPU load in `outputs/kaggle/usage.csv`, and runs the queue with the time left of an 11-hour session budget (`--max_hours`), one lane per GPU (both T4s of a Kaggle session; `--lanes 1` to use one). Start each session with *Save & Run All*; to continue, attach the latest version's output and run it again. The notebook's first cell lists the steps.
 
 Kaggle's torch may differ from `requirements.txt`; `collect_results` records the environment of every result, and the runs compared with each other should come from the same environment and GPU type.
 

@@ -164,6 +164,7 @@ FAKE_TRAIN = textwrap.dedent(
     if "--resume" in sys.argv and (run_dir / "last.pt").exists():
         print("Resuming after epoch 1", flush=True)
     print("Epoch 1/1 [Train]", flush=True)
+    print("GPU", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
     if os.environ["FAKE_OUTCOME"] == "fail":
         sys.exit(3)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -242,3 +243,78 @@ def test_the_queue_stops_after_a_paused_run(tmp_path, monkeypatch):
 
     assert started == [states[0].item.run_name]
     assert launch.state.startswith("paused")
+
+
+def test_lanes_split_the_queue_without_overlap(repo, tmp_path):
+    states = resolve_queue(build_queue("t", tiers=[1]), QueuePaths("t", None), {})
+    lanes = [run_queue.lane_states(states, lane, 2) for lane in range(2)]
+
+    names = [[state.item.run_name for state in lane] for lane in lanes]
+    assert sorted(names[0] + names[1]) == sorted(state.item.run_name for state in states)
+    assert not set(names[0]) & set(names[1])
+    # The same lane gets the same runs in every session, so it resumes the runs it paused.
+    again = resolve_queue(build_queue("t", tiers=[1]), QueuePaths("t", None), {})
+    assert [state.item.run_name for state in run_queue.lane_states(again, 1, 2)] == names[1]
+    assert run_queue.lane_states(states, 0, 1) == states
+
+
+def test_each_lane_has_its_own_status_file_but_shares_logs_and_stop(repo):
+    single, first, second = QueuePaths("t", None), QueuePaths("t", None, 0, 2), QueuePaths("t", None, 1, 2)
+    assert single.status_file.name == "status.txt"
+    assert len({single.status_file, first.status_file, second.status_file}) == 3
+    assert first.lane_lock_file != second.lane_lock_file
+    assert first.logs_dir == second.logs_dir and first.stop_file == second.stop_file
+
+
+def test_lanes_run_together_but_never_beside_a_single_lane_queue(repo):
+    first, second, single = QueuePaths("t", None, 0, 2), QueuePaths("t", None, 1, 2), QueuePaths("t", None)
+    first.queue_dir.mkdir(parents=True)
+
+    held = run_queue.acquire_locks(first) + run_queue.acquire_locks(second)
+    with pytest.raises(SystemExit, match="lane 0"):
+        run_queue.acquire_locks(first)
+    with pytest.raises(SystemExit, match="already running"):
+        run_queue.acquire_locks(single)
+
+    for lock in held:
+        lock.close()
+    held = run_queue.acquire_locks(single)
+    with pytest.raises(SystemExit, match="already running"):
+        run_queue.acquire_locks(second)
+
+
+def test_a_lane_trains_on_its_own_gpu(repo, tmp_path, monkeypatch):
+    (repo / "train.py").write_text(FAKE_TRAIN)
+    paths = QueuePaths("t", None, 1, 2)
+    paths.logs_dir.mkdir(parents=True)
+    item = build_queue("t", seeds=[42], tiers=[1])[1]
+    monkeypatch.setenv("FAKE_OUTCOME", "success")
+    monkeypatch.setenv("FAKE_RUN_DIR", str(paths.local_run_dir(item)))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    state = RunState(item)
+
+    assert run_queue.run_one(state, Launch("t", 0.0, None, 1, "main @ abc", gpu="1"), [state], paths)
+    assert "GPU 1\n" in paths.log_file(item).read_text()
+
+
+def test_the_lane_gpu_comes_from_the_visible_devices(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2, 3")
+    assert run_queue.visible_gpus() == ["2", "3"]
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [(["--lanes", "2", "--lane", "2"], "--lane must be between 0 and 1"), (["--lanes", "2", "--lane", "1"], "needs one GPU per lane; found 1")],
+)
+def test_lanes_that_cannot_run_stop_before_anything_starts(monkeypatch, options, message):
+    monkeypatch.setattr(run_queue, "visible_gpus", lambda: ["0"])
+    with pytest.raises(SystemExit, match=message):
+        run_queue.main(["--tag", "t", "--skip_wandb_check", "--no_backup", *options])
+
+
+def test_a_lane_dry_run_lists_only_its_runs(capsys):
+    run_queue.main(["--tag", "t", "--dataset", "duts", "--tiers", "1", "--seeds", "42", "--lanes", "2", "--lane", "1", "--dry_run", "--skip_wandb_check"])
+    output = capsys.readouterr().out
+    assert "duts__hybrid_unet_b32_rel_nope__focal_tversky__seed42__t" in output
+    assert "duts__vanilla_unet" not in output
+    assert "lane 1 of 2" in output
