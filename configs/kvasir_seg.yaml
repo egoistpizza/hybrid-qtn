@@ -1,6 +1,6 @@
 # Kvasir-SEG dataset config
 #
-# Layout expected after running `python scripts/download_kvasir_seg.py`:
+# Layout expected after running `python -m scripts.download_kvasir_seg`:
 #   data/kvasir-seg/Kvasir-SEG/images/*.jpg
 #   data/kvasir-seg/Kvasir-SEG/masks/*.jpg
 
@@ -19,9 +19,7 @@ strict_pairing: true
 # become foreground (1.0), the rest background (0.0).
 mask_threshold: 127
 
-# Albumentations pipeline. Applied jointly to image and mask.
-# Order matters. ToTensorV2 must be last.
-transforms:
+train_transforms:
   - name: Resize
     height: 512
     width: 512
@@ -29,6 +27,16 @@ transforms:
     p: 0.5
   - name: VerticalFlip
     p: 0.5
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+eval_transforms:
+  - name: Resize
+    height: 512
+    width: 512
   - name: Normalize
     mean: [0.485, 0.456, 0.406]
     std:  [0.229, 0.224, 0.225]

@@ -1,0 +1,17 @@
+.*
+*.md
+!README.md
+context
+paper
+venv
+data
+checkpoints
+outputs
+wandb
+cache
+**/__pycache__
+**/*.pyc
+*.pth
+*.onnx
+augmentation_preview*.png
+Dockerfile

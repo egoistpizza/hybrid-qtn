@@ -1,84 +1,59 @@
+"""ONNX export of a segmentation model and a PyTorch vs ONNX Runtime throughput benchmark."""
+
 import argparse
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import onnxruntime as ort
 import torch
 
+from models.factory import MODEL_TYPES, build_segmentation_model
+from models.variant import MPSVariant
 from utils import get_device
+from utils.run_naming import architecture_name
 
 
-def build_export_model(model_type: str, bond_dim: int) -> torch.nn.Module:
-    if model_type == "deep_hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_512 = MPSBottleneck(in_channels=512, bond_dim=bond_dim, height=64, width=64)
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=mps_512, transform_1024=mps_1024)
-        
-    if model_type == "hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=None, transform_1024=mps_1024)
-        
-    from models.unet_classic import UNet
-    return UNet(in_channels=3, out_channels=1)
+def measure_throughput(
+    run_once: Callable[[], object], iterations: int, warmup: int = 10, synchronize: Callable[[], None] = lambda: None
+) -> float:
+    """Calls of ``run_once`` per second over ``iterations`` timed calls, after ``warmup`` untimed ones.
+
+    ``synchronize`` waits for queued asynchronous work, so the timer brackets completed calls.
+    """
+    for _ in range(warmup):
+        run_once()
+    synchronize()
+    start = time.perf_counter()
+    for _ in range(iterations):
+        run_once()
+    synchronize()
+    return iterations / (time.perf_counter() - start)
+
 
 def benchmark_pytorch_throughput(model: torch.nn.Module, dummy_input: torch.Tensor, total_iterations: int = 100) -> float:
+    """Forward passes per second in PyTorch."""
     model.eval()
-    compute_device = dummy_input.device
-    
+    device = dummy_input.device
+    synchronize = (lambda: torch.cuda.synchronize(device)) if device.type == "cuda" else (lambda: None)
     with torch.inference_mode():
-        for _ in range(10):
-            _ = model(dummy_input)
-            
-        if compute_device.type == "cuda":
-            torch.cuda.synchronize(compute_device)
-            
-        start_timestamp = time.perf_counter()
-        
-        for _ in range(total_iterations):
-            _ = model(dummy_input)
-            
-        if compute_device.type == "cuda":
-            torch.cuda.synchronize(compute_device)
-            
-        end_timestamp = time.perf_counter()
-        
-    total_execution_time = end_timestamp - start_timestamp
-    frames_per_second = total_iterations / total_execution_time
-    
-    return frames_per_second
+        return measure_throughput(lambda: model(dummy_input), total_iterations, synchronize=synchronize)
+
 
 def benchmark_onnx_throughput(onnx_file_path: Path, numpy_dummy_input: np.ndarray, total_iterations: int = 100) -> float:
+    """Forward passes per second in ONNX Runtime, on CUDA if available."""
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    execution_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    inference_session = ort.InferenceSession(str(onnx_file_path), sess_options=session_options, providers=execution_providers)
-    
-    input_tensor_name = inference_session.get_inputs()[0].name
-    
-    for _ in range(10):
-        _ = inference_session.run(None, {input_tensor_name: numpy_dummy_input})
-        
-    start_timestamp = time.perf_counter()
-    
-    for _ in range(total_iterations):
-        _ = inference_session.run(None, {input_tensor_name: numpy_dummy_input})
-        
-    end_timestamp = time.perf_counter()
-    
-    total_execution_time = end_timestamp - start_timestamp
-    frames_per_second = total_iterations / total_execution_time
-    
-    return frames_per_second
+    session = ort.InferenceSession(
+        str(onnx_file_path), sess_options=session_options, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    feed = {session.get_inputs()[0].name: numpy_dummy_input}
+    return measure_throughput(lambda: session.run(None, feed), total_iterations)
+
 
 def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, output_file_path: Path) -> None:
+    """Export with opset 18 and a dynamic batch dimension; the spatial size stays fixed."""
     model.eval()
     
     torch.onnx.export(
@@ -97,10 +72,16 @@ def export_model_to_onnx(model: torch.nn.Module, dummy_input: torch.Tensor, outp
     )
 
 
+def export_filename(model_type: str, bond_dim: int, variant: MPSVariant, image_size: int) -> str:
+    """ONNX file name: the architecture part of the run name plus the input size."""
+    return f"{architecture_name(model_type, bond_dim, variant)}_s{image_size}.onnx"
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="hybrid", choices=["vanilla", "hybrid", "deep_hybrid"])
+    parser.add_argument("--model", type=str, default="hybrid", choices=MODEL_TYPES)
     parser.add_argument("--bond_dim", type=int, default=32)
+    MPSVariant.add_arguments(parser)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--iterations", type=int, default=100)
@@ -114,10 +95,11 @@ def main() -> None:
     output_directory = Path(args.output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     
-    onnx_filename = f"{args.model}_b{args.bond_dim}_s{args.image_size}.onnx"
+    variant = MPSVariant.from_arguments(args)
+    onnx_filename = export_filename(args.model, args.bond_dim, variant, args.image_size)
     onnx_file_path = output_directory / onnx_filename
     
-    model = build_export_model(args.model, args.bond_dim).to(compute_device)
+    model = build_segmentation_model(args.model, args.bond_dim, args.image_size, variant).to(compute_device)
     model = model.to(memory_format=torch.channels_last)
     
     dummy_input_tensor = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=compute_device)
