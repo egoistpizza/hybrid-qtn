@@ -6,9 +6,9 @@ from models.variant import MPSVariant
 
 
 def architecture_name(model_type: str, bond_dim: int, variant: MPSVariant = MPSVariant()) -> str:
-    """``vanilla_unet``, or ``<model_type>_unet_b<bond_dim>`` followed by :attr:`MPSVariant.name_suffix`."""
-    if model_type == "vanilla":
-        return "vanilla_unet"
+    """``vanilla_unet``, ``slim_vanilla_unet``, or ``<model_type>_unet_b<bond_dim>`` followed by :attr:`MPSVariant.name_suffix`."""
+    if model_type in ("vanilla", "slim_vanilla"):
+        return f"{model_type}_unet"
     return f"{model_type}_unet_b{bond_dim}{variant.name_suffix}"
 
 

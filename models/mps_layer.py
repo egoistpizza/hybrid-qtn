@@ -12,6 +12,7 @@ COLUMN_EQUATION = "bdjw,dwke->bejk"
 AXIAL_OPERATOR_RANK = 64
 BYPASS_TT_RANK = 32
 PROJECTION_KERNEL_SIZE = 3
+ATTENTION_HEADS = 4
 
 
 class SeparablePositionalEncoding2D(nn.Module):
@@ -31,11 +32,42 @@ class SeparablePositionalEncoding2D(nn.Module):
         return x + self.row_embedding + self.column_embedding
 
 
+class TokenSelfAttention(nn.Module):
+    """Pre-norm multi-head self-attention over every position of a feature map, with a residual.
+
+    Position enters through a learned separable positional encoding, because attention itself
+    is permutation-invariant. Used as the attention control of the bottleneck mixer.
+    """
+
+    def __init__(self, channels: int, height: int, width: int, heads: int = ATTENTION_HEADS):
+        super().__init__()
+        if channels % heads:
+            raise ValueError(f"channels ({channels}) must be divisible by heads ({heads})")
+        self.heads = heads
+        self.positional_encoding = SeparablePositionalEncoding2D(channels, height, width)
+        self.norm = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, 3 * channels)
+        self.out = nn.Linear(channels, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = x.shape
+        tokens = self.positional_encoding(x).flatten(2).transpose(1, 2)
+        query, key, value = (
+            part.reshape(batch, height * width, self.heads, channels // self.heads).transpose(1, 2)
+            for part in self.qkv(self.norm(tokens)).chunk(3, dim=-1)
+        )
+        attended = F.scaled_dot_product_attention(query, key, value).transpose(1, 2).reshape(batch, height * width, channels)
+        tokens = tokens + self.out(attended)
+        return tokens.transpose(1, 2).reshape(batch, channels, height, width)
+
+
 class AxialMPSLayer(nn.Module):
     """Global context mixing along the height axis, then along the width axis.
 
     The input is projected from ``in_channels`` to ``bond_dim`` latent channels, mixed by a
-    row operator and a column operator with a GELU in between, and projected back.
+    row operator and a column operator with a GELU in between, and projected back. The
+    ``attention`` and ``none`` mixers of :class:`MPSVariant` replace the two operators by
+    self-attention or by a GELU alone, keeping the projections.
 
     Args:
         in_channels: Channels of the incoming feature map.
@@ -43,7 +75,7 @@ class AxialMPSLayer(nn.Module):
         height: Feature-map height; fixes the size of the row operator.
         width: Feature-map width; fixes the size of the column operator.
         operator_rank: Bond dimension (chi) of the axial operators.
-        variant: Axial operator type, positional encoding and boundary.
+        variant: Mixer, axial operator type, positional encoding and boundary.
     """
 
     def __init__(
@@ -57,6 +89,7 @@ class AxialMPSLayer(nn.Module):
     ):
         super().__init__()
         operator = variant.operator_class
+        self.mixer = variant.mixer
         self.positional_encoding = (
             SeparablePositionalEncoding2D(in_channels, height, width) if variant.positional_encoding else None
         )
@@ -64,8 +97,11 @@ class AxialMPSLayer(nn.Module):
         self.in_proj = nn.Conv2d(
             in_channels, bond_dim, PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2, padding_mode=padding_mode
         )
-        self.row_operator = operator(bond_dim, height, operator_rank)
-        self.column_operator = operator(bond_dim, width, operator_rank)
+        if self.mixer == "axial":
+            self.row_operator = operator(bond_dim, height, operator_rank)
+            self.column_operator = operator(bond_dim, width, operator_rank)
+        elif self.mixer == "attention":
+            self.attention = TokenSelfAttention(bond_dim, height, width)
         self.out_proj = nn.Conv2d(
             bond_dim, in_channels, PROJECTION_KERNEL_SIZE, padding=PROJECTION_KERNEL_SIZE // 2, padding_mode=padding_mode
         )
@@ -75,6 +111,10 @@ class AxialMPSLayer(nn.Module):
         if self.positional_encoding is not None:
             x = self.positional_encoding(x)
         projected = self.in_proj(x)
+        if self.mixer == "attention":
+            return self.out_proj(F.gelu(self.attention(projected)))
+        if self.mixer == "none":
+            return self.out_proj(F.gelu(projected))
         row_mixed = F.gelu(self.row_operator.mix(projected, ROW_EQUATION, axis=2))
         column_mixed = self.column_operator.mix(row_mixed, COLUMN_EQUATION, axis=3)
         return self.out_proj(column_mixed)

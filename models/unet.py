@@ -34,17 +34,20 @@ class DoubleConv(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Decoder stage: bilinear 2x upsampling and a 1x1 channel reduction, then concatenation
-    with the encoder skip features and a :class:`DoubleConv`.
+    """Decoder stage: bilinear 2x upsampling and a 1x1 convolution to the skip width, then
+    concatenation with the encoder skip features and a :class:`DoubleConv`.
+
+    ``skip_channels`` defaults to ``in_channels // 2``, the standard U-Net widths.
     """
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, skip_channels: Optional[int] = None):
         super().__init__()
+        skip_channels = in_channels // 2 if skip_channels is None else skip_channels
         self.up = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
-            nn.Conv2d(in_channels, in_channels // 2, kernel_size=1),
+            nn.Conv2d(in_channels, skip_channels, kernel_size=1),
         )
-        self.conv = DoubleConv(in_channels, out_channels)
+        self.conv = DoubleConv(2 * skip_channels, out_channels)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """Upsample ``x1`` and fuse it with the skip connection ``x2``."""
@@ -78,6 +81,8 @@ class UNet(nn.Module):
         out_channels: Output logit channels.
         transform_512: Module applied to the 512-channel features, or ``None``.
         transform_1024: Module applied to the 1024-channel bottleneck features, or ``None``.
+        bottleneck_channels: Width of the deepest stage; 1024 in the standard U-Net. A
+            narrower stage gives the parameter-matched dense control; it takes no transform.
         entry_rank: Maximum bond rank of the tensorized entry convolutions.
         checkpoint_transforms: Recompute the transforms in the backward pass during
             training, trading compute for activation memory.
@@ -89,10 +94,13 @@ class UNet(nn.Module):
         out_channels: int = 1,
         transform_512: Optional[nn.Module] = None,
         transform_1024: Optional[nn.Module] = None,
+        bottleneck_channels: int = 1024,
         entry_rank: int = ENTRY_TT_RANK,
         checkpoint_transforms: bool = True,
     ):
         super().__init__()
+        if transform_1024 is not None and bottleneck_channels != 1024:
+            raise ValueError("A bottleneck transform needs the standard 1024-channel stage")
         self.checkpoint_transforms = checkpoint_transforms
         self.transform_512 = transform_512
         self.transform_1024 = transform_1024
@@ -101,9 +109,9 @@ class UNet(nn.Module):
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
         self.down3 = encoder_stage(256, 512, transform_512 is not None, entry_rank)
-        self.down4 = encoder_stage(512, 1024, transform_1024 is not None, entry_rank)
+        self.down4 = encoder_stage(512, bottleneck_channels, transform_1024 is not None, entry_rank)
 
-        self.up1 = UpBlock(1024, 512)
+        self.up1 = UpBlock(bottleneck_channels, 512, skip_channels=512)
         self.up2 = UpBlock(512, 256)
         self.up3 = UpBlock(256, 128)
         self.up4 = UpBlock(128, 64)

@@ -101,6 +101,9 @@ def axial_operator_component(axis: str, bond_dim: int, spatial_size: int, axial_
     """Absolute operator: 2→2 sites over channel and position bits. Relative and circular
     operators: 2→2 channel sites interleaved with 2→1 sites over the bits of the offsets
     (``2 * spatial_size`` relative offsets, ``spatial_size`` circular ones)."""
+    if axial_operator == "toeplitz_dense":
+        offsets = 2 * spatial_size - 1
+        return ParameterComponent(f"{axis} dense Toeplitz kernel", f"{bond_dim}·{offsets}·{bond_dim}", bond_dim * offsets * bond_dim)
     offset_slots = {"relative": 2 * spatial_size, "circular": spatial_size}
     if axial_operator in offset_slots:
         roles = interleaved_site_roles(binary_digits(offset_slots[axial_operator]), binary_digits(bond_dim))
@@ -109,6 +112,23 @@ def axial_operator_component(axis: str, bond_dim: int, spatial_size: int, axial_
         return tensor_train_component(f"{axis} {structure} MPO chain", (2,) * len(roles), output_modes, AXIAL_OPERATOR_RANK)
     site_count = binary_digits(bond_dim) + binary_digits(spatial_size)
     return tensor_train_component(f"{axis} MPO chain", (2,) * site_count, (2,) * site_count, AXIAL_OPERATOR_RANK)
+
+
+def mixer_components(bond_dim: int, spatial_size: int, variant: MPSVariant) -> tuple[ParameterComponent, ...]:
+    """Parameters between the block's projections: two axial operators, self-attention or nothing."""
+    if variant.mixer == "none":
+        return ()
+    if variant.mixer == "attention":
+        return (
+            ParameterComponent("Attention positional encoding", f"{bond_dim}·({spatial_size} + {spatial_size})", 2 * bond_dim * spatial_size),
+            ParameterComponent("Attention LayerNorm", f"2·{bond_dim}", 2 * bond_dim),
+            ParameterComponent("Attention QKV projection", f"{bond_dim}·3·{bond_dim} + 3·{bond_dim}", 3 * bond_dim * (bond_dim + 1)),
+            ParameterComponent("Attention output projection", f"{bond_dim}·{bond_dim} + {bond_dim}", bond_dim * (bond_dim + 1)),
+        )
+    return (
+        axial_operator_component("Row", bond_dim, spatial_size, variant.axial_operator),
+        axial_operator_component("Column", bond_dim, spatial_size, variant.axial_operator),
+    )
 
 
 def axial_mps_bottleneck_profile(
@@ -140,8 +160,7 @@ def axial_mps_bottleneck_profile(
             batchnorm_component("BatchNorm pre-MPS", channels),
             *encoding,
             conv3x3_component("Conv3×3 in_proj (C→D)", channels, bond_dim, bias=True),
-            axial_operator_component("Row", bond_dim, spatial_size, variant.axial_operator),
-            axial_operator_component("Column", bond_dim, spatial_size, variant.axial_operator),
+            *mixer_components(bond_dim, spatial_size, variant),
             conv3x3_component("Conv3×3 out_proj (D→C)", bond_dim, channels, bias=True),
             tensor_train_component(
                 f"TT-Conv1×1 bypass (R={BYPASS_TT_RANK})",

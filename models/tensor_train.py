@@ -351,6 +351,36 @@ class CircularAxialOperator(RelativeAxialOperator):
         return (positions[None, :] - positions[:, None]) % spatial_size
 
 
+class DenseToeplitzAxialOperator(AxialOperator):
+    """:class:`RelativeAxialOperator` with a plain kernel instead of a tensor train.
+
+    ``W[c, h, j, d] = K[c, d, j - h]`` with zero edges, where ``K`` holds one free weight per
+    channel pair and offset (``bond_dim**2 * (2 * spatial_size - 1)`` parameters). Kept as the
+    control that separates the Toeplitz structure from its tensor-train parameterization.
+
+    Args:
+        bond_dim: Latent channel width.
+        spatial_size: Length of the mixed axis.
+        max_rank: Unused; accepted so that every axial operator shares one constructor.
+    """
+
+    def __init__(self, bond_dim: int, spatial_size: int, max_rank: int):
+        super().__init__()
+        self.bond_dim = bond_dim
+        self.spatial_size = spatial_size
+        self.weight = nn.Parameter(torch.randn(bond_dim, 2 * spatial_size - 1, bond_dim) / math.sqrt(bond_dim * spatial_size))
+        positions = torch.arange(spatial_size)
+        self.register_buffer("offset_index", positions[None, :] - positions[:, None] + spatial_size - 1, persistent=False)
+
+    def kernel(self) -> torch.Tensor:
+        """Kernel of shape ``(in_channel, 2 * spatial_size - 1, out_channel)``; slot ``k`` holds offset ``k - spatial_size + 1``."""
+        return self.weight
+
+    def materialize(self) -> torch.Tensor:
+        """Dense operator of shape ``(in_channel, in_position, out_position, out_channel)``."""
+        return self.weight[:, self.offset_index, :]
+
+
 class MeanBoundaryAxialOperator(RelativeAxialOperator):
     """:class:`RelativeAxialOperator` whose positions beyond the edge take the mean of the input along the axis.
 

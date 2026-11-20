@@ -1,4 +1,4 @@
-"""Design choices of the MPS block: axial operator, positional encoding and boundary.
+"""Design choices of the MPS block: mixer, axial operator, positional encoding and boundary.
 
 Each choice is one table entry holding everything it implies (operator class, run-name suffix,
 padding, command-line help), so adding or reading a variant is a local change.
@@ -12,6 +12,7 @@ from models.tensor_train import (
     AbsoluteAxialOperator,
     AxialOperator,
     CircularAxialOperator,
+    DenseToeplitzAxialOperator,
     MeanBoundaryAxialOperator,
     RelativeAxialOperator,
 )
@@ -19,6 +20,11 @@ from models.tensor_train import (
 
 class OperatorChoice(NamedTuple):
     operator_class: type[AxialOperator]
+    name_suffix: str
+    help: str
+
+
+class MixerChoice(NamedTuple):
     name_suffix: str
     help: str
 
@@ -36,6 +42,17 @@ AXIAL_OPERATORS = {
     "circular": OperatorChoice(
         CircularAxialOperator, "_circ", "the offset wraps around the axis (reproduces a reported ablation)"
     ),
+    "toeplitz_dense": OperatorChoice(
+        DenseToeplitzAxialOperator, "_tdense", "relative weights as a plain kernel, without the tensor train (control)"
+    ),
+}
+
+# The mixer between the block's projections; the axial path is the model of the paper, the
+# others are controls with the rest of the block unchanged.
+MIXERS = {
+    "axial": MixerChoice("", "row and column axial operators (default)"),
+    "attention": MixerChoice("_attn", "multi-head self-attention over all bottleneck positions (control)"),
+    "none": MixerChoice("_nomix", "no spatial mixing between the projections (control)"),
 }
 
 # Zero padding would turn a uniform input into a border ring that the axis-wide operators spread,
@@ -61,11 +78,14 @@ class MPSVariant:
         positional_encoding: Whether a learned positional encoding is added to the block input.
         boundary: Key of :data:`AXIAL_BOUNDARIES`; ``zero`` by default. ``mean`` needs the
             relative operator.
+        mixer: Key of :data:`MIXERS`; ``axial`` by default. The other mixers take the default
+            operator and boundary and no block-input positional encoding.
     """
 
     axial_operator: str = "relative"
     positional_encoding: bool = False
     boundary: str = "zero"
+    mixer: str = "axial"
 
     def __post_init__(self) -> None:
         if self.axial_operator not in AXIAL_OPERATORS:
@@ -76,6 +96,12 @@ class MPSVariant:
             raise ValueError(f"Unknown boundary {self.boundary!r}. Expected one of {tuple(AXIAL_BOUNDARIES)}.")
         if self.boundary != "zero" and self.axial_operator != "relative":
             raise ValueError(f"The {self.boundary} boundary needs the relative axial operator.")
+        if self.mixer not in MIXERS:
+            raise ValueError(f"Unknown mixer {self.mixer!r}. Expected one of {tuple(MIXERS)}.")
+        if self.mixer != "axial" and (
+            self.axial_operator != "relative" or self.boundary != "zero" or self.positional_encoding
+        ):
+            raise ValueError(f"The {self.mixer} mixer takes no axial operator, boundary or positional encoding options.")
 
     @property
     def operator_class(self) -> type[AxialOperator]:
@@ -93,6 +119,8 @@ class MPSVariant:
 
         It describes the settings, not the defaults, so names stay comparable across versions.
         """
+        if self.mixer != "axial":
+            return MIXERS[self.mixer].name_suffix
         return (
             AXIAL_OPERATORS[self.axial_operator].name_suffix
             + AXIAL_BOUNDARIES[self.boundary].name_suffix
@@ -101,13 +129,15 @@ class MPSVariant:
 
     @property
     def description(self) -> str:
+        if self.mixer != "axial":
+            return f"{self.mixer} mixer"
         boundary = f", {self.boundary} boundary" if self.axial_operator == "relative" else ""
         encoding = "with" if self.positional_encoding else "no"
         return f"{self.axial_operator} operators{boundary}, {encoding} positional encoding"
 
     @staticmethod
     def add_arguments(parser: argparse.ArgumentParser) -> None:
-        """Add ``--axial_operator``, ``--positional_encoding`` and ``--axial_boundary``, defaulting to :class:`MPSVariant`."""
+        """Add ``--axial_operator``, ``--positional_encoding``, ``--axial_boundary`` and ``--mixer``, defaulting to :class:`MPSVariant`."""
         default = MPSVariant()
         parser.add_argument(
             "--axial_operator",
@@ -127,8 +157,14 @@ class MPSVariant:
             default=default.boundary,
             help="; ".join(f"{name}: {choice.help}" for name, choice in AXIAL_BOUNDARIES.items()),
         )
+        parser.add_argument(
+            "--mixer",
+            choices=tuple(MIXERS),
+            default=default.mixer,
+            help="; ".join(f"{name}: {choice.help}" for name, choice in MIXERS.items()),
+        )
 
     @classmethod
     def from_arguments(cls, arguments: argparse.Namespace) -> "MPSVariant":
         """The variant selected by the options of :meth:`add_arguments`."""
-        return cls(arguments.axial_operator, arguments.positional_encoding, arguments.axial_boundary)
+        return cls(arguments.axial_operator, arguments.positional_encoding, arguments.axial_boundary, arguments.mixer)
