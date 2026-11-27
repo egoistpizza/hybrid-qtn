@@ -1,3 +1,12 @@
+# Massachusetts Roads dataset config
+#
+# Layout expected after running `python -m scripts.download_mass_roads`:
+#   data/mass_roads/images/*.tiff
+#   data/mass_roads/masks/*.tif
+#
+# 1,171 aerial tiles of 1500x1500 pixels. Training uses random 512x512 crops;
+# validation and test use the deterministic centre crop.
+
 dataset_name: mass_roads
 
 images_dir: data/mass_roads/images
@@ -7,22 +16,6 @@ mask_ext:   .tif
 
 strict_pairing: true
 mask_threshold: 127
-
-transforms:
-  - name: PadIfNeeded
-    min_height: 512
-    min_width: 512
-    border_mode: 0
-    fill: 0
-    fill_mask: 0
-  - name: CenterCrop
-    height: 512
-    width: 512
-  - name: Normalize
-    mean: [0.485, 0.456, 0.406]
-    std:  [0.229, 0.224, 0.225]
-    max_pixel_value: 255.0
-  - name: ToTensorV2
 
 train_transforms:
   - name: PadIfNeeded
@@ -44,7 +37,7 @@ train_transforms:
     max_pixel_value: 255.0
   - name: ToTensorV2
 
-val_transforms:
+eval_transforms:
   - name: PadIfNeeded
     min_height: 512
     min_width: 512

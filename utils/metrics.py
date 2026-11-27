@@ -1,84 +1,104 @@
+"""Per-image segmentation metrics on binarized predictions at network resolution."""
+
 import numpy as np
 import torch
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
 
+METRIC_NAMES = ("dice", "iou", "mae", "f2", "hd95")
+PREDICTION_THRESHOLD = 0.5
+HD95_PERCENTILE = 95
+
+
+def binarize(logits: torch.Tensor) -> torch.Tensor:
+    """Foreground where the sigmoid probability exceeds ``PREDICTION_THRESHOLD``."""
+    return (torch.sigmoid(logits.float()) > PREDICTION_THRESHOLD).float()
+
+
 def calculate_mae(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return torch.abs(preds - targets).mean(dim=(1, 2, 3))
 
+
 def calculate_f2_score(preds: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
+    """F-beta score with beta = 2, weighting recall above precision."""
     tp = (preds * targets).sum(dim=(2, 3))
     fp = (preds * (1.0 - targets)).sum(dim=(2, 3))
     fn = ((1.0 - preds) * targets).sum(dim=(2, 3))
-    
     precision = (tp + smooth) / (tp + fp + smooth)
     recall = (tp + smooth) / (tp + fn + smooth)
-    
     return (5.0 * precision * recall) / (4.0 * precision + recall + smooth)
 
-def calculate_hd95(preds: torch.Tensor, targets: torch.Tensor) -> float:
-    preds_np = preds.detach().cpu().numpy()
-    targets_np = targets.detach().cpu().numpy()
-    batch_size = preds_np.shape[0]
-    hd95_scores = []
-    
-    struct = generate_binary_structure(2, 1)
 
-    for i in range(batch_size):
-        pred_mask = preds_np[i, 0].astype(bool)
-        target_mask = targets_np[i, 0].astype(bool)
+def _border(mask: np.ndarray, structure: np.ndarray) -> np.ndarray:
+    return mask ^ binary_erosion(mask, structure=structure)
 
-        if not np.any(pred_mask) and not np.any(target_mask):
+
+def hd95_per_image(preds: torch.Tensor, targets: torch.Tensor) -> list[float]:
+    """95th-percentile symmetric Hausdorff distance between mask borders, in pixels.
+
+    Images where both masks are empty are skipped; images where exactly one is empty
+    score the image diagonal, the largest possible distance.
+    """
+    preds_np = preds.detach().cpu().numpy().astype(bool)
+    targets_np = targets.detach().cpu().numpy().astype(bool)
+    structure = generate_binary_structure(2, 1)
+    scores: list[float] = []
+
+    for pred_mask, target_mask in zip(preds_np[:, 0], targets_np[:, 0]):
+        if not pred_mask.any() and not target_mask.any():
             continue
-            
-        if not np.any(pred_mask) or not np.any(target_mask):
-            max_dist = np.sqrt(pred_mask.shape[0]**2 + pred_mask.shape[1]**2)
-            hd95_scores.append(max_dist)
-            continue
-
-        pred_border = pred_mask ^ binary_erosion(pred_mask, structure=struct)
-        target_border = target_mask ^ binary_erosion(target_mask, structure=struct)
-        """
-        pred_edt = distance_transform_edt(~pred_mask)
-        target_edt = distance_transform_edt(~target_mask)
-
-        dist_1 = target_edt[pred_border]
-        dist_2 = pred_edt[target_border]
-        """
-        pred_border_edt = distance_transform_edt(~pred_border)
-        target_border_edt = distance_transform_edt(~target_border)
-
-        dist_1 = target_border_edt[pred_border]
-        dist_2 = pred_border_edt[target_border]
-
-        if dist_1.size == 0 or dist_2.size == 0:
+        if not pred_mask.any() or not target_mask.any():
+            scores.append(float(np.hypot(*pred_mask.shape)))
             continue
 
-        hd95_scores.append(np.maximum(np.percentile(dist_1, 95), np.percentile(dist_2, 95)))
+        pred_border = _border(pred_mask, structure)
+        target_border = _border(target_mask, structure)
+        pred_to_target = distance_transform_edt(~target_border)[pred_border]
+        target_to_pred = distance_transform_edt(~pred_border)[target_border]
 
-    return float(np.mean(hd95_scores)) if hd95_scores else 0.0
+        if pred_to_target.size == 0 or target_to_pred.size == 0:
+            continue
+        scores.append(
+            float(max(np.percentile(pred_to_target, HD95_PERCENTILE), np.percentile(target_to_pred, HD95_PERCENTILE)))
+        )
+    return scores
 
-def calculate_all_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5, compute_hd95: bool = False) -> dict:
-    probs = torch.sigmoid(logits)
-    preds = (probs > 0.5).float()
 
-    intersection = (preds * targets).sum(dim=(2, 3))
-    union = preds.sum(dim=(2, 3)) + targets.sum(dim=(2, 3))
-
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    iou = (intersection + smooth) / (union - intersection + smooth)
-    
-    mae = calculate_mae(preds, targets)
-    f2 = calculate_f2_score(preds, targets, smooth)
-
-    metrics = {
-        "dice": dice.mean().item(),
-        "iou": iou.mean().item(),
-        "mae": mae.mean().item(),
-        "f2": f2.mean().item(),
-        "hd95": 0.0
+def per_image_overlap_metrics(logits: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> dict[str, torch.Tensor]:
+    preds = binarize(logits)
+    intersection = (preds * targets).sum(dim=(1, 2, 3))
+    union = preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
+    return {
+        "dice": (2.0 * intersection + smooth) / (union + smooth),
+        "iou": (intersection + smooth) / (union - intersection + smooth),
+        "mae": calculate_mae(preds, targets),
+        "f2": calculate_f2_score(preds, targets, smooth).mean(dim=1),
     }
 
-    if compute_hd95:
-        metrics["hd95"] = calculate_hd95(preds, targets)
 
-    return metrics
+class MetricAccumulator:
+    """Running per-image averages of Dice, IoU, MAE, F2 and, optionally, HD95 over batches.
+
+    ``hd95`` is reported only with ``compute_hd95``; it is 0.0 when every image has both
+    masks empty.
+    """
+
+    def __init__(self, compute_hd95: bool = False) -> None:
+        self.compute_hd95 = compute_hd95
+        self._overlap_totals = {name: 0.0 for name in METRIC_NAMES if name != "hd95"}
+        self._hd95_scores: list[float] = []
+        self._image_count = 0
+
+    def update(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
+        for name, values in per_image_overlap_metrics(logits, targets).items():
+            self._overlap_totals[name] += values.sum().item()
+        self._image_count += logits.size(0)
+        if self.compute_hd95:
+            self._hd95_scores.extend(hd95_per_image(binarize(logits), targets))
+
+    def compute(self) -> dict[str, float]:
+        if self._image_count == 0:
+            raise ValueError("MetricAccumulator.compute() called before any update()")
+        metrics = {name: total / self._image_count for name, total in self._overlap_totals.items()}
+        if self.compute_hd95:
+            metrics["hd95"] = float(np.mean(self._hd95_scores)) if self._hd95_scores else 0.0
+        return metrics

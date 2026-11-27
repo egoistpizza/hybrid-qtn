@@ -1,4 +1,4 @@
-"""Image ↔ mask filename pairing."""
+"""Image and mask pairing by filename stem."""
 
 from __future__ import annotations
 
@@ -34,11 +34,15 @@ def pair_by_stem(
 ) -> list[tuple[str, str, str]]:
     """Pair image and mask files by filename stem.
 
-    Returns a deterministic, stem-sorted list of ``(image_path, mask_path, sample_id)``.
-    Matching is case-insensitive on the extension only; stems are matched as-is.
+    Extensions are matched case-insensitively; stems are matched exactly.
 
-    If ``strict_pairing`` is True (default), any orphan on either side raises
-    ``FileNotFoundError``. If False, orphans emit a warning and are skipped.
+    Returns:
+        ``(image_path, mask_path, sample_id)`` tuples sorted by stem.
+
+    Raises:
+        NotADirectoryError: If either directory is missing.
+        FileNotFoundError: If ``strict_pairing`` is set and a file has no partner.
+            Without ``strict_pairing`` unpaired files are skipped with a warning.
     """
     images_dir = Path(images_dir)
     masks_dir = Path(masks_dir)

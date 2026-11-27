@@ -1,6 +1,6 @@
 # CVC-ClinicDB dataset config
 #
-# Layout expected after running `python scripts/download_cvc_clinicdb.py`:
+# Layout expected after running `python -m scripts.download_cvc_clinicdb`:
 #   data/cvc-clinicdb/CVC-ClinicDB/Original/*.png
 #   data/cvc-clinicdb/CVC-ClinicDB/Ground Truth/*.png
 #
@@ -14,6 +14,10 @@ group_map:
   csv: configs/cvc_clinicdb_sequences.csv
   sample_column: sample_id
   group_column: sequence_id
+
+# Grouped K-fold cross-validation: `--fold k` (0 <= k < 5) tests on the sequences of fold k
+# and carves validation from the rest; without --fold the holdout split above is used.
+cross_validation_folds: 5
 
 dataset_name: cvc-clinicdb
 
@@ -32,9 +36,7 @@ strict_pairing: true
 # 0/255 with antialiased edges, so 127 binarizes cleanly.
 mask_threshold: 127
 
-# Albumentations pipeline. Applied jointly to image and mask.
-# Kept byte-identical to configs/kvasir_seg.yaml so the ablation is controlled.
-transforms:
+train_transforms:
   - name: Resize
     height: 512
     width: 512
@@ -42,6 +44,16 @@ transforms:
     p: 0.5
   - name: VerticalFlip
     p: 0.5
+  - name: Normalize
+    mean: [0.485, 0.456, 0.406]
+    std:  [0.229, 0.224, 0.225]
+    max_pixel_value: 255.0
+  - name: ToTensorV2
+
+eval_transforms:
+  - name: Resize
+    height: 512
+    width: 512
   - name: Normalize
     mean: [0.485, 0.456, 0.406]
     std:  [0.229, 0.224, 0.225]

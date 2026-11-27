@@ -1,198 +1,179 @@
+"""Evaluate a trained checkpoint on the validation split or on every test set of a dataset.
+
+Prints the per-image metrics of each set, renders qualitative panels and, with
+``--save_maps``, writes probability maps at ground-truth resolution.
+"""
+
 import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
-from dataset import (
-    build_train_val,
-    discover_dataset_configs,
-    parse_dataset_arg,
-    slugify_dataset_arg,
-)
-from utils.metrics import calculate_all_metrics
+from dataset import DatasetSplits, Denormalization, EvaluationSet, build_loader, build_splits
 from utils import get_device
+from utils.checkpoints import evaluation_checkpoint, load_weights
+from utils.evaluation import Batch, evaluate_model, metric_suites
+from utils.foreground_maps import full_resolution_maps
+from utils.metrics import MetricAccumulator, binarize
+from utils.run_spec import CHECKPOINT_ROOT, RunSpec
 
-IMAGE_MEAN = (0.485, 0.456, 0.406)
-IMAGE_STD = (0.229, 0.224, 0.225)
+TEST_SPLIT = "test"
+VALIDATION_SPLIT = "val"
+EVALUATION_SPLITS = (TEST_SPLIT, VALIDATION_SPLIT)
+EVALUATION_BATCH_SIZE = 4
+VISUALIZATION_SEED = 123
 
 
-def denormalize(tensor: torch.Tensor) -> np.ndarray:
-    device = tensor.device
-    mean = torch.tensor(IMAGE_MEAN, device=device).view(3, 1, 1)
-    std = torch.tensor(IMAGE_STD, device=device).view(3, 1, 1)
-    
-    tensor = tensor * std + mean
-    return torch.clamp(tensor, 0.0, 1.0).cpu().permute(1, 2, 0).numpy()
-
-def save_visualizations(
-    images: torch.Tensor, 
-    masks: torch.Tensor, 
-    logits: torch.Tensor, 
-    sample_ids: list[str], 
-    output_dir: Path, 
-    start_index: int = 0
+def save_panel(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    logits: torch.Tensor,
+    sample_id: str,
+    path: Path,
+    denormalization: Denormalization,
 ) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    preds = (torch.sigmoid(logits) > 0.5).float()
-    
-    for i in range(images.size(0)):
-        img_np = denormalize(images[i])
-        gt_np = masks[i].cpu().squeeze().numpy()
-        pred_np = preds[i].cpu().squeeze().numpy()
+    """Save an image / ground truth / prediction panel titled with the per-image metrics.
 
-        metrics = calculate_all_metrics(logits[i:i+1], masks[i:i+1], compute_hd95=True)
-        
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        axes[0].imshow(img_np)
-        axes[0].set_title(f"Original RGB\n({sample_ids[i]})")
-        axes[0].axis("off")
-        
-        axes[1].imshow(gt_np, cmap="gray")
-        axes[1].set_title("Ground Truth Mask")
-        axes[1].axis("off")
-        
-        axes[2].imshow(pred_np, cmap="gray")
-        axes[2].set_title(
+    Args:
+        image: Normalized ``(3, H, W)`` network input; ``denormalization`` restores it for display.
+        mask: ``(1, H, W)`` ground truth.
+        logits: ``(1, H, W)`` prediction logits.
+    """
+    accumulator = MetricAccumulator(compute_hd95=True)
+    accumulator.update(logits[None], mask[None])
+    metrics = accumulator.compute()
+    figure, axes = plt.subplots(1, 3, figsize=(16, 5))
+    panels = (
+        (denormalization(image), None, f"Original RGB\n({sample_id})"),
+        (mask.cpu().squeeze().numpy(), "gray", "Ground Truth Mask"),
+        (
+            binarize(logits).cpu().squeeze().numpy(),
+            "gray",
             f"Prediction | Dice: {metrics['dice']:.4f} | IoU: {metrics['iou']:.4f}\n"
-            f"HD95: {metrics['hd95']:.2f} | MAE: {metrics['mae']:.4f} | F2: {metrics['f2']:.4f}"
-        )
-        axes[2].axis("off")
-        
-        plt.tight_layout()
-        filename = f"viz_{start_index + i + 1:03d}_{sample_ids[i]}.png"
-        plt.savefig(output_dir / filename, bbox_inches="tight", dpi=300)
-        plt.close(fig)
+            f"HD95: {metrics['hd95']:.2f} | MAE: {metrics['mae']:.4f} | F2: {metrics['f2']:.4f}",
+        ),
+    )
+    for axis, (panel, colormap, title) in zip(axes, panels):
+        axis.imshow(panel, cmap=colormap)
+        axis.set_title(title)
+        axis.axis("off")
 
-def load_model_weights(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint required but not found at: {checkpoint_path}")
-        
-    print(f"Loading weights from: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    
-    clean_state_dict = {}
-    for key, value in state_dict.items():
-        if "n_averaged" in key:
-            continue
-            
-        clean_key = key.replace("_orig_mod.", "").replace("module.", "")
-        clean_state_dict[clean_key] = value
-        
-    model.load_state_dict(clean_state_dict)
-    print("Weights loaded successfully!")
+    plt.tight_layout()
+    plt.savefig(path, bbox_inches="tight", dpi=300)
+    plt.close(figure)
 
-def build_model(model_type: str, bond_dim: int) -> torch.nn.Module:
-    if model_type == "deep_hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_512 = MPSBottleneck(in_channels=512, bond_dim=bond_dim, height=64, width=64)
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=mps_512, transform_1024=mps_1024)
-        
-    if model_type == "hybrid":
-        from models.unet_hybrid import UNetDeepHybrid
-        from models.mps_layer import MPSBottleneck
-        
-        mps_1024 = MPSBottleneck(in_channels=1024, bond_dim=bond_dim, height=32, width=32)
-        return UNetDeepHybrid(in_channels=3, out_channels=1, transform_512=None, transform_1024=mps_1024)
-        
-    from models.unet_classic import UNet
-    return UNet(in_channels=3, out_channels=1)
+
+class PanelWriter:
+    """Saves a panel for every sample it sees, numbered in loader order."""
+
+    def __init__(self, output_dir: Path, denormalization: Denormalization) -> None:
+        self.output_dir = output_dir
+        self.denormalization = denormalization
+        self._rendered = 0
+
+    def update(self, logits: torch.Tensor, masks: torch.Tensor, batch: Batch) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        for index, sample_id in enumerate(batch["metadata"]["sample_id"]):
+            self._rendered += 1
+            path = self.output_dir / f"viz_{self._rendered:03d}_{sample_id}.png"
+            save_panel(batch["image"][index], masks[index], logits[index], sample_id, path, self.denormalization)
+
+    def compute(self) -> dict[str, float]:
+        return {}
+
+
+class ProbabilityMapWriter:
+    """Saves each sample's uint8 probability map at ground-truth resolution as ``<sample_id>.png``."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+
+    def update(self, logits: torch.Tensor, masks: torch.Tensor, batch: Batch) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        maps = full_resolution_maps(logits, batch["metadata"]["mask_path"])
+        for (prediction, _), sample_id in zip(maps, batch["metadata"]["sample_id"], strict=True):
+            Image.fromarray(prediction).save(self.output_dir / f"{sample_id}.png")
+
+    def compute(self) -> dict[str, float]:
+        return {}
+
 
 def parse_args() -> argparse.Namespace:
-    available_datasets = ", ".join(sorted(discover_dataset_configs())) or "(none)"
-    
-    parser = argparse.ArgumentParser(description="Evaluate Segmentation Models")
-    parser.add_argument("--model", type=str, default="vanilla", choices=["vanilla", "hybrid", "deep_hybrid"])
-    parser.add_argument("--bond_dim", type=int, default=32)
-    parser.add_argument("--tag", type=str, default=None)
-    parser.add_argument("--dataset", type=str, default="kvasir_seg", help=f"Available: {available_datasets}")
+    parser = argparse.ArgumentParser(description="Evaluate segmentation models")
+    RunSpec.add_arguments(parser)
+    parser.add_argument("--split", type=str, default="test", choices=EVALUATION_SPLITS)
     parser.add_argument("--num_samples", type=int, default=10, choices=range(5, 11))
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--run", type=str, default=None)
-    
+    parser.add_argument("--run", type=str, default=None, help="Checkpoint run name; overrides the derived name")
+    parser.add_argument("--save_maps", action="store_true", help="Save probability maps at ground-truth resolution")
     return parser.parse_args()
+
+
+def evaluation_sets(splits: DatasetSplits, split: str) -> dict[str, EvaluationSet]:
+    """Named datasets to evaluate: every test set, or the validation split."""
+    return dict(splits.test_sets) if split == TEST_SPLIT else {VALIDATION_SPLIT: splits.val}
+
+
+def evaluate_run(
+    spec: RunSpec,
+    splits: DatasetSplits,
+    device: torch.device,
+    split: str = TEST_SPLIT,
+    num_samples: int = 10,
+    output_dir: Path | None = None,
+    run_name: str | None = None,
+    save_maps: bool = False,
+) -> dict[str, dict[str, float]]:
+    """Evaluate the checkpoint of ``spec`` (or of ``run_name``) on every set of ``split``.
+
+    Writes qualitative panels to ``output_dir`` and, with ``save_maps``, probability maps;
+    returns the metrics of each evaluated set.
+    """
+    run_name = run_name or spec.run_name
+    model = spec.build_model(splits.image_size).to(device).to(memory_format=torch.channels_last)
+    checkpoint = evaluation_checkpoint(CHECKPOINT_ROOT / run_name)
+    print(f"Loading weights from: {checkpoint}")
+    load_weights(model, checkpoint, device)
+
+    output_dir = output_dir or Path("outputs") / "visualizations" / run_name
+    results = {}
+    for set_name, evaluation_set in evaluation_sets(splits, split).items():
+        dataset = evaluation_set.dataset
+        print(f"Dataset '{spec.dataset_slug}': {len(dataset)} {set_name} samples on {device}")
+        loader = build_loader(dataset, EVALUATION_BATCH_SIZE, shuffle=False, seed=spec.seed)
+        suites = metric_suites(compute_hd95=True, foreground_maps=evaluation_set.foreground_maps)
+        if save_maps:
+            suites.append(ProbabilityMapWriter(Path("outputs") / "prediction_maps" / run_name / set_name))
+        results[set_name] = evaluate_model(model, loader, device, suites, description=f"Evaluating {set_name}")
+        print(" | ".join(f"{set_name} {name}: {value:.4f}" for name, value in results[set_name].items()))
+
+        # Panels use a separate batch-size-1 pass: logits near the threshold depend on the batch size.
+        panel_positions = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(VISUALIZATION_SEED))
+        panel_loader = DataLoader(Subset(dataset, panel_positions[:num_samples].tolist()), batch_size=1, shuffle=False)
+        panel_writer = PanelWriter(output_dir / set_name, evaluation_set.denormalization)
+        evaluate_model(model, panel_loader, device, [panel_writer], description="Saving visualizations")
+    print(f"Visualizations saved to: {output_dir.absolute()}")
+    return results
+
 
 def main() -> None:
     args = parse_args()
-    device = get_device()
-    use_amp = device.type == "cuda"
-    
-    print(f"Evaluating on device: {device} | AMP Enabled: {use_amp}")
-
-    dataset_names = parse_dataset_arg(args.dataset)
-    dataset_slug = slugify_dataset_arg(dataset_names)
-
-    _, val_ds = build_train_val(dataset_names)
-    print(f"Dataset '{dataset_slug}': {len(val_ds)} validation samples")
-    
-    val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
-
-    viz_generator = torch.Generator().manual_seed(123)
-    viz_indices = torch.randperm(len(val_ds), generator=viz_generator)[:args.num_samples]
-    viz_subset = Subset(val_ds, viz_indices.tolist())
-    viz_loader = DataLoader(viz_subset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
-    
-    model = build_model(args.model, args.bond_dim)
-    model = model.to(device).to(memory_format=torch.channels_last)
-    
-    run_suffix = f"{args.model}_unet" if args.model == "vanilla" else f"{args.model}_unet_b{args.bond_dim}_ckpt"
-    run_name = args.run if args.run else f"{dataset_slug}__{run_suffix}"
-    if args.tag:
-        run_name = f"{run_name}__{args.tag}"
-        
-    checkpoint_dir = Path("checkpoints") / run_name
-    swa_checkpoint_path = checkpoint_dir / "best_swa_model.pth"
-    standard_checkpoint_path = checkpoint_dir / "best_model.pth"
-    
-    load_path = swa_checkpoint_path if swa_checkpoint_path.exists() else standard_checkpoint_path
-    load_model_weights(model, load_path, device)
-    
-    model.eval()
-    aggregated_metrics = {"dice": 0.0, "iou": 0.0, "mae": 0.0, "f2": 0.0, "hd95": 0.0}
-    
-    with torch.inference_mode():
-        for batch in tqdm(val_loader, desc="Evaluating"):
-            images = batch["image"].to(device, non_blocking=True, memory_format=torch.channels_last)
-            masks = batch["mask"].to(device, non_blocking=True)
-            
-            with torch.autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(images)
-            
-            batch_metrics = calculate_all_metrics(outputs, masks, compute_hd95=True)
-            for k in aggregated_metrics:
-                aggregated_metrics[k] += batch_metrics[k]
-            
-    for k in aggregated_metrics:
-        aggregated_metrics[k] /= len(val_loader)
-        
-    print(
-        f"Avg Dice: {aggregated_metrics['dice']:.4f} | Avg IoU: {aggregated_metrics['iou']:.4f} | "
-        f"Avg HD95: {aggregated_metrics['hd95']:.4f} | Avg MAE: {aggregated_metrics['mae']:.4f} | "
-        f"Avg F2: {aggregated_metrics['f2']:.4f}"
+    spec = RunSpec.from_arguments(args)
+    splits = build_splits(list(spec.datasets), fold=spec.fold)
+    evaluate_run(
+        spec,
+        splits,
+        get_device(),
+        split=args.split,
+        num_samples=args.num_samples,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+        run_name=args.run,
+        save_maps=args.save_maps,
     )
 
-    output_dir = Path(args.output_dir) if args.output_dir else Path("outputs") / "visualizations" / run_name
-    print(f"\nGenerating {args.num_samples} visualizations...")
-    
-    viz_count = 0
-    with torch.inference_mode():
-        for batch in tqdm(viz_loader, desc="Saving visualizations"):
-            images = batch["image"].to(device, non_blocking=True, memory_format=torch.channels_last)
-            masks = batch["mask"].to(device, non_blocking=True)
-            
-            with torch.autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(images)
-                
-            save_visualizations(images, masks, outputs, batch["metadata"]["sample_id"], output_dir, viz_count)
-            viz_count += images.size(0)
-            
-    print(f"Visualizations saved to: {output_dir.absolute()}")
 
 if __name__ == "__main__":
     main()

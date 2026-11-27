@@ -1,3 +1,5 @@
+"""Export the configuration, summary and full history of a W&B run to JSON."""
+
 import argparse
 import json
 
